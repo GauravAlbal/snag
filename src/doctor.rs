@@ -7,7 +7,7 @@ pub fn handle(_args: DoctorArgs) -> Result<()> {
     println!("Running snag doctor...\n");
     
     // Store access
-    match Store::open() {
+    match Store::open_read_only() {
         Ok(store) => {
             println!("✅ Store access: OK ({})", store.data_dir.display());
             

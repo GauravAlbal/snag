@@ -12,7 +12,7 @@ pub fn init_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
+pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
     let tx = conn.transaction()?;
     
     // Create migrations table if not exists
@@ -159,6 +159,14 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
             INSERT INTO schema_migrations (version, applied_at) 
             VALUES (1, datetime('now'));
             "
+        )?;
+    }
+
+    if current_version < 2 {
+        crate::migrations::migrate_v1_to_v2(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'))",
+            [],
         )?;
     }
 

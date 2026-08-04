@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde_json::json;
 
 pub fn handle(_args: BackupArgs) -> Result<()> {
-    let store = Store::open()?;
+    let store = Store::open_read_only()?;
     let backups_dir = store.data_dir.join("backups");
     fs::create_dir_all(&backups_dir)?;
     

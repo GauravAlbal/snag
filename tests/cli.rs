@@ -107,18 +107,25 @@ fn test_idempotency_gap() {
         .assert()
         .success();
         
-    // Same payload should succeed returning created=false (mocked to just succeed for now)
-    // Wait, the schema enforces `idempotency_key TEXT UNIQUE`. 
-    // So if we run it again, it should fail with a SQLite UNIQUE constraint error!
+    // Same payload should succeed returning created=false
     ctx.cmd()
         .arg("report")
         .arg("Idempotency Test")
         .arg("--idempotency-key")
         .arg("key_123")
         .assert()
+        .success()
+        .stdout(predicate::str::contains("Observation already exists"));
+        
+    // 3. Different payload with same key -> fails
+    ctx.cmd()
+        .arg("report")
+        .arg("Idempotency Test DIFFERENT")
+        .arg("--idempotency-key")
+        .arg("key_123")
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("UNIQUE constraint failed")); 
-        // This confirms the gap (it should return typed IDEMPOTENCY_CONFLICT or succeed cleanly if identical payload)
+        .stderr(predicate::str::contains("Idempotency key collision"));
 }
 
 #[test]

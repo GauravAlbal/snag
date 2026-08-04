@@ -80,7 +80,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     }
 
     // 3. Artifact Storage setup
-    let mut store = Store::open()?;
+    let mut store = Store::open_read_write()?;
     let artifact_storage = ArtifactStorage::new(&store.data_dir)?;
     
     let mut artifacts = Vec::new();
@@ -100,13 +100,13 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     
     let local_sequence: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM observations",
+        "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM records",
         [],
         |row| row.get(0),
     )?;
     
     let previous_record_hash: String = tx.query_row(
-        "SELECT record_hash FROM observations ORDER BY local_sequence DESC LIMIT 1",
+        "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
         [],
         |row| row.get(0),
     ).unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000000".to_string());
@@ -139,6 +139,66 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     };
     
     let canonical_payload = serde_json::to_string(&obs)?;
+
+    if let Some(ik) = &idempotency_key {
+        let existing: rusqlite::Result<(String, String, i64, String)> = tx.query_row(
+            "SELECT o.observation_id, r.canonical_payload_json, r.local_sequence, r.record_hash
+             FROM observations o
+             JOIN records r ON o.observation_id = r.record_id
+             WHERE o.idempotency_key = ?1 AND r.record_type = 'observation_created'",
+            rusqlite::params![ik],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        );
+        if let Ok((old_id, old_payload, old_seq, old_hash)) = existing {
+            // Compare semantic equality
+            let mut old_val: serde_json::Value = serde_json::from_str(&old_payload)?;
+            let mut new_val: serde_json::Value = serde_json::from_str(&canonical_payload)?;
+            
+            let strip = |v: &mut serde_json::Value| {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("observation_id");
+                    obj.remove("store_id");
+                    obj.remove("local_sequence");
+                    obj.remove("created_at");
+                    if let Some(arts) = obj.get_mut("artifacts").and_then(|a| a.as_array_mut()) {
+                        for art in arts {
+                            if let Some(a_obj) = art.as_object_mut() {
+                                a_obj.remove("created_at");
+                            }
+                        }
+                    }
+                }
+            };
+            strip(&mut old_val);
+            strip(&mut new_val);
+            
+            if old_val == new_val {
+                if args.json {
+                    let result = json!({
+                        "schema_version": 1,
+                        "observation_id": old_id,
+                        "store_id": store.store_id,
+                        "local_sequence": old_seq,
+                        "record_hash": old_hash,
+                        "created": false,
+                        "sync_state": "local",
+                        "context": {
+                            "repository": obs.context.repository.is_some(),
+                            "execution": obs.context.execution.is_some(),
+                        },
+                        "artifacts": obs.artifacts.len(),
+                        "warnings": []
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Observation already exists: {}  [sequence {}]", old_id, old_seq);
+                }
+                return Ok(());
+            } else {
+                return Err(SnagError::Validation("Idempotency key collision with different payload".to_string()).into());
+            }
+        }
+    }
     
     let mut hasher = blake3::Hasher::new();
     hasher.update(store.store_id.as_bytes());
@@ -146,6 +206,21 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     hasher.update(previous_record_hash.as_bytes());
     hasher.update(canonical_payload.as_bytes());
     let record_hash = format!("blake3:{}", hasher.finalize().to_hex());
+
+    tx.execute(
+        "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            local_sequence,
+            &obs.observation_id,
+            "observation_created",
+            &obs.observation_id,
+            &obs.created_at,
+            &canonical_payload,
+            &previous_record_hash,
+            &record_hash,
+        ],
+    )?;
 
     tx.execute(
         "INSERT INTO observations (
@@ -258,8 +333,11 @@ fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
 }
 
 pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
-    let store = Store::open()?;
-    let query = "SELECT observation_id, local_sequence, captured_at, title FROM observations".to_string();
+    let store = Store::open_read_only()?;
+    let query = "SELECT r.record_id, r.local_sequence, r.captured_at, o.title 
+                 FROM records r 
+                 JOIN observations o ON r.record_id = o.observation_id 
+                 WHERE r.record_type = 'observation_created'".to_string();
     let mut stmt = store.conn.prepare(&query)?;
     let mut rows = stmt.query([])?;
     
@@ -272,9 +350,9 @@ pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
 }
 
 pub fn show(args: crate::cli::ShowArgs) -> anyhow::Result<()> {
-    let store = Store::open()?;
+    let store = Store::open_read_only()?;
     let payload: String = store.conn.query_row(
-        "SELECT canonical_payload_json FROM observations WHERE observation_id = ?1",
+        "SELECT canonical_payload_json FROM records WHERE record_id = ?1 AND record_type = 'observation_created'",
         rusqlite::params![&args.observation_id],
         |row| row.get(0),
     )?;
@@ -284,7 +362,7 @@ pub fn show(args: crate::cli::ShowArgs) -> anyhow::Result<()> {
 }
 
 pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
-    let mut store = Store::open()?;
+    let mut store = Store::open_read_write()?;
     let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     
     let exists: bool = tx.query_row(
@@ -298,13 +376,13 @@ pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
     }
     
     let local_sequence: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM observation_actions",
+        "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM records",
         [],
         |row| row.get(0),
     )?;
     
     let previous_record_hash: String = tx.query_row(
-        "SELECT record_hash FROM observation_actions ORDER BY local_sequence DESC LIMIT 1",
+        "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
         [],
         |row| row.get(0),
     ).unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000000".to_string());
@@ -321,6 +399,21 @@ pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
     hasher.update(action_payload_json.as_bytes());
     let record_hash = format!("blake3:{}", hasher.finalize().to_hex());
     
+    tx.execute(
+        "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            local_sequence,
+            &action_id,
+            "observation_retracted",
+            &args.observation_id,
+            &now,
+            &action_payload_json,
+            &previous_record_hash,
+            &record_hash,
+        ],
+    )?;
+
     tx.execute(
         "INSERT INTO observation_actions (action_id, observation_id, action_type, action_payload_json, created_at, local_sequence, previous_record_hash, record_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",

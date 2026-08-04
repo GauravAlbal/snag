@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 pub fn handle(args: VerifyArgs) -> Result<()> {
-    let mut store = Store::open()?;
+    let mut store = Store::open_read_only()?;
     
     if let Some(backup_path) = args.backup {
         println!("Verifying backup at {:?}", backup_path);

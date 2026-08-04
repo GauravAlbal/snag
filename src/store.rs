@@ -3,6 +3,7 @@ use crate::types::{generate_id, Observation};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use rusqlite::Connection;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,37 +11,68 @@ pub struct Store {
     pub conn: Connection,
     pub store_id: String,
     pub data_dir: PathBuf,
+    pub db_path: PathBuf,
 }
 
 impl Store {
-    pub fn open() -> Result<Self> {
-        let proj_dirs = ProjectDirs::from("", "", "snag").context("Failed to determine project directories")?;
-        let data_dir = proj_dirs.data_dir().to_path_buf();
-        
-        if !data_dir.exists() {
-            fs::create_dir_all(&data_dir)?;
-            
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
-            }
-        }
-        
+    fn paths() -> Result<(PathBuf, PathBuf)> {
+        let project_dirs = ProjectDirs::from("", "", "snag-cli")
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        let data_dir = if let Ok(data_home) = env::var("XDG_DATA_HOME") {
+            PathBuf::from(data_home).join("snag")
+        } else {
+            project_dirs.data_dir().to_path_buf()
+        };
         let db_path = data_dir.join("snag.sqlite");
+        Ok((data_dir, db_path))
+    }
+
+    pub fn open_read_write() -> Result<Self> {
+        let (data_dir, db_path) = Self::paths()?;
+        
+        fs::create_dir_all(&data_dir)?;
         let mut conn = Connection::open(&db_path)?;
         init_connection(&conn)?;
+        
+        let tx = conn.transaction()?;
+        tx.commit()?;
+        
         apply_migrations(&mut conn)?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = fs::metadata(&db_path) {
-                fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600)).ok();
-            }
+        let store_id = Self::ensure_store_id(&conn)?;
+
+        Ok(Self {
+            conn,
+            store_id,
+            data_dir,
+            db_path,
+        })
+    }
+    
+    pub fn open_read_only() -> Result<Self> {
+        let (data_dir, db_path) = Self::paths()?;
+        if !db_path.exists() {
+            return Err(anyhow::anyhow!("Store not found (has snag report been run?)"));
         }
         
-        // Ensure store_id exists
+        let conn = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        init_connection(&conn)?;
+        
+        let store_id: String = conn.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |row| row.get(0))?;
+
+        Ok(Self {
+            conn,
+            store_id,
+            data_dir,
+            db_path,
+        })
+    }
+    
+    pub fn open_for_maintenance() -> Result<Self> {
+        Self::open_read_write()
+    }
+
+    fn ensure_store_id(conn: &Connection) -> Result<String> {
         let store_id: Option<String> = conn.query_row(
             "SELECT store_id FROM store_metadata LIMIT 1",
             [],
@@ -60,11 +92,7 @@ impl Store {
             }
         };
 
-        Ok(Self {
-            conn,
-            store_id,
-            data_dir,
-        })
+        Ok(store_id)
     }
 
     pub fn insert_observation(&mut self, _obs: &Observation) -> Result<()> {

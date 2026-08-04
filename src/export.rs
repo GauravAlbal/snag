@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use serde_json::json;
 
 pub fn handle(args: ExportArgs) -> Result<()> {
-    let store = Store::open()?;
+    let store = Store::open_read_only()?;
     
     let out_writer: Box<dyn Write> = if let Some(path) = &args.output {
         Box::new(File::create(path)?)
