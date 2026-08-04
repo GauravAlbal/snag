@@ -31,7 +31,7 @@ fn quick_verify(store: &mut Store) -> Result<()> {
     }
     
     // Check latest chain segment
-    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json FROM observations ORDER BY local_sequence DESC LIMIT 1")?;
+    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json FROM records ORDER BY local_sequence DESC LIMIT 1")?;
     let mut rows = stmt.query([])?;
     
     if let Some(row) = rows.next()? {
@@ -76,7 +76,7 @@ fn full_verify(store: &mut Store) -> Result<()> {
     }
     
     // Complete hash chain verify
-    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json FROM observations ORDER BY local_sequence ASC")?;
+    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json FROM records ORDER BY local_sequence ASC")?;
     let mut rows = stmt.query([])?;
     
     let mut last_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
@@ -106,28 +106,44 @@ fn full_verify(store: &mut Store) -> Result<()> {
         count += 1;
     }
     
-    // Check artifact existence
+    // Check artifact existence, length, and hash
     let objects_dir = store.data_dir.join("objects").join("blake3");
-    let mut art_stmt = store.conn.prepare("SELECT digest FROM artifacts")?;
+    let mut art_stmt = store.conn.prepare("SELECT digest, byte_length FROM artifacts")?;
     let mut art_rows = art_stmt.query([])?;
     
     let mut missing = 0;
+    let mut invalid = 0;
     while let Some(row) = art_rows.next()? {
         let digest: String = row.get(0)?;
+        let expected_len: i64 = row.get(1)?;
+        
         if let Some(hash) = digest.strip_prefix("blake3:") {
             let prefix = &hash[0..2];
             let path = objects_dir.join(prefix).join(hash);
             if !path.exists() {
                 missing += 1;
+            } else {
+                let meta = std::fs::metadata(&path)?;
+                if meta.len() as i64 != expected_len {
+                    invalid += 1;
+                } else {
+                    let mut file = std::fs::File::open(&path)?;
+                    let mut hasher = blake3::Hasher::new();
+                    std::io::copy(&mut file, &mut hasher)?;
+                    let computed = format!("blake3:{}", hasher.finalize().to_hex());
+                    if computed != digest {
+                        invalid += 1;
+                    }
+                }
             }
         }
     }
     
-    if missing > 0 {
-        anyhow::bail!("{} artifacts are missing from disk", missing);
+    if missing > 0 || invalid > 0 {
+        anyhow::bail!("{} artifacts are missing, {} are invalid", missing, invalid);
     }
     
-    println!("Full verification passed ({} observations checked).", count);
+    println!("Full verification passed ({} records checked).", count);
     Ok(())
 }
 

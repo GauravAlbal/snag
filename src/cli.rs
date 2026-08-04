@@ -43,6 +43,10 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Adds a retraction action without deleting the original observation
     Retract(RetractArgs),
+    /// Restores the database from a backup
+    Restore(RestoreArgs),
+    /// Rebuilds the database from an export stream
+    Rebuild(RebuildArgs),
 }
 
 #[derive(Args)]
@@ -164,4 +168,14 @@ pub struct DoctorArgs {}
 #[derive(Args)]
 pub struct RetractArgs {
     pub observation_id: String,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    pub backup_dir: PathBuf,
+}
+
+#[derive(Args)]
+pub struct RebuildArgs {
+    pub stream: PathBuf,
 }

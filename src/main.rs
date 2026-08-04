@@ -14,6 +14,8 @@ pub mod schema;
 pub mod store;
 pub mod types;
 pub mod verify;
+pub mod restore;
+pub mod rebuild;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -35,6 +37,8 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Verify(args)) => verify::handle(args),
         Some(Command::Doctor(args)) => doctor::handle(args),
         Some(Command::Retract(args)) => report::retract(args),
+        Some(Command::Restore(args)) => restore::handle(args),
+        Some(Command::Rebuild(args)) => rebuild::handle(args),
         None => {
             // "snag <title>" fast path, equivalent to "snag report <title>"
             if let Some(title) = cli.title {

@@ -22,7 +22,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     }
     
     // 2. Verification of the backup copy
-    let mut backup_conn = Connection::open(&temp_db_path)?;
+    let backup_conn = Connection::open(&temp_db_path)?;
     
     let integrity: String = backup_conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
@@ -35,7 +35,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     }
     
     // 3. Get head hash
-    let mut stmt = backup_conn.prepare("SELECT local_sequence, record_hash FROM observations ORDER BY local_sequence DESC LIMIT 1")?;
+    let mut stmt = backup_conn.prepare("SELECT local_sequence, record_hash FROM records ORDER BY local_sequence DESC LIMIT 1")?;
     let mut rows = stmt.query([])?;
     
     let (head_sequence, head_hash) = if let Some(row) = rows.next()? {
@@ -43,8 +43,24 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         let hash: String = row.get(1)?;
         (seq, hash)
     } else {
-        (0, "0000000000000000000000000000000000000000000000000000000000000000".to_string())
+        (0_i64, "0000000000000000000000000000000000000000000000000000000000000000".to_string())
     };
+    
+    // Generate objects manifest
+    let mut art_stmt = backup_conn.prepare("SELECT digest, byte_length FROM artifacts")?;
+    let mut art_rows = art_stmt.query([])?;
+    let mut objects = Vec::new();
+    while let Some(row) = art_rows.next()? {
+        let digest: String = row.get(0)?;
+        let byte_length: i64 = row.get(1)?;
+        objects.push(json!({"digest": digest, "byte_length": byte_length}));
+    }
+    
+    let objects_manifest = json!({"objects": objects});
+    let objects_manifest_bytes = serde_json::to_vec_pretty(&objects_manifest)?;
+    let objects_manifest_digest = format!("blake3:{}", blake3::hash(&objects_manifest_bytes).to_hex());
+    let objects_manifest_path = temp_dir.path().join("objects-manifest.json");
+    fs::write(&objects_manifest_path, &objects_manifest_bytes)?;
     
     // Calculate DB digest
     let db_bytes = fs::read(&temp_db_path)?;
@@ -61,7 +77,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         "database_digest": db_digest,
         "integrity_check": "ok",
         "foreign_key_check": "ok",
-        "artifact_manifest_digest": "none" // Placeholder
+        "artifact_manifest_digest": objects_manifest_digest
     });
     
     let manifest_path = temp_dir.path().join("manifest.json");

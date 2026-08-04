@@ -159,3 +159,44 @@ fn test_idempotency_gap() {
 }
 
 
+#[test]
+fn test_certification_mission() {
+    let ctx = TestContext::new();
+    
+    // 1. Encounter a problem and record it in one command
+    ctx.cmd()
+        .arg("report")
+        .arg("System crashed during start")
+        .arg("--kind")
+        .arg("reliability")
+        .arg("--idempotency-key")
+        .arg("cert_123")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recorded obs_"));
+        
+    // 2. "crash immediately afterward" -> CLI naturally terminates.
+    
+    // 3. Later prove whether it was durably captured
+    // using verify
+    ctx.cmd()
+        .arg("verify")
+        .arg("--full")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Full verification passed"));
+        
+    // using list
+    ctx.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("System crashed during start"));
+        
+    // using backup
+    ctx.cmd()
+        .arg("backup")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Backup verified and saved"));
+}
