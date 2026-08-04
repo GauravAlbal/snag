@@ -8,6 +8,7 @@ pub mod export;
 pub mod git;
 pub mod identity;
 pub mod migrations;
+pub mod parser;
 pub mod report;
 pub mod schema;
 pub mod store;
@@ -22,16 +23,18 @@ fn main() -> anyhow::Result<()> {
     
     let cli = Cli::parse();
 
-    match cli.command {
-        Some(Command::Report(args)) => report::handle(args)?,
-        Some(Command::List(args)) => report::list(args)?,
-        Some(Command::Show(args)) => report::show(args)?,
-        Some(Command::Context(args)) => context::handle(args)?,
-        Some(Command::Export(args)) => export::handle(args)?,
-        Some(Command::Backup(args)) => backup::handle(args)?,
-        Some(Command::Verify(args)) => verify::handle(args)?,
-        Some(Command::Doctor(args)) => doctor::handle(args)?,
-        Some(Command::Retract(args)) => report::retract(args)?,
+    let wants_json = cli.wants_json();
+
+    let result = match cli.command {
+        Some(Command::Report(args)) => report::handle(args),
+        Some(Command::List(args)) => report::list(args),
+        Some(Command::Show(args)) => report::show(args),
+        Some(Command::Context(args)) => context::handle(args),
+        Some(Command::Export(args)) => export::handle(args),
+        Some(Command::Backup(args)) => backup::handle(args),
+        Some(Command::Verify(args)) => verify::handle(args),
+        Some(Command::Doctor(args)) => doctor::handle(args),
+        Some(Command::Retract(args)) => report::retract(args),
         None => {
             // "snag <title>" fast path, equivalent to "snag report <title>"
             if let Some(title) = cli.title {
@@ -52,11 +55,24 @@ fn main() -> anyhow::Result<()> {
                     pearl_id: None,
                     attempt_id: None,
                     affected_repos: vec![],
-                })?;
+                })
             } else {
                 // Should be unreachable due to clap validation, but just in case
-                eprintln!("Error: A title or command is required.");
+                Err(anyhow::anyhow!("Error: A title or command is required."))
             }
+        }
+    };
+
+    if let Err(e) = result {
+        if wants_json {
+            let snag_error = match e.downcast::<error::SnagError>() {
+                Ok(se) => se.to_envelope(),
+                Err(e) => error::SnagError::Other(e).to_envelope(),
+            };
+            eprintln!("{}", serde_json::to_string_pretty(&snag_error).unwrap());
+            std::process::exit(1);
+        } else {
+            return Err(e);
         }
     }
 

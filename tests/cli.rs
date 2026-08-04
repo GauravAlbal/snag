@@ -90,9 +90,7 @@ fn test_json_intake_gap() {
         .arg("--json")
         .write_stdin(json_payload)
         .assert()
-        // It fails because it requires a title and ignores the JSON title
-        .failure()
-        .stderr(predicate::str::contains("Title is required"));
+        .success();
 }
 
 #[test]

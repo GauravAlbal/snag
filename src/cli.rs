@@ -5,11 +5,22 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
     /// The title of the observation (fast path)
-    #[arg(required_unless_present = "command")]
     pub title: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    pub fn wants_json(&self) -> bool {
+        match &self.command {
+            Some(Command::Report(args)) => args.json,
+            Some(Command::List(args)) => args.format.as_deref() == Some("json"),
+            Some(Command::Context(args)) => args.format.as_deref() == Some("json"),
+            Some(Command::Export(args)) => args.format.as_deref() == Some("json"),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Subcommand)]

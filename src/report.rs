@@ -1,5 +1,7 @@
 use crate::cli::ReportArgs;
 use crate::context::gather_context;
+use crate::error::SnagError;
+use crate::parser::{parse_prose, JsonInput};
 use crate::store::Store;
 use crate::artifacts::ArtifactStorage;
 use crate::types::{Observation, ArtifactReference, Sensitivity, generate_id};
@@ -9,34 +11,73 @@ use std::io::{self, Read};
 
 pub fn handle(args: ReportArgs) -> Result<()> {
     // 1. Parse input
-    let mut title = args.title.clone().unwrap_or_default();
+    let mut title = args.title.clone();
+    let mut summary = None;
+    let mut expected_behavior = args.expected.clone();
+    let mut observed_behavior = args.observed.clone();
+    let mut workaround = args.workaround.clone();
+    let mut repro = args.repro.clone();
+    let mut kind = args.kind.clone();
+    let mut severity = args.severity.clone();
+    let mut idempotency_key = args.idempotency_key.clone();
+    let mut affected_repos = args.affected_repos.clone();
+    let mut impact = None;
     
     if args.stdin {
         let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer)?;
-        // Simplistic parse: first line is title, rest is summary (if we wanted to parse it)
-        // Since prose parsing is deliberately simple:
-        if title.is_empty() {
-            let mut lines = buffer.lines();
-            if let Some(first) = lines.next() {
-                title = first.to_string();
+        io::stdin().read_to_string(&mut buffer).map_err(|e| SnagError::Other(e.into()))?;
+        let parsed = parse_prose(&buffer);
+        if !parsed.title.is_empty() && title.is_none() {
+            title = Some(parsed.title);
+        }
+        if parsed.summary.is_some() { summary = parsed.summary; }
+        if parsed.expected.is_some() { expected_behavior = parsed.expected; }
+        if parsed.observed.is_some() { observed_behavior = parsed.observed; }
+        if parsed.repro.is_some() { repro = parsed.repro; }
+        if parsed.workaround.is_some() { workaround = parsed.workaround; }
+        if parsed.impact.is_some() { impact = parsed.impact; }
+    }
+    
+    if args.json {
+        let path = args.title.clone().unwrap_or_else(|| "-".to_string());
+        let mut buffer = String::new();
+        if path == "-" {
+            io::stdin().read_to_string(&mut buffer).map_err(|e| SnagError::Other(e.into()))?;
+        } else {
+            buffer = std::fs::read_to_string(&path).map_err(|e| SnagError::Validation(format!("Could not read JSON file: {}", e)))?;
+        }
+        
+        let json_input: JsonInput = serde_json::from_str(&buffer).map_err(|e| SnagError::Validation(format!("Invalid JSON: {}", e)))?;
+        
+        if let Some(sv) = json_input.schema_version {
+            if sv != 1 {
+                return Err(SnagError::UnsupportedSchema(sv.to_string()).into());
             }
         }
+        
+        if let Some(t) = json_input.title { title = Some(t); }
+        if let Some(s) = json_input.summary { summary = Some(s); }
+        if let Some(k) = json_input.kind_assertion { kind = Some(k); }
+        if let Some(sev) = json_input.severity_assertion { severity = Some(sev); }
+        if let Some(exp) = json_input.expected_behavior { expected_behavior = Some(exp); }
+        if let Some(obs) = json_input.observed_behavior { observed_behavior = Some(obs); }
+        if let Some(r) = json_input.reproduction { repro = Some(r); }
+        if let Some(w) = json_input.workaround { workaround = Some(w); }
+        if let Some(i) = json_input.impact { impact = Some(i); }
+        if let Some(ik) = json_input.idempotency_key { idempotency_key = Some(ik); }
+        if let Some(ar) = json_input.affected_repositories { affected_repos = ar; }
     }
     
-    // JSON parsing would override everything
-    if args.json {
-        let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer)?;
-        // Try parsing JSON... for now, we just proceed.
-    }
-    
+    let title = title.unwrap_or_default();
     if title.is_empty() {
-        anyhow::bail!("Title is required");
+        return Err(SnagError::Validation("Title is required".to_string()).into());
     }
 
     // 2. Gather Context
-    let (source, context) = gather_context(&args)?;
+    let (source, context, gathered_idempotency_key) = gather_context(&args)?;
+    if idempotency_key.is_none() {
+        idempotency_key = gathered_idempotency_key;
+    }
 
     // 3. Artifact Storage setup
     let mut store = Store::open()?;
@@ -78,18 +119,18 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         observation_id: obs_id.clone(),
         store_id: store.store_id.clone(),
         local_sequence: local_sequence as u64,
-        idempotency_key: args.idempotency_key.clone(),
+        idempotency_key: idempotency_key.clone(),
         created_at: now.clone(),
         source,
         title,
-        summary: None,
-        kind_assertion: args.kind.clone(),
-        severity_assertion: args.severity.clone(),
-        expected_behavior: args.expected.clone(),
-        observed_behavior: args.observed.clone(),
-        reproduction: args.repro.clone(),
-        workaround: args.workaround.clone(),
-        impact: None,
+        summary,
+        kind_assertion: kind,
+        severity_assertion: severity,
+        expected_behavior,
+        observed_behavior,
+        reproduction: repro,
+        workaround,
+        impact,
         confidence: None,
         sensitivity: Sensitivity::Normal,
         labels: None,
