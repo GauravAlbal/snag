@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
             // "snag <title>" fast path, equivalent to "snag report <title>"
             if let Some(title) = cli.title {
                 report::handle(cli::ReportArgs {
-                    title,
+                    title: Some(title),
                     kind: None,
                     severity: None,
                     expected: None,
