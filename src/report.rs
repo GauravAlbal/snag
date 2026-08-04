@@ -96,6 +96,20 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         });
     }
 
+    // 3.5. Identity resolution
+    if let Some(repo_ctx) = &context.repository {
+        let mut temp_git = crate::git::GitContext::default();
+        temp_git.git_common_dir = repo_ctx.git_common_dir.clone();
+        temp_git.git_remote_aliases = repo_ctx.git_remote_aliases.clone();
+        temp_git.repository_root = repo_ctx.repository_root.clone();
+        
+        if let Ok(Some(repo_id)) = crate::identity::resolve_repository(&mut store, &temp_git) {
+            if !affected_repos.contains(&repo_id) {
+                affected_repos.push(repo_id);
+            }
+        }
+    }
+
     // 4. Begin Transaction and allocate
     let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     
@@ -273,6 +287,14 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         )?;
     }
 
+    // Insert observation_repositories (affected repos)
+    for repo_id in &affected_repos {
+        tx.execute(
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id) VALUES (?1, ?2)",
+            rusqlite::params![&obs.observation_id, repo_id],
+        )?;
+    }
+
     tx.commit()?;
 
     if args.json {
@@ -334,12 +356,42 @@ fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
 
 pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
     let store = Store::open_read_only()?;
-    let query = "SELECT r.record_id, r.local_sequence, r.captured_at, o.title 
-                 FROM records r 
-                 JOIN observations o ON r.record_id = o.observation_id 
-                 WHERE r.record_type = 'observation_created'".to_string();
+    
+    let mut query = String::from(
+        "SELECT r.record_id, r.local_sequence, r.captured_at, o.title 
+         FROM records r 
+         JOIN observations o ON r.record_id = o.observation_id 
+         WHERE r.record_type = 'observation_created'"
+    );
+    
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    
+    if let Some(sk) = &args.source {
+        query.push_str(" AND o.source_kind = ?");
+        params.push(Box::new(sk.clone()));
+    }
+    
+    if let Some(k) = &args.kind {
+        query.push_str(" AND o.kind_assertion = ?");
+        params.push(Box::new(k.clone()));
+    }
+    
+    if let Some(repo) = &args.repo {
+        query.push_str(" AND EXISTS (SELECT 1 FROM observation_repositories u JOIN repository_aliases a ON u.repository_id = a.repository_id WHERE u.observation_id = o.observation_id AND a.alias = ?)");
+        params.push(Box::new(repo.clone()));
+    }
+    
+    query.push_str(" ORDER BY r.local_sequence DESC");
+    
+    if let Some(limit) = args.limit {
+        query.push_str(" LIMIT ?");
+        params.push(Box::new(limit as i64));
+    }
+    
     let mut stmt = store.conn.prepare(&query)?;
-    let mut rows = stmt.query([])?;
+    // Convert Vec<Box<dyn ToSql>> to a slice of references
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut rows = stmt.query(param_refs.as_slice())?;
     
     if args.format.as_deref() == Some("json") {
         list_json(&mut rows)?;

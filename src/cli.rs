@@ -106,6 +106,12 @@ pub struct ListArgs {
 
     #[arg(long)]
     pub source: Option<String>,
+    
+    #[arg(long)]
+    pub kind: Option<String>,
+    
+    #[arg(long)]
+    pub limit: Option<usize>,
 
     #[arg(long)]
     pub format: Option<String>,

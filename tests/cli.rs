@@ -71,6 +71,36 @@ fn test_structured_cli_report() {
         .stdout(predicate::str::contains("Recorded obs_"));
 }
 
+#[test]
+fn test_list_filters_gap() {
+    // Create a specific observation
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("List filter test")
+        .arg("--kind")
+        .arg("security")
+        .assert()
+        .success();
+
+    // It filters out correctly
+    ctx.cmd()
+        .arg("list")
+        .arg("--kind")
+        .arg("security")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("List filter test"));
+        
+    ctx.cmd()
+        .arg("list")
+        .arg("--kind")
+        .arg("bug")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("List filter test").not());
+}
+
 // ==========================================
 // Failing tests for known gaps (G1 - G19)
 // ==========================================
@@ -128,17 +158,4 @@ fn test_idempotency_gap() {
         .stderr(predicate::str::contains("Idempotency key collision"));
 }
 
-#[test]
-fn test_list_filters_gap() {
-    // Gap G9: List filters are ignored
-    let ctx = TestContext::new();
-    ctx.cmd().arg("report").arg("List filter test").assert().success();
-    
-    ctx.cmd()
-        .arg("list")
-        // .arg("--limit") // GAP: Doesn't even parse --limit yet
-        // .arg("0") 
-        .assert()
-        .success();
-        // .stdout(predicate::str::contains("List filter test").not()); // Exposes gap
-}
+
