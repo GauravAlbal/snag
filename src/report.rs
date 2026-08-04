@@ -84,8 +84,14 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     let artifact_storage = ArtifactStorage::new(&store.data_dir)?;
     
     let mut artifacts = Vec::new();
+    let mut total_artifact_bytes = 0_u64;
     for artifact_path in &args.artifacts {
         let (digest, size) = artifact_storage.ingest_file(artifact_path)?;
+        total_artifact_bytes += size;
+        if total_artifact_bytes > 250 * 1024 * 1024 {
+            return Err(SnagError::Validation("Total artifacts size exceeds 250 MiB limit".to_string()).into());
+        }
+        
         let name = artifact_path.file_name().map(|n| n.to_string_lossy().into_owned());
         artifacts.push(ArtifactReference {
             digest,
