@@ -51,6 +51,15 @@ jobs:
         with:
           path: artifacts
 
+      - name: Rename binaries to distinct artifact names
+        run: |
+          mkdir -p release-binaries
+          for dir in artifacts/*/; do
+            name="$(basename "$dir")"
+            cp "$dir/snag" "release-binaries/$name"
+          done
+          ls -la release-binaries
+
       - name: Determine tag
         id: tag
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
@@ -68,5 +77,5 @@ jobs:
             - `snag-x86_64-unknown-linux-gnu` — Linux x86_64
             - `snag-aarch64-apple-darwin` — macOS arm64
           files: |
-            artifacts/**/snag
+            release-binaries/*
           fail_on_unmatched_files: true
