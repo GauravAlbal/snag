@@ -1,90 +1,156 @@
-# snag
+# Snag
 
-Durable observation capture for agent fleets. `snag` records atomic bug/friction
-reports — with repository, worktree, pearl, attempt, model, and tool context —
-into a local, verifiable, backup/restore-capable store.
+<div align="center">
 
-Snag is the **capture layer** of the constellation:
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey.svg)
+![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
+
+</div>
+
+**Snag is a durable observation outbox for coding agents.**
+
+When an agent encounters an out-of-scope bug or recurring workaround, it records
+the evidence and continues its assigned task. Reports remain local, survive
+crashes, and can be exported to any downstream issue or analysis system.
+
+**Supported agents:** [Claude Code](examples/agents/claude-code.md),
+[Codex CLI](examples/agents/codex.md), [Gemini CLI](examples/agents/gemini-cli.md),
+[OpenCode](examples/agents/opencode.md), and any
+[shell-based agent](examples/agents/generic.md) — the integration is a short
+instruction block plus an optional context file, nothing more.
+
+---
+
+## Quick install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/13banditos/snag/master/install.sh | bash
+```
+
+The installer downloads the platform binary from the latest GitHub release,
+verifies its SHA-256 checksum, and puts `snag` on your PATH. Prefer a manual
+install?
+
+```bash
+cargo install --git https://github.com/13banditos/snag
+```
+
+Release binaries are published for macOS (arm64, x86_64) and Linux (x86_64,
+aarch64), each with a SHA256SUMS.txt and the source SHA of the build.
+
+## Thirty-second example
+
+```bash
+snag report "build reports success but produces no artifact" \
+  --kind bug \
+  --observed "command exited 0; dist/app does not exist" \
+  --expected "successful build creates dist/app" \
+  --repro "run make release in a fresh clone"
+```
+
+```bash
+snag list
+snag show <observation-id>
+snag verify --full
+```
+
+## How it works
 
 ```text
-Snag        → durable observation capture
-Panopticon  → coalescing, taxonomy, materiality, issue synchronization
-VX          → promoted work and execution
-Moat        → acceptance evidence
+agent encounters an out-of-scope issue
+→ records it with Snag
+→ continues the current task
+→ observations are reviewed or exported later
 ```
 
-Report issues while evidence is fresh; **do not broaden the current task to fix
-them** unless explicitly instructed.
+Snag is deliberately boring. It does one job — durable local capture — and
+stays out of the way while you work.
 
-## Build
+## Why use it
 
-```sh
-cargo build --release        # binary: target/release/snag
-```
-
-Requires Rust stable (edition 2024). SQLite is bundled (`rusqlite` `bundled`
-feature) — no system dependency.
-
-## Install
-
-```sh
-cargo install --path .       # or copy target/release/snag onto PATH
-```
-
-Snag stores observations in a local SQLite database under your platform data
-directory (`~/.local/share/snag` on macOS/Linux). The first run creates the
-store and a repository identity.
-
-## Usage
-
-Fast path:
-
-```sh
-snag "flake: vendored build script breaks on fresh clone"
-```
-
-Full report:
-
-```sh
-snag report "<specific symptom>" \
-  --kind <kind> \
-  --severity <blocker|major|minor> \
-  --observed "<what happened>" \
-  --expected "<what should have happened>" \
-  --repro "<minimal reproduction, when known>" \
-  --workaround "<workaround used, when any>" \
-  --idempotency-key "<stable attempt-local key>"
-```
-
-### Commands
-
-| Command | Purpose |
+| Feature | What it does |
 |---|---|
-| `snag report` | Durably record one observation |
-| `snag list` | List captured observations (filters: `--repo --since --source --kind --limit --format`) |
-| `snag show <id>` | Display the immutable payload, context, and artifacts |
-| `snag context` | Show what context would be attached from the current process |
-| `snag export` | Produce deterministic Panopticon-ready records (JSONL) |
-| `snag backup` | Create and verify a point-in-time backup + manifest |
-| `snag restore <dir>` | Non-destructively restore from a backup (forensic copy preserved) |
-| `snag rebuild --from-export <stream> --destination <dir>` | Rebuild a store from an export stream |
-| `snag verify` | Verify SQLite integrity and the observation hash chain |
-| `snag doctor` | Check configuration, backup freshness, and system context |
-| `snag retract <id>` | Add a retraction action (original observation is never deleted) |
+| Durable local capture | One command records a finding with full context; nothing is uploaded anywhere |
+| Tamper-evident history | Records are hash-chained (`previous_record_hash`) and globally sequenced; `verify --full` recomputes the whole chain |
+| Context auto-attached | Git repo/checkout/worktree identity, branch, and HEAD are captured from the current checkout |
+| Crash-safe | Writes are transactional; a killed process leaves either nothing or one complete observation |
+| Recovery chain | `backup` → `restore` (non-destructive, forensic copy preserved) → `rebuild` from an export stream |
+| Deterministic export | Identical store state produces byte-identical JSONL — safe to diff, checksum, and checkpoint |
+| Append-only retraction | `retract` appends a retraction record; the original observation is never deleted |
+| Zero telemetry | No analytics, no phone-home, no account, no cloud |
 
-### Context
+## Data captured
 
-Context is inherited automatically:
+Each observation stores: title, summary, kind and severity assertions, expected
+vs observed behavior, reproduction, workaround, impact, confidence, sensitivity,
+labels, and optional attached artifacts. Context is inherited automatically:
 
 - Git repository identity (repo/checkout/worktree IDs, branch, HEAD) from the
   current checkout.
-- Session context via `SNAG_CONTEXT_FILE` (JSON) or `VX_*` / `ARQ_*` /
-  `SNAG_*` environment variables — see `src/context.rs` and the installed
-  `snag-ctx` helper.
+- Session context via the `SNAG_CONTEXT_FILE` environment variable — a
+  versioned JSON document (see [docs/SCHEMAS.md](docs/SCHEMAS.md) and
+  [schemas/](schemas/)).
 - Set `SNAG_SOURCE_KIND=agent_report` and `SNAG_REPORTER_ID=<agent>` for agent
   captures.
 
-Run `snag context` to inspect what would be attached.
+Run `snag context` to see exactly what would be attached from the current
+process.
+
+## Privacy
+
+- Snag is **local-only by default**. It sends no telemetry and never uploads
+  observations automatically.
+- It does **not** capture environment variables or shell history.
+- Artifacts are copied into the store **only when explicitly attached** with
+  `--artifact`.
+- Git remotes, paths, branch names, model/tool IDs, and context may be stored —
+  treat the store like a code review log.
+- Retraction is append-only: it never deletes or rewrites the original
+  observation.
+
+See [SECURITY.md](SECURITY.md) for the full threat model.
+
+## Store location
+
+Snag keeps everything in one directory. `snag doctor` prints the exact paths on
+your machine:
+
+| Platform | Store directory |
+|---|---|
+| macOS | `~/Library/Application Support/snag-cli` |
+| Linux (default) | `~/.local/share/snag-cli` |
+| Linux (`XDG_DATA_HOME` set) | `$XDG_DATA_HOME/snag` |
+
+Inside it: `snag.sqlite` (the database), `objects/blake3/` (content-addressed
+artifacts), and `backups/` (point-in-time bundles).
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `snag report "<title>"` | Durably record one observation (fast path; structured flags work without the subcommand) |
+| `snag report --json` | Record from a JSON document on stdin or a file (see [schemas/](schemas/observation-input-v1.schema.json)) |
+| `snag list` | List observations (`--repo --since --source --kind --limit --format json`) |
+| `snag show <id>` | Display the immutable payload, context, and artifacts |
+| `snag context` | Show what context would be attached from the current process |
+| `snag export` | Deterministic JSONL stream (full or `--after-sequence N` partial) |
+| `snag backup` | Create and verify a point-in-time backup bundle |
+| `snag restore <dir>` | Non-destructively restore from a backup (forensic copy preserved) |
+| `snag rebuild --from-export <stream> --destination <dir>` | Rebuild a store from an export stream |
+| `snag verify` | Verify SQLite integrity and the observation hash chain (`--full` recomputes everything) |
+| `snag doctor` | Print store paths, effective context source, version, and health |
+| `snag retract <id>` | Append a retraction (the original observation is never deleted) |
+
+## Durability model
+
+Observations are append-only and hash-chained: every record binds to its
+predecessor, so tampering breaks the chain and `snag verify --full` reports it.
+Retractions append actions rather than deleting. Backups are self-contained
+bundles (database + manifest + objects) that `snag restore` verifies fully
+before touching active state; `snag rebuild` reconstructs a store from an
+export stream. Details: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Architecture
 
@@ -107,16 +173,66 @@ src/
   idempotency.rs stable semantic idempotency keys
 ```
 
-Records are hash-chained (`previous_record_hash`), giving tamper-evident,
-globally-sequenced history. `verify --full` recomputes the whole chain.
+## Recovery
 
-## Documentation
+| Symptom | Procedure |
+|---|---|
+| Corrupt or missing store | `snag doctor` to assess; restore the latest backup (`snag backup` list, then `snag restore <dir>`) |
+| No backup exists | Rebuild from the last export: `snag rebuild --from-export <stream> --destination <dir>` |
+| Suspicious integrity | `snag verify --full`; if the chain breaks, the store is tampered or corrupt — restore from backup |
 
-- [Runbook](docs/RUNBOOK.md) — build, install, operations, recovery
-- [Releasing](docs/RELEASING.md) — versioning and release process
-- [CHANGELOG](CHANGELOG.md) — version history
-- [Certification requirement digest](.cert-reqs-digest.md) — the v0 certification contract
-- [AUDIT.md](AUDIT.md) — post-certification audit state
+**Never delete the only copy of a store before a verified backup exists.**
+
+## Stability
+
+Snag is at v0.1. The CLI, observation JSON, context JSON, and export stream are
+versioned contracts; the SQLite schema is internal. Downstream systems must
+consume `snag export` — never open `snag.sqlite` directly. Guarantees:
+[docs/STABILITY.md](docs/STABILITY.md).
+
+## Non-goals
+
+Snag is **not**:
+
+- an issue tracker;
+- an agent orchestrator;
+- an analytics system;
+- a tracing platform;
+- a telemetry collector;
+- a replacement for GitHub Issues;
+- an automatic bug detector;
+- an LLM-based deduplicator.
+
+It captures observations durably. Everything downstream — triage, dedup,
+routing, fixing — belongs to other tools that consume the export stream.
+
+## Extending Snag
+
+- **Context protocol** — [docs/SCHEMAS.md](docs/SCHEMAS.md) + [schemas/](schemas/)
+- **Agent integrations** — [examples/agents/](examples/agents/)
+- **Downstream consumers** — [examples/export-consumer/](examples/export-consumer/)
+- **Roadmap** — [docs/ROADMAP.md](docs/ROADMAP.md)
+
+## Case study
+
+Snag was born from a two-hour dogfood run that captured 87 observations across
+5 repositories — including cancellation, timeout, spend-control, stale-state,
+recovery, and interface failures — two of which were bugs in Snag itself and
+are fixed in this release. The lesson: agents were already finding these
+issues; Snag changed whether the findings survived the session. Read the
+anonymized account in [docs/CASE_STUDY.md](docs/CASE_STUDY.md).
+
+## Demo
+
+See [docs/DEMO.md](docs/DEMO.md) for a five-minute walkthrough: capture,
+inspect, verify, and export — plus the reliability story.
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first, file
+bugs via the [issue templates](.github/ISSUE_TEMPLATE/), and report security
+vulnerabilities privately per [SECURITY.md](SECURITY.md). This project follows
+the [Contributor Covenant](CODE_OF_CONDUCT.md). Support: [SUPPORT.md](SUPPORT.md).
 
 ## License
 
