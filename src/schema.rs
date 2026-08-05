@@ -8,7 +8,7 @@ pub fn initialize_writer_connection(conn: &Connection) -> Result<()> {
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = FULL;
         PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = 5000;
+        PRAGMA busy_timeout = 30000;
         ",
     )?;
     Ok(())
@@ -21,7 +21,7 @@ pub fn initialize_reader_connection(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = 5000;
+        PRAGMA busy_timeout = 30000;
         ",
     )?;
     Ok(())
