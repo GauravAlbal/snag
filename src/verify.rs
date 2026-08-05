@@ -31,7 +31,7 @@ fn quick_verify(store: &mut Store) -> Result<()> {
     }
     
     // Check latest chain segment
-    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json FROM records ORDER BY local_sequence DESC LIMIT 1")?;
+    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json, record_id, record_type, entity_id, captured_at FROM records ORDER BY local_sequence DESC LIMIT 1")?;
     let mut rows = stmt.query([])?;
     
     if let Some(row) = rows.next()? {
@@ -39,13 +39,21 @@ fn quick_verify(store: &mut Store) -> Result<()> {
         let prev: String = row.get(1)?;
         let expected_hash: String = row.get(2)?;
         let payload: String = row.get(3)?;
+        let record_id: String = row.get(4)?;
+        let record_type: String = row.get(5)?;
+        let entity_id: String = row.get(6)?;
+        let captured_at: String = row.get(7)?;
         
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(store.store_id.as_bytes());
-        hasher.update(&seq.to_le_bytes());
-        hasher.update(prev.as_bytes());
-        hasher.update(payload.as_bytes());
-        let computed = format!("blake3:{}", hasher.finalize().to_hex());
+        let record_payload: crate::record::RecordPayload = serde_json::from_str(&payload).context("Invalid canonical payload")?;
+        let canonical_record = crate::record::CanonicalRecordV1 {
+            local_sequence: seq as u64,
+            record_id,
+            record_type,
+            entity_id,
+            captured_at,
+            payload: record_payload,
+        };
+        let computed = canonical_record.compute_hash(&store.store_id, &prev);
         
         if computed != expected_hash {
             anyhow::bail!("Hash chain mismatch at sequence {}", seq);
@@ -60,7 +68,7 @@ fn quick_verify(store: &mut Store) -> Result<()> {
     Ok(())
 }
 
-fn full_verify(store: &mut Store) -> Result<()> {
+pub fn full_verify(store: &mut Store) -> Result<()> {
     let result: String = store.conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if result != "ok" {
         anyhow::bail!("Integrity check failed: {}", result);
@@ -76,7 +84,7 @@ fn full_verify(store: &mut Store) -> Result<()> {
     }
     
     // Complete hash chain verify
-    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json FROM records ORDER BY local_sequence ASC")?;
+    let mut stmt = store.conn.prepare("SELECT local_sequence, previous_record_hash, record_hash, canonical_payload_json, record_id, record_type, entity_id, captured_at FROM records ORDER BY local_sequence ASC")?;
     let mut rows = stmt.query([])?;
     
     let mut last_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
@@ -86,17 +94,25 @@ fn full_verify(store: &mut Store) -> Result<()> {
         let prev: String = row.get(1)?;
         let expected_hash: String = row.get(2)?;
         let payload: String = row.get(3)?;
+        let record_id: String = row.get(4)?;
+        let record_type: String = row.get(5)?;
+        let entity_id: String = row.get(6)?;
+        let captured_at: String = row.get(7)?;
         
         if prev != last_hash {
             anyhow::bail!("Broken chain at seq {}: previous hash mismatch", seq);
         }
         
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(store.store_id.as_bytes());
-        hasher.update(&seq.to_le_bytes());
-        hasher.update(prev.as_bytes());
-        hasher.update(payload.as_bytes());
-        let computed = format!("blake3:{}", hasher.finalize().to_hex());
+        let record_payload: crate::record::RecordPayload = serde_json::from_str(&payload).context("Invalid canonical payload")?;
+        let canonical_record = crate::record::CanonicalRecordV1 {
+            local_sequence: seq as u64,
+            record_id,
+            record_type,
+            entity_id,
+            captured_at,
+            payload: record_payload,
+        };
+        let computed = canonical_record.compute_hash(&store.store_id, &prev);
         
         if computed != expected_hash {
             anyhow::bail!("Hash chain mismatch at sequence {}", seq);

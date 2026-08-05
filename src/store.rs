@@ -15,7 +15,7 @@ pub struct Store {
 }
 
 impl Store {
-    fn paths() -> Result<(PathBuf, PathBuf)> {
+    pub fn paths() -> Result<(PathBuf, PathBuf)> {
         let project_dirs = ProjectDirs::from("", "", "snag-cli")
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         let data_dir = if let Ok(data_home) = env::var("XDG_DATA_HOME") {
@@ -27,9 +27,8 @@ impl Store {
         Ok((data_dir, db_path))
     }
 
-    pub fn open_read_write() -> Result<Self> {
-        let (data_dir, db_path) = Self::paths()?;
-        
+    pub fn open_at(data_dir: &PathBuf) -> Result<Self> {
+        let db_path = data_dir.join("snag.sqlite");
         fs::create_dir_all(&data_dir)?;
         let mut conn = Connection::open(&db_path)?;
         init_connection(&conn)?;
@@ -44,13 +43,18 @@ impl Store {
         Ok(Self {
             conn,
             store_id,
-            data_dir,
+            data_dir: data_dir.clone(),
             db_path,
         })
     }
+
+    pub fn open_read_write() -> Result<Self> {
+        let (data_dir, _db_path) = Self::paths()?;
+        Self::open_at(&data_dir)
+    }
     
-    pub fn open_read_only() -> Result<Self> {
-        let (data_dir, db_path) = Self::paths()?;
+    pub fn open_read_only_at(data_dir: &PathBuf) -> Result<Self> {
+        let db_path = data_dir.join("snag.sqlite");
         if !db_path.exists() {
             return Err(anyhow::anyhow!("Store not found (has snag report been run?)"));
         }
@@ -63,9 +67,14 @@ impl Store {
         Ok(Self {
             conn,
             store_id,
-            data_dir,
+            data_dir: data_dir.clone(),
             db_path,
         })
+    }
+    
+    pub fn open_read_only() -> Result<Self> {
+        let (data_dir, _db_path) = Self::paths()?;
+        Self::open_read_only_at(&data_dir)
     }
     
     pub fn open_for_maintenance() -> Result<Self> {

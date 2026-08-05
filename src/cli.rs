@@ -172,10 +172,14 @@ pub struct RetractArgs {
 
 #[derive(Args)]
 pub struct RestoreArgs {
-    pub backup_dir: PathBuf,
+    pub archive: PathBuf,
 }
 
 #[derive(Args)]
 pub struct RebuildArgs {
-    pub stream: PathBuf,
+    #[arg(long = "from-export")]
+    pub from_export: PathBuf,
+
+    #[arg(long)]
+    pub destination: PathBuf,
 }

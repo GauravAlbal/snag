@@ -16,7 +16,7 @@ pub mod types;
 pub mod verify;
 pub mod restore;
 pub mod rebuild;
-
+pub mod record;
 use clap::Parser;
 use cli::{Cli, Command};
 

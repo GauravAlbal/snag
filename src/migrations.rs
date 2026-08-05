@@ -66,12 +66,16 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
     let mut new_sequence = 1_u64;
 
     for rec in old_records {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(store_id.as_bytes());
-        hasher.update(&new_sequence.to_le_bytes());
-        hasher.update(previous_hash.as_bytes());
-        hasher.update(rec.payload.as_bytes());
-        let record_hash = format!("blake3:{}", hasher.finalize().to_hex());
+        let record_payload: crate::record::RecordPayload = serde_json::from_str(&rec.payload).expect("Invalid legacy payload");
+        let canonical_record = crate::record::CanonicalRecordV1 {
+            local_sequence: new_sequence,
+            record_id: rec.id.clone(),
+            record_type: rec.typ.clone(),
+            entity_id: rec.entity_id.clone(),
+            captured_at: rec.captured_at.clone(),
+            payload: record_payload,
+        };
+        let record_hash = canonical_record.compute_hash(&store_id, &previous_hash);
 
         tx.execute(
             "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)

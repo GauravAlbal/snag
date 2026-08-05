@@ -200,3 +200,128 @@ fn test_certification_mission() {
         .success()
         .stdout(predicate::str::contains("Backup verified and saved"));
 }
+
+#[test]
+fn test_metadata_tamper() {
+    let ctx = TestContext::new();
+    
+    // 1. Create a record
+    ctx.cmd()
+        .arg("report")
+        .arg("Tamper Test")
+        .assert()
+        .success();
+        
+    // 2. Tamper with the sqlite DB directly
+    let db_path = ctx.data_dir.join("snag.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute("UPDATE records SET captured_at = '2000-01-01T00:00:00Z' WHERE local_sequence = 1", []).unwrap();
+    
+    // 3. Verify should fail
+    ctx.cmd()
+        .arg("verify")
+        .arg("--full")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Hash chain mismatch"));
+}
+
+#[test]
+fn test_export_protocol() {
+    let ctx = TestContext::new();
+    
+    ctx.cmd()
+        .arg("report")
+        .arg("Export Test 1")
+        .assert()
+        .success();
+        
+    let out_path = ctx.home_dir.path().join("export.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&out_path)
+        .assert()
+        .success();
+        
+    let content = std::fs::read_to_string(&out_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(lines.len() >= 2);
+    
+    let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(header["export_kind"], "export_header");
+    
+    let record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(record["export_kind"], "record");
+}
+
+#[test]
+fn test_rebuild_protocol() {
+    let ctx = TestContext::new();
+    
+    ctx.cmd()
+        .arg("report")
+        .arg("Rebuild Test 1")
+        .assert()
+        .success();
+        
+    let out_path = ctx.home_dir.path().join("export.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&out_path)
+        .assert()
+        .success();
+        
+    let rebuild_dest = ctx.home_dir.path().join("rebuilt_snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&out_path)
+        .arg("--destination")
+        .arg(&rebuild_dest)
+        .assert()
+        .success();
+        
+    // Verify the rebuilt DB
+    let rebuilt_db = rebuild_dest.join("snag.sqlite");
+    assert!(rebuilt_db.exists());
+    let conn = rusqlite::Connection::open(&rebuilt_db).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_restore_protocol() {
+    let ctx = TestContext::new();
+    
+    // Create record
+    ctx.cmd().arg("report").arg("Restore Test").assert().success();
+    
+    // Backup
+    ctx.cmd().arg("backup").assert().success();
+    
+    // Find the backup archive
+    let backups_dir = ctx.data_dir.join("backups");
+    let mut backup_archive = None;
+    for entry in std::fs::read_dir(&backups_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map_or(false, |e| e == "gz") {
+            backup_archive = Some(path);
+            break;
+        }
+    }
+    let archive_path = backup_archive.expect("Backup archive not found");
+    
+    // Try restoring when active store is non-empty -> should fail
+    ctx.cmd().arg("restore").arg(&archive_path).assert().failure().stderr(predicate::str::contains("non-empty"));
+    
+    // Delete store file directly
+    let _ = std::fs::remove_file(ctx.data_dir.join("snag.sqlite"));
+    
+    // Restore
+    ctx.cmd().arg("restore").arg(&archive_path).assert().success();
+    
+    // Verify
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+}

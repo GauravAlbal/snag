@@ -156,9 +156,20 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         labels: None,
         context,
         artifacts: artifacts.clone(),
+        affected_repository_ids: affected_repos.clone(),
     };
     
-    let canonical_payload = serde_json::to_string(&obs)?;
+    use crate::record::{CanonicalRecordV1, RecordPayload};
+    
+    let canonical_record = CanonicalRecordV1 {
+        local_sequence: local_sequence as u64,
+        record_id: obs.observation_id.clone(),
+        record_type: "observation_created".to_string(),
+        entity_id: obs.observation_id.clone(),
+        captured_at: obs.created_at.clone(),
+        payload: RecordPayload::Observation(obs.clone()),
+    };
+    let canonical_payload = serde_json::to_string(&canonical_record.payload)?;
 
     if let Some(ik) = &idempotency_key {
         let existing: rusqlite::Result<(String, String, i64, String)> = tx.query_row(
@@ -220,13 +231,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         }
     }
     
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(store.store_id.as_bytes());
-    hasher.update(&local_sequence.to_le_bytes());
-    hasher.update(previous_record_hash.as_bytes());
-    hasher.update(canonical_payload.as_bytes());
-    let record_hash = format!("blake3:{}", hasher.finalize().to_hex());
-
+    let record_hash = canonical_record.compute_hash(&store.store_id, &previous_record_hash);
     tx.execute(
         "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -448,15 +453,19 @@ pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
     let action_id = generate_id("act");
     let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
     let action_type = "retracted";
-    let action_payload_json = json!({"reason": "manual retraction"}).to_string();
+    use crate::record::{CanonicalRecordV1, RecordPayload, RetractionPayload};
     
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(store.store_id.as_bytes());
-    hasher.update(&local_sequence.to_le_bytes());
-    hasher.update(previous_record_hash.as_bytes());
-    hasher.update(action_payload_json.as_bytes());
-    let record_hash = format!("blake3:{}", hasher.finalize().to_hex());
+    let canonical_record = CanonicalRecordV1 {
+        local_sequence: local_sequence as u64,
+        record_id: action_id.clone(),
+        record_type: "observation_retracted".to_string(),
+        entity_id: args.observation_id.clone(),
+        captured_at: now.clone(),
+        payload: RecordPayload::Retraction(RetractionPayload { reason: "manual retraction".to_string() }),
+    };
     
+    let action_payload_json = serde_json::to_string(&canonical_record.payload)?;
+    let record_hash = canonical_record.compute_hash(&store.store_id, &previous_record_hash);    
     tx.execute(
         "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
