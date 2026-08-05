@@ -5,7 +5,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)
+![Version](https://img.shields.io/badge/version-0.2.0--dev-blue.svg)
 
 </div>
 

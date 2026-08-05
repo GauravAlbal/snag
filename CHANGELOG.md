@@ -5,10 +5,10 @@ All notable changes to snag are documented here. Format follows
 [SemVer](https://semver.org/). See [docs/RELEASING.md](docs/RELEASING.md) for
 the release process.
 
-> **Version state on `main`:** v0.1.1 (Apache-2.0) is the current release. The
-> prior MIT release `v0.1.0` is retired (its release and tag are removed);
-> v0.1.1 re-licenses the same core under Apache-2.0 and all later versions
-> stay Apache-2.0.
+> **Version state on `main`:** development for v0.2.0; `snag --version` reports
+> `0.2.0-dev` on unreleased builds. The current release is `v0.1.1`
+> (Apache-2.0); the prior MIT release `v0.1.0` is retired (release and tag
+> removed). All versions from v0.1.1 onward are Apache-2.0.
 
 ## [0.1.1] - 2026-08-05
 
