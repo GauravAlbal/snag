@@ -79,10 +79,28 @@ fn compute_bounds(args: &ExportArgs, store: &Store) -> Result<ExportBounds> {
 }
 
 fn build_header(store: &Store, bounds: &ExportBounds) -> serde_json::Value {
+    // Remediation records are additive to the export protocol: readers that
+    // only know observations/retractions can still reject the new record
+    // types cleanly, but any reader that must reconstruct remediation state
+    // (rebuild) needs to understand them — hence the version bump.
+    let has_remediation: bool = store
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE record_type IN (
+                 'observation_claimed','observation_claim_heartbeat','observation_claim_released',
+                 'observation_claim_expired','observation_reviewed','observation_disposition_set',
+                 'observation_reopened','observation_relationship_added','observation_relationship_retracted',
+                 'observation_promoted','remediation_task_attached','remediation_fix_attached',
+                 'remediation_verification_attached','remediation_marked_handled','remediation_reopened'
+             ) AND local_sequence >= ?1 AND local_sequence <= ?2)",
+            rusqlite::params![bounds.min_seq, bounds.actual_through_seq],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
     json!({
         "export_kind": "export_header",
         "export_schema_version": 1,
-        "minimum_reader_version": 1,
+        "minimum_reader_version": if has_remediation { 2 } else { 1 },
         "store_id": store.store_id,
         "first_sequence": bounds.first_seq,
         "through_sequence": bounds.actual_through_seq,

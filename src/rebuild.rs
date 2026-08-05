@@ -41,6 +41,15 @@ fn parse_and_validate_header(header_line: &str) -> Result<(String, u64, String, 
         .get("record_count")
         .and_then(|v| v.as_u64())
         .context("Missing record_count")?;
+    // The reader understands export protocol 1 with remediation records
+    // (minimum_reader_version 2); anything newer is rejected cleanly.
+    if let Some(min_v) = header
+        .get("minimum_reader_version")
+        .and_then(|v| v.as_i64())
+        && min_v > 2
+    {
+        anyhow::bail!("Unsupported minimum reader version: {min_v}");
+    }
     Ok((store_id, first_sequence, predecessor_hash, head_hash, count))
 }
 

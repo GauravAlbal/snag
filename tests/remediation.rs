@@ -1410,3 +1410,214 @@ fn t6_negative_dispositions_handle_without_task_or_patch() {
         assert!(handled);
     }
 }
+
+// ---------------------------------------------------------------------------
+// T8: export/rebuild round-trip.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t8_export_rebuild_preserves_all_remediation_state() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "exp-a", "bug", "major");
+    let b = report(&ctx, "exp-b", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-task")
+        .arg(&a)
+        .arg("--task-id")
+        .arg("t1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&a)
+        .arg("--commit")
+        .arg("sha1")
+        .arg("--repo")
+        .arg("r1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("rec1")
+        .arg("--status")
+        .arg("accepted")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&b)
+        .arg("--relation")
+        .arg("upstream-cause")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("claim")
+        .arg(&b)
+        .arg("--task")
+        .arg("t2")
+        .assert()
+        .success();
+
+    // Snapshot the materialized state before the round trip.
+    let conn = ctx.conn();
+    let state_before: Vec<(String, String, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT observation_id, state, handled FROM observation_review_state ORDER BY observation_id")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut v = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            v.push((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()));
+        }
+        v
+    };
+
+    let export_path = ctx.home_dir.path().join("export.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export_path)
+        .assert()
+        .success();
+    let rebuilt = ctx.home_dir.path().join("rebuilt");
+    // Rebuild's destination is a data dir (the store lands at
+    // <destination>/snag.sqlite), so pointing it at the XDG store dir makes
+    // the rebuilt store addressable with XDG_DATA_HOME=rebuilt.
+    let dest = rebuilt.join("snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export_path)
+        .arg("--destination")
+        .arg(&dest)
+        .assert()
+        .success();
+
+    // The rebuilt store passes full verification (chain + remediation checks).
+    ctx.cmd()
+        .env("XDG_DATA_HOME", &rebuilt)
+        .arg("verify")
+        .arg("--full")
+        .assert()
+        .success();
+
+    let conn2 = Connection::open(dest.join("snag.sqlite")).unwrap();
+    let state_after: Vec<(String, String, i64)> = {
+        let mut stmt = conn2
+            .prepare("SELECT observation_id, state, handled FROM observation_review_state ORDER BY observation_id")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut v = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            v.push((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap()));
+        }
+        v
+    };
+    assert_eq!(
+        state_before, state_after,
+        "review state must survive rebuild"
+    );
+
+    // Event history is complete.
+    let events: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM records WHERE record_type LIKE 'observation_%' OR record_type LIKE 'remediation_%'", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        events >= 8,
+        "remediation history must round-trip, got {events}"
+    );
+
+    // Relationships and links survive.
+    let rels: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM observation_relationships", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rels, 1);
+    let links: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM remediation_links", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        links, 4,
+        "finding? no — task + commit + verification + claim-time task"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T9: backup/restore.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t9_backup_restore_preserves_remediation_state() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "bk-a", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("rec1")
+        .arg("--status")
+        .arg("accepted")
+        .assert()
+        .success();
+
+    let out = ctx.cmd().arg("backup").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let archive = stdout
+        .lines()
+        .find_map(|l| l.split("saved to: ").nth(1))
+        .map(|p| p.trim().to_string())
+        .expect("backup path in stdout");
+
+    // Destroy the store, then restore from the archive.
+    let db = ctx.data_dir.join("snag.sqlite");
+    std::fs::remove_file(&db).unwrap();
+    ctx.cmd().arg("restore").arg(&archive).assert().success();
+
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+    let conn = ctx.conn();
+    let (state, handled): (String, i64) = conn
+        .query_row(
+            "SELECT state, handled FROM observation_review_state WHERE observation_id = ?1",
+            [&a],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "verified_fixed");
+    assert_eq!(handled, 1);
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE entity_id = ?1",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        events, 4,
+        "created + reviewed + disposition_set + verification"
+    );
+}

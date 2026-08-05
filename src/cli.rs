@@ -298,6 +298,10 @@ pub enum ReviewCommand {
     MarkHandled(ReviewMarkHandledArgs),
     /// Reopen a handled remediation (append-only)
     ReopenRemediation(ReviewReopenRemediationArgs),
+    /// Inspect the full evidence packet for one observation
+    Show(ReviewShowArgs),
+    /// List the observation's remediation event history
+    History(ReviewHistoryArgs),
 }
 
 #[derive(Args)]
@@ -612,4 +616,20 @@ pub struct ReviewReopenRemediationArgs {
 
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewShowArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewHistoryArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub format: Option<String>,
 }

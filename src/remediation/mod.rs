@@ -12,6 +12,7 @@ pub mod events;
 pub mod identity;
 pub mod queue;
 pub mod reducer;
+pub mod verify;
 
 use crate::cli::ReviewCommand;
 use crate::error::SnagError;
@@ -43,6 +44,8 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::AttachVerification(args) => attach_verification(args),
         ReviewCommand::MarkHandled(args) => mark_handled(args),
         ReviewCommand::ReopenRemediation(args) => reopen_remediation(args),
+        ReviewCommand::Show(args) => show(args),
+        ReviewCommand::History(args) => history(args),
     }
 }
 
@@ -1221,6 +1224,89 @@ fn reopen_remediation(args: crate::cli::ReviewReopenRemediationArgs) -> Result<(
         "Reopened remediation for {} (sequence {})",
         args.observation_id, appended.local_sequence
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inspection (show / history).
+// ---------------------------------------------------------------------------
+
+/// `snag review show <observation-id> [--format json]` — the full evidence
+/// packet (the same versioned envelope `next --format agent` emits), so a
+/// remediation session can re-inspect any queued observation.
+fn show(args: crate::cli::ReviewShowArgs) -> Result<()> {
+    let store = Store::open_read_only()?;
+    let packet = agent_packet(&store, &args.observation_id)?;
+    if args.format.as_deref() == Some("json") || args.format.as_deref() == Some("agent") {
+        println!("{}", serde_json::to_string_pretty(&packet)?);
+    } else {
+        // Observation id first, then the state line and the body fields.
+        let o = packet["observation"].clone();
+        println!("{}", args.observation_id);
+        println!(
+            "title: {}  severity: {}  kind: {}",
+            o["title"].as_str().unwrap_or(""),
+            o["severity_assertion"].as_str().unwrap_or("-"),
+            o["kind_assertion"].as_str().unwrap_or("-")
+        );
+        println!(
+            "state: {}  disposition: {}  handled: {}",
+            packet["current_state"]["remediation_status"]
+                .as_str()
+                .unwrap_or(""),
+            packet["current_state"]["disposition"]
+                .as_str()
+                .unwrap_or("-"),
+            packet["current_state"]["handled"]
+        );
+        if let Some(eb) = o["expected_behavior"].as_str() {
+            println!("expected: {eb}");
+        }
+        if let Some(ob) = o["observed_behavior"].as_str() {
+            println!("observed: {ob}");
+        }
+        if let Some(r) = o["reproduction"].as_str() {
+            println!("repro: {r}");
+        }
+        if packet["body_gap"].as_bool() == Some(true) {
+            println!("warning: thin body (severity above minor, no expected/observed/repro)");
+        }
+        let lineage = &packet["lineage"];
+        println!(
+            "lineage: finding={} tasks={} commits={} receipts={}",
+            lineage["finding_id"].as_str().unwrap_or("-"),
+            lineage["task_ids"].as_array().map(|v| v.len()).unwrap_or(0),
+            lineage["commits"].as_array().map(|v| v.len()).unwrap_or(0),
+            lineage["verification_receipts"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+/// `snag review history <observation-id> [--format json]` — every remediation
+/// event for the observation in stream order (append-only audit surface).
+fn history(args: crate::cli::ReviewHistoryArgs) -> Result<()> {
+    let store = Store::open_read_only()?;
+    let packet = agent_packet(&store, &args.observation_id)?;
+    let events = packet["remediation_history"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if args.format.as_deref() == Some("json") {
+        println!("{}", serde_json::to_string_pretty(&events)?);
+        return Ok(());
+    }
+    for ev in &events {
+        let seq = ev["local_sequence"].as_i64().unwrap_or(0);
+        let typ = ev["record_type"].as_str().unwrap_or("?");
+        println!("{}  {}", seq, typ);
+    }
+    if events.is_empty() {
+        println!("no remediation events for {}", args.observation_id);
+    }
     Ok(())
 }
 
