@@ -7,7 +7,7 @@ No wrapper, no private tooling, no context file required.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/main/install.sh | bash
 ```
 
 ## Instruction block (drop into AGENTS.md / CLAUDE.md)

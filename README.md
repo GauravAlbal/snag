@@ -26,7 +26,7 @@ instruction block plus an optional context file, nothing more.
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/main/install.sh | bash
 ```
 
 The installer downloads the platform binary from the latest GitHub release,

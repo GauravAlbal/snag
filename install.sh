@@ -3,7 +3,7 @@
 # snag installer
 #
 # One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/main/install.sh | bash
 #
 # Options:
 #   --version vX.Y.Z   Install a specific version (default: latest release)
@@ -25,7 +25,7 @@ umask 022
 
 OWNER="${SNAG_OWNER:-GauravAlbal}"
 REPO="${SNAG_REPO:-snag}"
-BRANCH="${SNAG_BRANCH:-master}"
+BRANCH="${SNAG_BRANCH:-main}"
 VERSION="${VERSION:-}"
 DEST="${DEST:-$HOME/.local/bin}"
 SYSTEM=0

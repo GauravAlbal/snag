@@ -19,7 +19,7 @@ internal), see [STABILITY.md](STABILITY.md).
 ### 1. Prepare
 
 ```sh
-git checkout master && git pull
+git checkout main && git pull
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --no-fail-fast
@@ -38,7 +38,7 @@ Edit `Cargo.toml` `version` per SemVer. Update `CHANGELOG.md`:
 ```sh
 git add -A && git commit -m "chore: release vX.Y.Z"
 git tag -a vX.Y.Z -m "snag vX.Y.Z"
-git push origin master --tags
+git push origin main --tags
 ```
 
 Pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which:

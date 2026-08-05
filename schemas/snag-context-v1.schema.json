@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/GauravAlbal/snag/blob/master/schemas/snag-context-v1.schema.json",
+  "$id": "https://github.com/GauravAlbal/snag/blob/main/schemas/snag-context-v1.schema.json",
   "title": "Snag context file (SNAG_CONTEXT_FILE), version 1",
   "description": "Optional session context attached to a `snag report`, read from the file named by the SNAG_CONTEXT_FILE environment variable. Every field is optional except schema_version. Unknown top-level keys are ignored by the reader (documented compatibility rule); a schema_version other than 1 is rejected with a typed error.",
   "type": "object",

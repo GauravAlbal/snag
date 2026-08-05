@@ -65,7 +65,7 @@ glyphs in a terminal.
 ## Run it yourself
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/main/install.sh | bash
 cd "$(mktemp -d)" && git init -q && snag report "try me" && snag list && snag verify --full
 ```
 
