@@ -32,7 +32,7 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
             previous_record_hash TEXT NOT NULL,
             record_hash TEXT NOT NULL
         );
-        "
+        ",
     )?;
 
     // Park all old sequences out of the positive range so new global sequences
@@ -82,19 +82,26 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
 
     // G33 deterministic ordering: captured_at, class order, original seq, id.
     old_records.sort_by(|a, b| {
-        a.captured_at.cmp(&b.captured_at)
+        a.captured_at
+            .cmp(&b.captured_at)
             .then_with(|| a.class_order.cmp(&b.class_order))
             .then_with(|| a.seq.cmp(&b.seq))
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let store_id: String = tx.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |row| row.get(0)).unwrap_or_else(|_| "store_000".to_string());
+    let store_id: String = tx
+        .query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|_| "store_000".to_string());
 
-    let mut previous_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    let mut previous_hash =
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string();
 
     let mut new_sequence = 1_u64;
     let mut count = 0_i64;
 
+    #[allow(clippy::explicit_counter_loop)]
     for rec in old_records {
         let record_payload: crate::record::RecordPayload = serde_json::from_str(&rec.payload)
             .map_err(|e| anyhow::anyhow!("invalid legacy payload for {}: {}", rec.id, e))?;

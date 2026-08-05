@@ -1,8 +1,8 @@
-use crate::store::Store;
-use crate::git::{GitContext, normalize_remote_alias};
-use crate::types::generate_id;
 use crate::error::SnagError;
-use rusqlite::{params, OptionalExtension};
+use crate::git::{GitContext, normalize_remote_alias};
+use crate::store::Store;
+use crate::types::generate_id;
+use rusqlite::{OptionalExtension, params};
 
 /// Role of a repository in an observation: the repository the observation was
 /// made from (primary) or a repository it is understood to affect.
@@ -37,7 +37,9 @@ fn ensure_explicit_repo(store: &mut Store, id: &str, now: &str) -> anyhow::Resul
     let tx = store.conn.transaction()?;
     let exists: i64 = tx.query_row(
         "SELECT COUNT(*) FROM repositories WHERE repository_id = ?1",
-        params![id], |r| r.get(0))?;
+        params![id],
+        |r| r.get(0),
+    )?;
     if exists == 0 {
         tx.execute(
             "INSERT INTO repositories (repository_id, created_at) VALUES (?1, ?2)",
@@ -71,13 +73,23 @@ fn record_aliases(store: &mut Store, aliases: &[String], repo_id: &str, now: &st
 }
 
 /// Ensure a checkout row exists for the given repo + git common dir.
-fn ensure_checkout_for(store: &mut Store, git_ctx: &GitContext, repo_id: &str, now: &str)
-    -> Option<String> {
+fn ensure_checkout_for(
+    store: &mut Store,
+    git_ctx: &GitContext,
+    repo_id: &str,
+    now: &str,
+) -> Option<String> {
     let git_common_dir = git_ctx.git_common_dir.clone()?;
     let conn = store.conn.transaction().ok()?;
-    let existing: Option<String> = conn.query_row(
-        "SELECT checkout_id FROM checkouts WHERE git_common_dir = ?1",
-        params![&git_common_dir], |r| r.get(0)).optional().ok()?.flatten();
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT checkout_id FROM checkouts WHERE git_common_dir = ?1",
+            params![&git_common_dir],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()?
+        .flatten();
     if existing.is_some() {
         conn.commit().ok();
         return existing;
@@ -94,14 +106,23 @@ fn ensure_checkout_for(store: &mut Store, git_ctx: &GitContext, repo_id: &str, n
     }
 }
 
-fn ensure_worktree_for(store: &mut Store, git_ctx: &GitContext, checkout_id: Option<&str>, now: &str)
-    -> Option<String> {
+fn ensure_worktree_for(
+    store: &mut Store,
+    git_ctx: &GitContext,
+    checkout_id: Option<&str>,
+    now: &str,
+) -> Option<String> {
     let checkout_id = checkout_id?;
     let root = git_ctx.repository_root.clone()?;
     let conn = store.conn.transaction().ok()?;
-    if let Ok(Some(wt)) = conn.query_row(
-        "SELECT worktree_id FROM worktrees WHERE worktree_path = ?1",
-        params![root], |r| r.get(0)).optional() {
+    if let Ok(Some(wt)) = conn
+        .query_row(
+            "SELECT worktree_id FROM worktrees WHERE worktree_path = ?1",
+            params![root],
+            |r| r.get(0),
+        )
+        .optional()
+    {
         conn.commit().ok();
         return wt;
     }
@@ -124,6 +145,7 @@ fn ensure_worktree_for(store: &mut Store, git_ctx: &GitContext, checkout_id: Opt
 ///   4. known checkout binding (git common dir)
 ///   5. unique remote alias
 ///   6. new repository identity
+///
 /// The caller merges explicit/context/env precedence into `explicit_repo_id`.
 pub fn resolve_repository(
     store: &mut Store,
@@ -131,7 +153,8 @@ pub fn resolve_repository(
     explicit_repo_id: Option<&str>,
 ) -> anyhow::Result<RepositoryResolution> {
     let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339).unwrap();
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let mut warnings = git_ctx.warnings.clone();
 
     // 1-3. Explicit identity.
@@ -143,7 +166,10 @@ pub fn resolve_repository(
             let tx = store.conn.transaction()?;
             tx.query_row(
                 "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
-                params![dir], |r| r.get(0)).optional()?
+                params![dir],
+                |r| r.get(0),
+            )
+            .optional()?
         };
         if let Some(rid) = existing {
             rid
@@ -160,7 +186,10 @@ pub fn resolve_repository(
                         params![&rid, &now],
                     )?;
                     tx.commit()?;
-                    warnings.push("created a new repository identity (no known checkout or unique alias)".to_string());
+                    warnings.push(
+                        "created a new repository identity (no known checkout or unique alias)"
+                            .to_string(),
+                    );
                     rid
                 }
             }
@@ -196,7 +225,8 @@ fn unique_alias_match(store: &mut Store, aliases: &[String]) -> anyhow::Result<O
     for alias in aliases {
         let norm = normalize_remote_alias(alias);
         let mut stmt = tx.prepare(
-            "SELECT repository_id FROM repository_aliases WHERE alias = ?1 ORDER BY repository_id")?;
+            "SELECT repository_id FROM repository_aliases WHERE alias = ?1 ORDER BY repository_id",
+        )?;
         let mut rows = stmt.query(params![norm])?;
         while let Some(row) = rows.next()? {
             let rid: String = row.get(0)?;
@@ -209,7 +239,8 @@ fn unique_alias_match(store: &mut Store, aliases: &[String]) -> anyhow::Result<O
         return Err(SnagError::RepositoryAmbiguous(format!(
             "aliases {:?} match multiple repositories: {:?}",
             aliases, candidates
-        )).into());
+        ))
+        .into());
     }
     Ok(candidates.pop())
 }
@@ -226,7 +257,9 @@ pub fn resolve_affected_repository(
         let res = resolve_repository(store, git_ctx, None)?;
         if git_ctx.git_common_dir.is_none() {
             return Err(SnagError::RepositoryNotFound(
-                "current: not inside a git repository".to_string()).into());
+                "current: not inside a git repository".to_string(),
+            )
+            .into());
         }
         return Ok(res.repository_id);
     }
@@ -247,8 +280,11 @@ pub fn resolve_affected_repository(
             SnagError::RepositoryInvalid(format!("could not inspect path {}", value))
         })?;
         if resolved.git_common_dir.is_none() {
-            return Err(SnagError::RepositoryNotFound(
-                format!("{} is not inside a git repository", value)).into());
+            return Err(SnagError::RepositoryNotFound(format!(
+                "{} is not inside a git repository",
+                value
+            ))
+            .into());
         }
         return resolve_repository(store, &resolved, None).map(|r| r.repository_id);
     }
@@ -263,10 +299,15 @@ pub fn resolve_affected_repository(
     let tx = store.conn.transaction()?;
     let exists: i64 = tx.query_row(
         "SELECT COUNT(*) FROM repositories WHERE repository_id = ?1",
-        params![value], |r| r.get(0))?;
+        params![value],
+        |r| r.get(0),
+    )?;
     if exists > 0 {
         return Ok(value.to_string());
     }
     Err(SnagError::RepositoryNotFound(format!(
-        "{} is not a known repository, alias, or existing path", value)).into())
+        "{} is not a known repository, alias, or existing path",
+        value
+    ))
+    .into())
 }

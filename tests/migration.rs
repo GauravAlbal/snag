@@ -16,7 +16,8 @@ impl TestContext {
     }
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("snag").unwrap();
-        c.env("XDG_DATA_HOME", self.home_dir.path()).env("HOME", self.home_dir.path());
+        c.env("XDG_DATA_HOME", self.home_dir.path())
+            .env("HOME", self.home_dir.path());
         c
     }
 }
@@ -172,17 +173,30 @@ fn test_v1_migration_fixture() {
 
     // A write-open triggers the migration chain (v1->v2->v3->v4), which runs
     // full verification immediately after migrating.
-    ctx.cmd().arg("report").arg("post-migration").assert().success();
+    ctx.cmd()
+        .arg("report")
+        .arg("post-migration")
+        .assert()
+        .success();
 
     // Independent full verification of the migrated store.
     ctx.cmd().arg("verify").arg("--full").assert().success();
 
     let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
     // All legacy records survived in the global stream.
-    let records: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap();
-    let obs: i64 = conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0)).unwrap();
-    let acts: i64 = conn.query_row("SELECT COUNT(*) FROM observation_actions", [], |r| r.get(0)).unwrap();
-    assert_eq!(obs, 3, "two legacy observations plus the post-migration report must survive");
+    let records: i64 = conn
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap();
+    let obs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+        .unwrap();
+    let acts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observation_actions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        obs, 3,
+        "two legacy observations plus the post-migration report must survive"
+    );
     assert_eq!(acts, 1, "legacy action must survive");
     // 2 obs + 1 action + 1 new report observation = 4 records.
     assert_eq!(records, 4);
@@ -190,7 +204,9 @@ fn test_v1_migration_fixture() {
     // Deterministic ordering: obs_b (01-01, class0) before action (01-01,
     // class1) before obs_a (01-02, class0).
     let order: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT local_sequence, record_type FROM records ORDER BY local_sequence").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT local_sequence, record_type FROM records ORDER BY local_sequence")
+            .unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut v = Vec::new();
         while let Some(r) = rows.next().unwrap() {
@@ -206,7 +222,14 @@ fn test_v1_migration_fixture() {
     // Forensic pre-migration copy exists.
     let forensics = ctx.data_dir.join("forensics");
     let has_copy = std::fs::read_dir(&forensics)
-        .map(|mut it| it.any(|e| e.unwrap().file_name().to_string_lossy().starts_with("pre-v2-migration-")))
+        .map(|mut it| {
+            it.any(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pre-v2-migration-")
+            })
+        })
         .unwrap_or(false);
     assert!(has_copy, "forensic pre-migration copy missing");
 }
@@ -225,7 +248,9 @@ fn test_v1_migration_malformed_payload_fails() {
     )
     .unwrap();
 
-    ctx.cmd().arg("report").arg("boom")
+    ctx.cmd()
+        .arg("report")
+        .arg("boom")
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid legacy payload"));

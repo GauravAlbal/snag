@@ -23,6 +23,7 @@ impl Cli {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Command {
     /// Durably records one observation
@@ -110,10 +111,10 @@ pub struct ListArgs {
 
     #[arg(long)]
     pub source: Option<String>,
-    
+
     #[arg(long)]
     pub kind: Option<String>,
-    
+
     #[arg(long)]
     pub limit: Option<usize>,
 

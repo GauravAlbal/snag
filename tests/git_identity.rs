@@ -25,7 +25,11 @@ impl TestContext {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = Proc::new("git").args(args).current_dir(dir).status().unwrap();
+    let status = Proc::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap();
     assert!(status.success(), "git {:?} failed", args);
 }
 
@@ -59,22 +63,49 @@ fn test_linked_worktrees_share_repository() {
     let ctx = TestContext::new();
     let main = ctx.home_dir.path().join("main");
     init_repo(&main);
-    git(&main, &["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+    git(
+        &main,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
     git(&main, &["worktree", "add", "-q", "../wt1", "-b", "feature"]);
     let wt1 = ctx.home_dir.path().join("wt1");
 
-    ctx.cmd().current_dir(&main).arg("report").arg("in main").assert().success();
-    ctx.cmd().current_dir(&wt1).arg("report").arg("in wt1").assert().success();
+    ctx.cmd()
+        .current_dir(&main)
+        .arg("report")
+        .arg("in main")
+        .assert()
+        .success();
+    ctx.cmd()
+        .current_dir(&wt1)
+        .arg("report")
+        .arg("in wt1")
+        .assert()
+        .success();
 
     let repos = store_rows(&ctx, "SELECT repository_id, created_at FROM repositories");
     let checkouts = store_rows(&ctx, "SELECT checkout_id, repository_id FROM checkouts");
     let worktrees = store_rows(&ctx, "SELECT worktree_id, checkout_id FROM worktrees");
 
     assert_eq!(repos.len(), 1, "expected one repository, got {repos:?}");
-    assert_eq!(checkouts.len(), 1, "expected one checkout, got {checkouts:?}");
-    assert_eq!(worktrees.len(), 2, "expected two worktrees, got {worktrees:?}");
-    assert_ne!(worktrees[0].0, worktrees[1].0, "worktree ids must be distinct");
-    assert_eq!(worktrees[0].1, worktrees[1].1, "worktrees must share one checkout");
+    assert_eq!(
+        checkouts.len(),
+        1,
+        "expected one checkout, got {checkouts:?}"
+    );
+    assert_eq!(
+        worktrees.len(),
+        2,
+        "expected two worktrees, got {worktrees:?}"
+    );
+    assert_ne!(
+        worktrees[0].0, worktrees[1].0,
+        "worktree ids must be distinct"
+    );
+    assert_eq!(
+        worktrees[0].1, worktrees[1].1,
+        "worktrees must share one checkout"
+    );
 }
 
 /// Ambiguous remote aliases must not silently pick the first candidate (G30).
@@ -90,16 +121,47 @@ fn test_ambiguous_remote_aliases() {
 
     // Two DISTINCT repositories both already confirmed against the SAME
     // normalized alias (SSH form on A, HTTPS form on B).
-    git(&a, &["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
-    git(&b, &["remote", "add", "origin", "https://github.com/acme/widgets.git"]);
-    ctx.cmd().current_dir(&a).arg("report").arg("in a").arg("--repo-id").arg("repoA").assert().success();
-    ctx.cmd().current_dir(&b).arg("report").arg("in b").arg("--repo-id").arg("repoB").assert().success();
+    git(
+        &a,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+    git(
+        &b,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    ctx.cmd()
+        .current_dir(&a)
+        .arg("report")
+        .arg("in a")
+        .arg("--repo-id")
+        .arg("repoA")
+        .assert()
+        .success();
+    ctx.cmd()
+        .current_dir(&b)
+        .arg("report")
+        .arg("in b")
+        .arg("--repo-id")
+        .arg("repoB")
+        .assert()
+        .success();
 
     // A third fresh checkout with the same alias, no checkout binding and no
     // explicit identity, must be reported AMBIGUOUS rather than silently bound
     // to the first candidate.
-    git(&c, &["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
-    ctx.cmd().current_dir(&c).arg("report").arg("in c")
+    git(
+        &c,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+    ctx.cmd()
+        .current_dir(&c)
+        .arg("report")
+        .arg("in c")
         .assert()
         .failure()
         .stderr(predicate::str::contains("ambiguous"));
@@ -122,8 +184,10 @@ fn test_explicit_repo_id() {
         .success();
 
     let repos = store_rows(&ctx, "SELECT repository_id, created_at FROM repositories");
-    assert!(repos.iter().any(|(id, _)| id == "repo_corp_backend"),
-        "explicit repository id not present: {repos:?}");
+    assert!(
+        repos.iter().any(|(id, _)| id == "repo_corp_backend"),
+        "explicit repository id not present: {repos:?}"
+    );
 }
 
 /// `--affected-repo` resolves by ID and persists the relationship with a role
@@ -135,9 +199,17 @@ fn test_affected_repo_by_id() {
     init_repo(&main);
     let other = ctx.home_dir.path().join("other");
     init_repo(&other);
-    ctx.cmd().current_dir(&other).arg("report").arg("bind other").assert().success();
+    ctx.cmd()
+        .current_dir(&other)
+        .arg("report")
+        .arg("bind other")
+        .assert()
+        .success();
 
-    let ids = store_rows(&ctx, "SELECT repository_id, created_at FROM repositories ORDER BY created_at DESC");
+    let ids = store_rows(
+        &ctx,
+        "SELECT repository_id, created_at FROM repositories ORDER BY created_at DESC",
+    );
     let other_id = ids[0].0.clone();
 
     ctx.cmd()
@@ -156,11 +228,16 @@ fn test_affected_repo_by_id() {
         let mut stmt = conn.prepare(
             "SELECT o.title, r.role FROM observation_repositories r JOIN observations o ON o.observation_id = r.observation_id WHERE r.repository_id = ?1",
         ).unwrap();
-        let mut it = stmt
-            .query_map(rusqlite::params![&other_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        let it = stmt
+            .query_map(rusqlite::params![&other_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .unwrap();
         it.map(|r| r.unwrap()).collect()
     };
-    assert!(rows.iter().any(|(t, role)| t == "affects other" && role == "affected"),
-        "expected affected role persisted, got {rows:?}");
+    assert!(
+        rows.iter()
+            .any(|(t, role)| t == "affects other" && role == "affected"),
+        "expected affected role persisted, got {rows:?}"
+    );
 }

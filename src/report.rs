@@ -1,10 +1,10 @@
+use crate::artifacts::ArtifactStorage;
 use crate::cli::ReportArgs;
 use crate::context::gather_context;
 use crate::error::SnagError;
-use crate::parser::{parse_prose, JsonInput};
+use crate::parser::{JsonInput, parse_prose};
 use crate::store::Store;
-use crate::artifacts::ArtifactStorage;
-use crate::types::{Observation, ArtifactReference, Sensitivity, generate_id};
+use crate::types::{ArtifactReference, Observation, generate_id};
 use anyhow::Result;
 use serde_json::json;
 use std::io::{self, Read};
@@ -33,64 +33,118 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     // CLI explicit kwargs take precedence over JSON/prose fields.
     let cli_kind = args.kind.clone();
     let cli_severity = args.severity.clone();
-    
+
     if args.stdin {
         let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer).map_err(|e| SnagError::Other(e.into()))?;
+        io::stdin()
+            .read_to_string(&mut buffer)
+            .map_err(|e| SnagError::Other(e.into()))?;
         let parsed = parse_prose(&buffer);
         if !parsed.title.is_empty() && title.is_none() {
             title = Some(parsed.title);
         }
-        if parsed.summary.is_some() { summary = parsed.summary; }
-        if parsed.expected.is_some() { expected_behavior = parsed.expected; }
-        if parsed.observed.is_some() { observed_behavior = parsed.observed; }
-        if parsed.repro.is_some() { repro = parsed.repro; }
-        if parsed.workaround.is_some() { workaround = parsed.workaround; }
-        if parsed.impact.is_some() { impact = parsed.impact; }
+        if parsed.summary.is_some() {
+            summary = parsed.summary;
+        }
+        if parsed.expected.is_some() {
+            expected_behavior = parsed.expected;
+        }
+        if parsed.observed.is_some() {
+            observed_behavior = parsed.observed;
+        }
+        if parsed.repro.is_some() {
+            repro = parsed.repro;
+        }
+        if parsed.workaround.is_some() {
+            workaround = parsed.workaround;
+        }
+        if parsed.impact.is_some() {
+            impact = parsed.impact;
+        }
     }
-    
+
     if args.json {
         let path = args.title.clone().unwrap_or_else(|| "-".to_string());
         let mut buffer = String::new();
         if path == "-" {
-            io::stdin().read_to_string(&mut buffer).map_err(|e| SnagError::Other(e.into()))?;
+            io::stdin()
+                .read_to_string(&mut buffer)
+                .map_err(|e| SnagError::Other(e.into()))?;
         } else {
-            buffer = std::fs::read_to_string(&path).map_err(|e| SnagError::Validation(format!("Could not read JSON file: {}", e)))?;
+            buffer = std::fs::read_to_string(&path)
+                .map_err(|e| SnagError::Validation(format!("Could not read JSON file: {}", e)))?;
         }
-        
-        let json_input: JsonInput = serde_json::from_str(&buffer).map_err(|e| SnagError::Validation(format!("Invalid JSON: {}", e)))?;
-        
-        if let Some(sv) = json_input.schema_version {
-            if sv != 1 {
-                return Err(SnagError::UnsupportedSchema(sv.to_string()).into());
-            }
+
+        let json_input: JsonInput = serde_json::from_str(&buffer)
+            .map_err(|e| SnagError::Validation(format!("Invalid JSON: {}", e)))?;
+
+        if let Some(sv) = json_input.schema_version
+            && sv != 1
+        {
+            return Err(SnagError::UnsupportedSchema(sv.to_string()).into());
         }
-        
-        if let Some(t) = json_input.title { title = Some(t); }
-        if let Some(s) = json_input.summary { summary = Some(s); }
-        if let Some(k) = json_input.kind_assertion { kind = Some(k); }
-        if let Some(sev) = json_input.severity_assertion { severity = Some(sev); }
-        if let Some(exp) = json_input.expected_behavior { expected_behavior = Some(exp); }
-        if let Some(obs) = json_input.observed_behavior { observed_behavior = Some(obs); }
-        if let Some(r) = json_input.reproduction { repro = Some(r); }
-        if let Some(w) = json_input.workaround { workaround = Some(w); }
-        if let Some(i) = json_input.impact { impact = Some(i); }
-        if let Some(ik) = json_input.idempotency_key { idempotency_key = Some(ik); }
-        if let Some(ar) = json_input.affected_repositories { affected_repos = ar; }
-        if let Some(c) = json_input.confidence { confidence = Some(c); }
-        if let Some(s) = json_input.sensitivity { sensitivity = Some(s); }
-        if let Some(l) = json_input.labels { labels = Some(l); }
-        if let Some(src) = json_input.source { source_override = Some(src); }
-        if let Some(ctxt) = json_input.context { context_override = Some(ctxt); }
+
+        if let Some(t) = json_input.title {
+            title = Some(t);
+        }
+        if let Some(s) = json_input.summary {
+            summary = Some(s);
+        }
+        if let Some(k) = json_input.kind_assertion {
+            kind = Some(k);
+        }
+        if let Some(sev) = json_input.severity_assertion {
+            severity = Some(sev);
+        }
+        if let Some(exp) = json_input.expected_behavior {
+            expected_behavior = Some(exp);
+        }
+        if let Some(obs) = json_input.observed_behavior {
+            observed_behavior = Some(obs);
+        }
+        if let Some(r) = json_input.reproduction {
+            repro = Some(r);
+        }
+        if let Some(w) = json_input.workaround {
+            workaround = Some(w);
+        }
+        if let Some(i) = json_input.impact {
+            impact = Some(i);
+        }
+        if let Some(ik) = json_input.idempotency_key {
+            idempotency_key = Some(ik);
+        }
+        if let Some(ar) = json_input.affected_repositories {
+            affected_repos = ar;
+        }
+        if let Some(c) = json_input.confidence {
+            confidence = Some(c);
+        }
+        if let Some(s) = json_input.sensitivity {
+            sensitivity = Some(s);
+        }
+        if let Some(l) = json_input.labels {
+            labels = Some(l);
+        }
+        if let Some(src) = json_input.source {
+            source_override = Some(src);
+        }
+        if let Some(ctxt) = json_input.context {
+            context_override = Some(ctxt);
+        }
         if let Some(arts) = json_input.artifacts {
             artifact_paths.extend(arts.into_iter().map(PathBuf::from));
         }
     }
 
     // CLI explicit flags override JSON fields.
-    if cli_kind.is_some() { kind = cli_kind; }
-    if cli_severity.is_some() { severity = cli_severity; }
-    
+    if cli_kind.is_some() {
+        kind = cli_kind;
+    }
+    if cli_severity.is_some() {
+        severity = cli_severity;
+    }
+
     let title = title.unwrap_or_default();
     if title.is_empty() {
         return Err(SnagError::Validation("Title is required".to_string()).into());
@@ -107,13 +161,23 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     if let Some(ctxt) = context_override {
         // Merge explicit context into the gathered one, preserving the
         // auto-detected repository identity unless the input replaces it.
-        if let Some(exec) = ctxt.execution {
-            if let Some(cur) = context.execution.as_mut() {
-                if exec.workspace_id.is_some() { cur.workspace_id = exec.workspace_id; }
-                if exec.program_id.is_some() { cur.program_id = exec.program_id; }
-                if exec.session_id.is_some() { cur.session_id = exec.session_id; }
-                if exec.pearl_id.is_some() { cur.pearl_id = exec.pearl_id; }
-                if exec.attempt_id.is_some() { cur.attempt_id = exec.attempt_id; }
+        if let Some(exec) = ctxt.execution
+            && let Some(cur) = context.execution.as_mut()
+        {
+            if exec.workspace_id.is_some() {
+                cur.workspace_id = exec.workspace_id;
+            }
+            if exec.program_id.is_some() {
+                cur.program_id = exec.program_id;
+            }
+            if exec.session_id.is_some() {
+                cur.session_id = exec.session_id;
+            }
+            if exec.pearl_id.is_some() {
+                cur.pearl_id = exec.pearl_id;
+            }
+            if exec.attempt_id.is_some() {
+                cur.attempt_id = exec.attempt_id;
             }
         }
         if ctxt.extra.is_some() {
@@ -124,23 +188,30 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     // 3. Artifact Storage setup
     let mut store = Store::open_read_write()?;
     let artifact_storage = ArtifactStorage::new(&store.data_dir)?;
-    
+
     let mut artifacts = Vec::new();
     let mut total_artifact_bytes = 0_u64;
     for artifact_path in &artifact_paths {
         let (digest, size) = artifact_storage.ingest_file(artifact_path)?;
         total_artifact_bytes += size;
         if total_artifact_bytes > 250 * 1024 * 1024 {
-            return Err(SnagError::Validation("Total artifacts size exceeds 250 MiB limit".to_string()).into());
+            return Err(SnagError::Validation(
+                "Total artifacts size exceeds 250 MiB limit".to_string(),
+            )
+            .into());
         }
-        
-        let name = artifact_path.file_name().map(|n| n.to_string_lossy().into_owned());
+
+        let name = artifact_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
         artifacts.push(ArtifactReference {
             digest,
             byte_length: size,
             media_type: None,
             original_name: name,
-            created_at: time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap(),
+            created_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
         });
     }
 
@@ -155,7 +226,11 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         temp_git.repository_root = repo_ctx.repository_root.clone();
     }
     if let Some(repo_ctx) = context.repository.as_mut() {
-        let res = crate::identity::resolve_repository(&mut store, &temp_git, repo_ctx.repository_id.as_deref())?;
+        let res = crate::identity::resolve_repository(
+            &mut store,
+            &temp_git,
+            repo_ctx.repository_id.as_deref(),
+        )?;
         if !res.repository_id.is_empty() {
             repo_ctx.repository_id = Some(res.repository_id.clone());
             repo_ctx.checkout_id = res.checkout_id;
@@ -176,31 +251,39 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         }
     }
     let mut all_repo_ids = resolved_affected.clone();
-    if let Some(p) = &primary_repo_id {
-        if !all_repo_ids.contains(p) {
-            all_repo_ids.push(p.clone());
-        }
+    if let Some(p) = &primary_repo_id
+        && !all_repo_ids.contains(p)
+    {
+        all_repo_ids.push(p.clone());
     }
     affected_repos = all_repo_ids;
 
     // 4. Begin Transaction and allocate
-    let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
     let local_sequence: i64 = tx.query_row(
         "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM records",
         [],
         |row| row.get(0),
     )?;
-    
-    let previous_record_hash: String = tx.query_row(
-        "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    ).unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000000".to_string());
-    
+
+    let previous_record_hash: String = tx
+        .query_row(
+            "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        });
+
     let obs_id = generate_id("obs");
-    let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
-    
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+
     let obs = Observation {
         schema_version: 1,
         observation_id: obs_id.clone(),
@@ -225,9 +308,9 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         artifacts: artifacts.clone(),
         affected_repository_ids: affected_repos.clone(),
     };
-    
+
     use crate::record::{CanonicalRecordV1, RecordPayload};
-    
+
     let canonical_record = CanonicalRecordV1 {
         local_sequence: local_sequence as u64,
         record_id: obs.observation_id.clone(),
@@ -275,7 +358,10 @@ pub fn handle(args: ReportArgs) -> Result<()> {
                         });
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     } else {
-                        println!("Observation already exists: {}  [sequence {}]", old_id, old_seq);
+                        println!(
+                            "Observation already exists: {}  [sequence {}]",
+                            old_id, old_seq
+                        );
                     }
                     return Ok(());
                 }
@@ -284,12 +370,13 @@ pub fn handle(args: ReportArgs) -> Result<()> {
                     return Err(SnagError::IdempotencyConflict(format!(
                         "idempotency key {} already used with a different semantic payload",
                         ik
-                    )).into());
+                    ))
+                    .into());
                 }
             }
         }
     }
-    
+
     let record_hash = canonical_record.compute_hash(&store.store_id, &previous_record_hash);
     tx.execute(
         "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
@@ -357,7 +444,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
             ],
         )?;
         tx.execute(
-            "INSERT INTO observation_artifacts (observation_id, digest) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO observation_artifacts (observation_id, digest) VALUES (?1, ?2)",
             rusqlite::params![&obs.observation_id, &art.digest],
         )?;
     }
@@ -396,11 +483,14 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!("Recorded {}  [sequence {}]", obs.observation_id, obs.local_sequence);
+        println!(
+            "Recorded {}  [sequence {}]",
+            obs.observation_id, obs.local_sequence
+        );
         println!("artifacts: {}", obs.artifacts.len());
         println!("sync: local");
     }
-    
+
     Ok(())
 }
 
@@ -431,8 +521,14 @@ fn list_json(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
 }
 
 fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
-    println!("{:<20} | {:<6} | {:<24} | {:<26} | {}", "ID", "Seq", "Date", "Title", "Retracted");
-    println!("{:-<20}-+-{:-<6}-+-{:-<24}-+-{:-<26}-+-{:-<10}", "", "", "", "", "");
+    println!(
+        "{:<20} | {:<6} | {:<24} | {:<26} | Retracted",
+        "ID", "Seq", "Date", "Title"
+    );
+    println!(
+        "{:-<20}-+-{:-<6}-+-{:-<24}-+-{:-<26}-+-{:-<10}",
+        "", "", "", "", ""
+    );
     while let Some(row) = rows.next()? {
         let observation_id: String = row.get(0)?;
         let local_sequence: i64 = row.get(1)?;
@@ -440,7 +536,10 @@ fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
         let title: String = row.get(3)?;
         let retracted: bool = row.get(4)?;
         let mark = if retracted { "RETRACTED" } else { "" };
-        println!("{:<20} | {:<6} | {:<24} | {:<26} | {}", observation_id, local_sequence, captured_at, title, mark);
+        println!(
+            "{:<20} | {:<6} | {:<24} | {:<26} | {}",
+            observation_id, local_sequence, captured_at, title, mark
+        );
     }
     Ok(())
 }
@@ -460,20 +559,23 @@ fn parse_since(s: &str) -> anyhow::Result<i64> {
         "d" => n * 86400,
         _ => {
             return Err(crate::error::SnagError::Validation(format!(
-                "invalid --since duration unit: {}", s
-            )).into())
+                "invalid --since duration unit: {}",
+                s
+            ))
+            .into());
         }
     };
     Ok(secs)
 }
 
 pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
-    if let Some(fmt) = &args.format {
-        if fmt != "json" && fmt != "table" {
-            return Err(crate::error::SnagError::Validation(format!(
-                "invalid --format: {}", fmt
-            )).into());
-        }
+    if let Some(fmt) = &args.format
+        && fmt != "json"
+        && fmt != "table"
+    {
+        return Err(
+            crate::error::SnagError::Validation(format!("invalid --format: {}", fmt)).into(),
+        );
     }
 
     let store = Store::open_read_only()?;
@@ -513,9 +615,14 @@ pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let git_ctx = crate::git::collect_git_context(&cwd).unwrap_or_default();
             let repo_id: Option<String> = if let Some(dir) = &git_ctx.git_common_dir {
-                store.conn.query_row(
-                    "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
-                    rusqlite::params![dir], |r| r.get(0)).ok()
+                store
+                    .conn
+                    .query_row(
+                        "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
+                        rusqlite::params![dir],
+                        |r| r.get(0),
+                    )
+                    .ok()
             } else {
                 None
             };
@@ -560,53 +667,63 @@ pub fn show(args: crate::cli::ShowArgs) -> anyhow::Result<()> {
         rusqlite::params![&args.observation_id],
         |row| row.get(0),
     )?;
-    
+
     println!("{}", payload);
     Ok(())
 }
 
 pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
     let mut store = Store::open_read_write()?;
-    let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id = ?1)",
         rusqlite::params![&args.observation_id],
         |row| row.get(0),
     )?;
-    
+
     if !exists {
         anyhow::bail!("Observation not found");
     }
-    
+
     let local_sequence: i64 = tx.query_row(
         "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM records",
         [],
         |row| row.get(0),
     )?;
-    
-    let previous_record_hash: String = tx.query_row(
-        "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
-        [],
-        |row| row.get(0),
-    ).unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000000".to_string());
-    
+
+    let previous_record_hash: String = tx
+        .query_row(
+            "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        });
+
     let action_id = generate_id("act");
-    let now = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let action_type = "retracted";
     use crate::record::{CanonicalRecordV1, RecordPayload, RetractionPayload};
-    
+
     let canonical_record = CanonicalRecordV1 {
         local_sequence: local_sequence as u64,
         record_id: action_id.clone(),
         record_type: "observation_retracted".to_string(),
         entity_id: args.observation_id.clone(),
         captured_at: now.clone(),
-        payload: RecordPayload::Retraction(RetractionPayload { reason: "manual retraction".to_string() }),
+        payload: RecordPayload::Retraction(RetractionPayload {
+            reason: "manual retraction".to_string(),
+        }),
     };
-    
+
     let action_payload_json = serde_json::to_string(&canonical_record.payload)?;
-    let record_hash = canonical_record.compute_hash(&store.store_id, &previous_record_hash);    
+    let record_hash = canonical_record.compute_hash(&store.store_id, &previous_record_hash);
     tx.execute(
         "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -636,10 +753,10 @@ pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
             &record_hash,
         ],
     )?;
-    
+
     tx.commit()?;
-    
+
     println!("Retracted {}", args.observation_id);
-    
+
     Ok(())
 }

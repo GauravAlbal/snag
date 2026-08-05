@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 pub fn normalize_remote_alias(raw: &str) -> String {
     let trimmed = raw.trim();
     // git@github.com:owner/repo.git
-    if let Some(rest) = trimmed.strip_prefix("git@") {
-        if let Some(slash) = rest.find(':') {
-            let host = &rest[..slash];
-            let path = &rest[slash + 1..];
-            return host_path_to_alias(host, path);
-        }
+    if let Some(rest) = trimmed.strip_prefix("git@")
+        && let Some(slash) = rest.find(':')
+    {
+        let host = &rest[..slash];
+        let path = &rest[slash + 1..];
+        return host_path_to_alias(host, path);
     }
     // https://github.com/owner/repo.git , https://git@github.com/owner/repo
     if let Some(rest) = trimmed.strip_prefix("https://") {
@@ -128,7 +128,12 @@ pub fn collect_git_context_with_budget(cwd: &Path, budget: Duration) -> Result<G
     let deadline = Instant::now() + budget;
     let mut ctx = GitContext::default();
 
-    let inside = run_git(&["rev-parse", "--is-inside-work-tree"], cwd, deadline, &mut ctx.warnings);
+    let inside = run_git(
+        &["rev-parse", "--is-inside-work-tree"],
+        cwd,
+        deadline,
+        &mut ctx.warnings,
+    );
     let is_inside = inside
         .filter(|o| o.status.success() && stdout_str(o) == "true")
         .is_some();
@@ -136,64 +141,80 @@ pub fn collect_git_context_with_budget(cwd: &Path, budget: Duration) -> Result<G
         return Ok(ctx);
     }
 
-    if let Some(out) = run_git(&["rev-parse", "--show-toplevel"], cwd, deadline, &mut ctx.warnings) {
-        if out.status.success() {
-            ctx.repository_root = Some(stdout_str(&out));
-        }
+    if let Some(out) = run_git(
+        &["rev-parse", "--show-toplevel"],
+        cwd,
+        deadline,
+        &mut ctx.warnings,
+    ) && out.status.success()
+    {
+        ctx.repository_root = Some(stdout_str(&out));
     }
 
     // G26: use the real common dir so linked worktrees resolve to one logical
     // repository, and canonicalize to an absolute path.
-    if let Some(out) = run_git(&["rev-parse", "--git-common-dir"], cwd, deadline, &mut ctx.warnings) {
-        if out.status.success() {
-            let raw = stdout_str(&out);
-            let path = PathBuf::from(&raw);
-            let abs = if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            };
-            if let Ok(canon) = abs.canonicalize() {
-                ctx.git_common_dir = Some(canon.to_string_lossy().into_owned());
-            } else {
-                ctx.git_common_dir = Some(abs.to_string_lossy().into_owned());
+    if let Some(out) = run_git(
+        &["rev-parse", "--git-common-dir"],
+        cwd,
+        deadline,
+        &mut ctx.warnings,
+    ) && out.status.success()
+    {
+        let raw = stdout_str(&out);
+        let path = PathBuf::from(&raw);
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        if let Ok(canon) = abs.canonicalize() {
+            ctx.git_common_dir = Some(canon.to_string_lossy().into_owned());
+        } else {
+            ctx.git_common_dir = Some(abs.to_string_lossy().into_owned());
+        }
+    }
+
+    if let Some(out) = run_git(&["rev-parse", "HEAD"], cwd, deadline, &mut ctx.warnings)
+        && out.status.success()
+    {
+        ctx.git_head = Some(stdout_str(&out));
+    }
+
+    if let Some(out) = run_git(
+        &["symbolic-ref", "--short", "HEAD"],
+        cwd,
+        deadline,
+        &mut ctx.warnings,
+    ) && out.status.success()
+    {
+        ctx.git_branch = Some(stdout_str(&out));
+    }
+
+    if let Some(out) = run_git(&["remote", "-v"], cwd, deadline, &mut ctx.warnings)
+        && out.status.success()
+    {
+        let mut remotes = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts.get(2) == Some(&"(fetch)") {
+                remotes.push(normalize_remote_alias(parts[1]));
             }
         }
+        remotes.sort();
+        remotes.dedup();
+        ctx.git_remote_aliases = remotes;
     }
 
-    if let Some(out) = run_git(&["rev-parse", "HEAD"], cwd, deadline, &mut ctx.warnings) {
-        if out.status.success() {
-            ctx.git_head = Some(stdout_str(&out));
-        }
-    }
-
-    if let Some(out) = run_git(&["symbolic-ref", "--short", "HEAD"], cwd, deadline, &mut ctx.warnings) {
-        if out.status.success() {
-            ctx.git_branch = Some(stdout_str(&out));
-        }
-    }
-
-    if let Some(out) = run_git(&["remote", "-v"], cwd, deadline, &mut ctx.warnings) {
-        if out.status.success() {
-            let mut remotes = Vec::new();
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && parts.get(2) == Some(&"(fetch)") {
-                    remotes.push(normalize_remote_alias(parts[1]));
-                }
-            }
-            remotes.sort();
-            remotes.dedup();
-            ctx.git_remote_aliases = remotes;
-        }
-    }
-
-    if let Some(out) = run_git(&["rev-parse", "--show-prefix"], cwd, deadline, &mut ctx.warnings) {
-        if out.status.success() {
-            let prefix = stdout_str(&out);
-            if !prefix.is_empty() {
-                ctx.relative_cwd = Some(prefix);
-            }
+    if let Some(out) = run_git(
+        &["rev-parse", "--show-prefix"],
+        cwd,
+        deadline,
+        &mut ctx.warnings,
+    ) && out.status.success()
+    {
+        let prefix = stdout_str(&out);
+        if !prefix.is_empty() {
+            ctx.relative_cwd = Some(prefix);
         }
     }
 

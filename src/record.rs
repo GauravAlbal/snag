@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Observation;
+use serde::{Deserialize, Serialize};
 
 /// Canonical record encoding version. Any change to the canonical structure or
 /// the set of fields covered by the hash MUST bump this version so that records
@@ -11,6 +11,7 @@ pub struct RetractionPayload {
     pub reason: String,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum RecordPayload {
@@ -40,7 +41,8 @@ impl CanonicalRecordV1 {
         hasher.update(self.captured_at.as_bytes());
         hasher.update(previous_record_hash.as_bytes());
 
-        let payload_str = serde_json::to_string(&self.payload).expect("Deterministic serialization failed");
+        let payload_str =
+            serde_json::to_string(&self.payload).expect("Deterministic serialization failed");
         hasher.update(payload_str.as_bytes());
 
         format!("blake3:{}", hasher.finalize().to_hex())
@@ -143,11 +145,19 @@ mod tests {
         };
     }
 
-    tamper_test!(tamper_local_sequence, |r: &mut CanonicalRecordV1| r.local_sequence = 2);
-    tamper_test!(tamper_record_id, |r: &mut CanonicalRecordV1| r.record_id = "obs_different".to_string());
-    tamper_test!(tamper_record_type, |r: &mut CanonicalRecordV1| r.record_type = "observation_retracted".to_string());
-    tamper_test!(tamper_entity_id, |r: &mut CanonicalRecordV1| r.entity_id = "obs_other".to_string());
-    tamper_test!(tamper_captured_at, |r: &mut CanonicalRecordV1| r.captured_at = "1999-01-01T00:00:00Z".to_string());
+    tamper_test!(tamper_local_sequence, |r: &mut CanonicalRecordV1| r
+        .local_sequence =
+        2);
+    tamper_test!(tamper_record_id, |r: &mut CanonicalRecordV1| r.record_id =
+        "obs_different".to_string());
+    tamper_test!(tamper_record_type, |r: &mut CanonicalRecordV1| r
+        .record_type =
+        "observation_retracted".to_string());
+    tamper_test!(tamper_entity_id, |r: &mut CanonicalRecordV1| r.entity_id =
+        "obs_other".to_string());
+    tamper_test!(tamper_captured_at, |r: &mut CanonicalRecordV1| r
+        .captured_at =
+        "1999-01-01T00:00:00Z".to_string());
 
     #[test]
     fn tamper_store_id() {
@@ -183,7 +193,9 @@ mod tests {
             record_type: "observation_retracted".to_string(),
             entity_id: "obs_target".to_string(),
             captured_at: "2026-08-04T00:00:01Z".to_string(),
-            payload: RecordPayload::Retraction(RetractionPayload { reason: "r".to_string() }),
+            payload: RecordPayload::Retraction(RetractionPayload {
+                reason: "r".to_string(),
+            }),
         };
         let original = rec.compute_hash("store_x", "prev");
         let mut tampered = rec.clone();
@@ -199,4 +211,3 @@ mod tests {
         assert_eq!(back, rec.payload);
     }
 }
-

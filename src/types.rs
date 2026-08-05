@@ -8,10 +8,10 @@ pub struct Observation {
     pub observation_id: String,
     pub store_id: String,
     pub local_sequence: u64,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    
+
     pub created_at: String, // ISO8601 or similar
 
     pub source: SourceInfo,
@@ -19,12 +19,12 @@ pub struct Observation {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_assertion: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_assertion: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_behavior: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,14 +37,14 @@ pub struct Observation {
     pub impact: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
-    
+
     pub sensitivity: Sensitivity,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeMap<String, String>>,
-    
+
     pub context: ContextInfo,
-    
+
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub artifacts: Vec<ArtifactReference>,
 
@@ -57,16 +57,12 @@ pub struct Observation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Sensitivity {
+    #[default]
     Normal,
     Sensitive,
     Restricted,
-}
-
-impl Default for Sensitivity {
-    fn default() -> Self {
-        Sensitivity::Normal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

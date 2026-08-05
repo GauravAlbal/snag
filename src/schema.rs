@@ -40,7 +40,7 @@ pub fn init_connection(conn: &Connection) -> Result<()> {
 
 pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
     let tx = conn.transaction()?;
-    
+
     // Create migrations table if not exists
     tx.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -49,7 +49,7 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
         )",
         [],
     )?;
-    
+
     let current_version: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         [],
@@ -184,7 +184,7 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
 
             INSERT INTO schema_migrations (version, applied_at) 
             VALUES (1, datetime('now'));
-            "
+            ",
         )?;
     }
 

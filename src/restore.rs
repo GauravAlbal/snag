@@ -18,7 +18,11 @@ struct MaintenanceLock {
 impl MaintenanceLock {
     fn acquire(data_dir: &Path) -> Result<MaintenanceLock> {
         let path = data_dir.join(".maintenance.lock");
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut f) => {
                 let _ = writeln!(f, "pid={}", std::process::id());
                 let _ = f.sync_all();
@@ -45,7 +49,9 @@ fn forensic_copy(data_dir: &Path) -> Result<PathBuf> {
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap()
         .replace(':', "");
-    let dir = data_dir.join("forensics").join(format!("pre-restore-{}", ts));
+    let dir = data_dir
+        .join("forensics")
+        .join(format!("pre-restore-{}", ts));
     fs::create_dir_all(&dir)?;
     for suffix in ["snag.sqlite", "snag.sqlite-wal", "snag.sqlite-shm"] {
         let src = data_dir.join(suffix);
@@ -56,10 +62,6 @@ fn forensic_copy(data_dir: &Path) -> Result<PathBuf> {
     }
     sync_dir(&dir)?;
     Ok(dir)
-}
-
-fn digest(path: &Path) -> String {
-    crate::backup::file_digest(path).unwrap_or_else(|_| "unavailable".to_string())
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
@@ -81,7 +83,9 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
     // copy of a non-empty database silently).
     if final_db.exists() {
         let existing = Connection::open(&final_db)?;
-        let count: i64 = existing.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0)).unwrap_or(0);
+        let count: i64 = existing
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+            .unwrap_or(0);
         if count > 0 {
             anyhow::bail!(crate::error::SnagError::RestoreRefused(
                 "active store is non-empty; refusing to overwrite history".to_string()
@@ -90,7 +94,8 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
     }
 
     // 2. Fully verify the backup bundle BEFORE touching active state.
-    crate::verify::verify_backup(&args.archive).context("backup verification failed; refusing restore")?;
+    crate::verify::verify_backup(&args.archive)
+        .context("backup verification failed; refusing restore")?;
 
     // 3. Preserve the active DB + WAL/SHM + metadata as a timestamped forensic copy.
     let forensic_dir = forensic_copy(&data_dir)?;
@@ -115,7 +120,7 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
     let candidate = data_dir.join(format!("snag.sqlite.candidate.{}", ulid::Ulid::generate()));
     fs::copy(&restored_db, &candidate)?;
     {
-        let mut conn = Connection::open(&candidate)?;
+        let conn = Connection::open(&candidate)?;
         conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA wal_checkpoint(TRUNCATE);")?;
         drop(conn);
     }
@@ -124,14 +129,22 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
     //    which is self-contained and was independently verified in step 2.
     {
         let mut cand_store = Store {
-            conn: Connection::open_with_flags(&candidate, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?,
+            conn: Connection::open_with_flags(
+                &candidate,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?,
             store_id: String::new(),
             data_dir: bundle_dir.clone(),
             db_path: candidate.clone(),
         };
-        cand_store.store_id = cand_store.conn.query_row(
-            "SELECT store_id FROM store_metadata LIMIT 1", [], |r| r.get(0))?;
-        verify::full_verify(&mut cand_store).context("restored candidate failed full verification")?;
+        cand_store.store_id =
+            cand_store
+                .conn
+                .query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |r| {
+                    r.get(0)
+                })?;
+        verify::full_verify(&mut cand_store)
+            .context("restored candidate failed full verification")?;
     }
 
     // 7. Merge the bundle's objects into the active objects dir (idempotent,
@@ -184,7 +197,10 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
     fs::write(&receipt_path, serde_json::to_string_pretty(&receipt)?)?;
     File::open(&receipt_path)?.sync_all()?;
 
-    println!("Database successfully restored and verified from: {}", args.archive.display());
+    println!(
+        "Database successfully restored and verified from: {}",
+        args.archive.display()
+    );
     println!("Restore receipt: {}", receipt_path.display());
     Ok(())
 }
@@ -197,11 +213,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let d = dst.join(entry.file_name());
         if s.is_dir() {
             copy_tree(&s, &d)?;
-        } else if s.is_file() {
-            if !d.exists() {
-                fs::copy(&s, &d)?;
-                File::open(&d)?.sync_all()?;
-            }
+        } else if s.is_file() && !d.exists() {
+            fs::copy(&s, &d)?;
+            File::open(&d)?.sync_all()?;
         }
     }
     Ok(())

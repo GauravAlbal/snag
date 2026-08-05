@@ -1,9 +1,9 @@
 use crate::cli::ExportArgs;
 use crate::store::Store;
 use anyhow::{Context, Result};
-use std::fs::File;
-use std::io::{self, Write, BufWriter};
 use serde_json::json;
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
 pub fn handle(args: ExportArgs) -> Result<()> {
@@ -12,9 +12,8 @@ pub fn handle(args: ExportArgs) -> Result<()> {
 }
 
 pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
-    
     let min_seq = args.after_sequence.map(|s| s + 1).unwrap_or(1) as i64;
-    
+
     let (actual_through_seq, record_count): (i64, i64) = if let Some(ts) = args.through_sequence {
         store.conn.query_row(
             "SELECT COALESCE(MAX(local_sequence), 0), COUNT(*) FROM records WHERE local_sequence >= ?1 AND local_sequence <= ?2",
@@ -30,11 +29,16 @@ pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
     };
 
     let head_hash: String = if actual_through_seq > 0 {
-        store.conn.query_row(
-            "SELECT record_hash FROM records WHERE local_sequence = ?1",
-            rusqlite::params![actual_through_seq],
-            |row| row.get(0)
-        ).unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000000".to_string())
+        store
+            .conn
+            .query_row(
+                "SELECT record_hash FROM records WHERE local_sequence = ?1",
+                rusqlite::params![actual_through_seq],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| {
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            })
     } else {
         "0000000000000000000000000000000000000000000000000000000000000000".to_string()
     };
@@ -42,15 +46,18 @@ pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
     let first_seq = if record_count > 0 { min_seq } else { 0 };
 
     let predecessor_hash: String = if min_seq > 1 {
-        store.conn.query_row(
-            "SELECT record_hash FROM records WHERE local_sequence = ?1",
-            rusqlite::params![min_seq - 1],
-            |row| row.get(0),
-        ).context("Predecessor record not found for partial export bounds")?
+        store
+            .conn
+            .query_row(
+                "SELECT record_hash FROM records WHERE local_sequence = ?1",
+                rusqlite::params![min_seq - 1],
+                |row| row.get(0),
+            )
+            .context("Predecessor record not found for partial export bounds")?
     } else {
         "0000000000000000000000000000000000000000000000000000000000000000".to_string()
     };
-    
+
     let header = json!({
         "export_kind": "export_header",
         "export_schema_version": 1,
@@ -63,20 +70,24 @@ pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
         "record_count": record_count
     });
 
-    let (mut writer, temp_path): (Box<dyn Write>, Option<PathBuf>) = if let Some(path) = &args.output {
-        let mut temp_path = path.clone();
-        temp_path.set_extension(format!("tmp.{}", ulid::Ulid::generate()));
-        (Box::new(BufWriter::new(File::create(&temp_path)?)), Some(temp_path))
-    } else {
-        (Box::new(BufWriter::new(io::stdout())), None)
-    };
+    let (mut writer, temp_path): (Box<dyn Write>, Option<PathBuf>) =
+        if let Some(path) = &args.output {
+            let mut temp_path = path.clone();
+            temp_path.set_extension(format!("tmp.{}", ulid::Ulid::generate()));
+            (
+                Box::new(BufWriter::new(File::create(&temp_path)?)),
+                Some(temp_path),
+            )
+        } else {
+            (Box::new(BufWriter::new(io::stdout())), None)
+        };
 
     writeln!(writer, "{}", serde_json::to_string(&header)?)?;
-    
+
     // Fetch records
     let mut stmt = store.conn.prepare("SELECT local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash FROM records WHERE local_sequence >= ?1 AND local_sequence <= ?2 ORDER BY local_sequence ASC")?;
     let mut rows = stmt.query(rusqlite::params![min_seq, actual_through_seq])?;
-    
+
     let mut actual_count = 0;
     while let Some(row) = rows.next()? {
         let local_sequence: i64 = row.get(0)?;
@@ -87,9 +98,9 @@ pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
         let payload_json: String = row.get(5)?;
         let previous_record_hash: String = row.get(6)?;
         let record_hash: String = row.get(7)?;
-        
+
         let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
-        
+
         let record_envelope = json!({
             "export_kind": "record",
             "record_schema_version": 1,
@@ -102,14 +113,14 @@ pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
             "previous_record_hash": previous_record_hash,
             "record_hash": record_hash
         });
-        
+
         writeln!(writer, "{}", serde_json::to_string(&record_envelope)?)?;
         actual_count += 1;
     }
-    
+
     writer.flush()?;
     drop(writer);
-    
+
     if let Some(temp) = temp_path {
         // Sync and rename
         let file = File::open(&temp)?;
@@ -118,6 +129,6 @@ pub fn handle_with_store(args: ExportArgs, store: Store) -> Result<()> {
         std::fs::rename(temp, args.output.unwrap())?;
         eprintln!("Exported {} records.", actual_count);
     }
-    
+
     Ok(())
 }

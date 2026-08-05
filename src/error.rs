@@ -1,5 +1,5 @@
-use thiserror::Error;
 use serde::Serialize;
+use thiserror::Error;
 
 #[derive(Debug, Serialize)]
 pub struct ErrorEnvelope {
@@ -61,7 +61,7 @@ pub enum SnagError {
 
     #[error("Not found: {0}")]
     NotFound(String),
-    
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -86,7 +86,7 @@ impl SnagError {
             Self::NotFound(_) => "NOT_FOUND",
             Self::Other(_) => "INTERNAL_ERROR",
         };
-        
+
         ErrorEnvelope {
             schema_version: 1,
             error: ErrorDetail {

@@ -10,20 +10,20 @@ pub mod idempotency;
 pub mod identity;
 pub mod migrations;
 pub mod parser;
+pub mod rebuild;
+pub mod record;
 pub mod report;
+pub mod restore;
 pub mod schema;
 pub mod store;
 pub mod types;
 pub mod verify;
-pub mod restore;
-pub mod rebuild;
-pub mod record;
 use clap::Parser;
 use cli::{Cli, Command};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    
+
     let cli = Cli::parse();
 
     let wants_json = cli.wants_json();

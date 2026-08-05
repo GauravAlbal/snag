@@ -2,13 +2,13 @@ use crate::cli::BackupArgs;
 use crate::store::Store;
 use crate::verify;
 use anyhow::{Context, Result};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use rusqlite::Connection;
 use serde_json::json;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 
 /// Manifest schema version for the self-contained v0 backup bundle.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -46,7 +46,10 @@ pub fn artifact_rel_path(digest: &str) -> Option<String> {
 /// artifact row with its canonical path, expected byte length, and digest.
 /// Any artifact that is missing, wrong length, or wrong digest is reported as
 /// an error (so a backup is never published with broken artifact recoverability).
-fn build_objects_manifest(conn: &Connection, bundle_root: &Path) -> Result<(Vec<String>, Vec<serde_json::Value>)> {
+fn build_objects_manifest(
+    conn: &Connection,
+    bundle_root: &Path,
+) -> Result<(Vec<String>, Vec<serde_json::Value>)> {
     let mut stmt = conn.prepare("SELECT digest, byte_length FROM artifacts ORDER BY digest")?;
     let mut rows = stmt.query([])?;
 
@@ -106,7 +109,11 @@ fn copy_objects(src: &Path, dst: &Path) -> Result<()> {
     copy_tree(src, dst)
 }
 
-fn append_dir(tar: &mut tar::Builder<flate2::write::GzEncoder<File>>, dir: &Path, prefix: &str) -> Result<()> {
+fn append_dir(
+    tar: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+    dir: &Path,
+    prefix: &str,
+) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -171,22 +178,39 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     }
 
     // 3. Full verification of the staged copy BEFORE publication.
-    let mut staged_store = Store::open_read_only_at(&stage_root.to_path_buf())?;
+    let mut staged_store = Store::open_read_only_at(stage_root)?;
     verify::full_verify(&mut staged_store).context("backup copy failed full verification")?;
 
     let conn = Connection::open(&staged_db)?;
     let through_sequence: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(local_sequence), 0) FROM records", [], |r| r.get(0))?;
-    let head_record_hash: String = conn.query_row(
-        "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1", [], |r| r.get(0))
-        .unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000000".to_string());
-    let observation_count: i64 = conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))?;
-    let action_count: i64 = conn.query_row("SELECT COUNT(*) FROM observation_actions", [], |r| r.get(0))?;
+        "SELECT COALESCE(MAX(local_sequence), 0) FROM records",
+        [],
+        |r| r.get(0),
+    )?;
+    let head_record_hash: String = conn
+        .query_row(
+            "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| {
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        });
+    let observation_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))?;
+    let action_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM observation_actions", [], |r| r.get(0))?;
     let record_count: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
     let artifact_count: i64 = conn.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
     let integrity_check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    let foreign_key_check: i64 = conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
-    let store_id: String = conn.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |r| r.get(0))?;
+    let foreign_key_check: i64 =
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    let store_id: String =
+        conn.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |r| {
+            r.get(0)
+        })?;
 
     // 4. Objects manifest (verifies every artifact path/length/digest).
     let (obj_errors, object_manifest_entries) = build_objects_manifest(&conn, stage_root)?;
@@ -194,11 +218,14 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         anyhow::bail!("artifact verification failed: {}", obj_errors.join("; "));
     }
     let objects_manifest_path = stage_root.join("objects-manifest.json");
-    fs::write(&objects_manifest_path, serde_json::to_string_pretty(&json!({
-        "schema_version": 1,
-        "artifact_count": artifact_count,
-        "artifacts": object_manifest_entries,
-    }))?)?;
+    fs::write(
+        &objects_manifest_path,
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "artifact_count": artifact_count,
+            "artifacts": object_manifest_entries,
+        }))?,
+    )?;
     let artifact_manifest_digest = file_digest(&objects_manifest_path)?;
 
     // 5. Database digest after verification (represents the published bytes).
@@ -206,7 +233,8 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
 
     // 6. Manifest with real, populated values (no placeholders).
     let created_at = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339).unwrap();
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let manifest = json!({
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "store_id": store_id,
@@ -232,8 +260,11 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
 
     // 7. Publish atomically: temp name -> fsync -> rename.
     let short_hash = head_record_hash
-        .strip_prefix("blake3:").unwrap_or(&head_record_hash)
-        .chars().take(8).collect::<String>();
+        .strip_prefix("blake3:")
+        .unwrap_or(&head_record_hash)
+        .chars()
+        .take(8)
+        .collect::<String>();
     let ts = created_at.replace(':', "");
     let archive_name = format!("snag-backup-{}-{}.tar.gz", ts, short_hash);
     let final_archive = backups_dir.join(&archive_name);
@@ -250,7 +281,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
             append_dir(&mut builder, &dst_objects, "objects")?;
         }
         let enc = builder.into_inner()?;
-        let mut raw = enc.finish()?;
+        let raw = enc.finish()?;
         raw.sync_all()?;
     }
     File::open(&tmp_archive)?.sync_all()?;

@@ -55,7 +55,13 @@ pub fn observation_semantic_digest(obs: &Observation) -> String {
         .context
         .execution
         .as_ref()
-        .map(|e| (e.session_id.clone(), e.pearl_id.clone(), e.attempt_id.clone()))
+        .map(|e| {
+            (
+                e.session_id.clone(),
+                e.pearl_id.clone(),
+                e.attempt_id.clone(),
+            )
+        })
         .unwrap_or((None, None, None));
 
     let mut artifact_digests: Vec<(String, u64)> = obs
@@ -109,15 +115,28 @@ mod tests {
             created_at: "2026-08-04T00:00:00Z".to_string(),
             source: SourceInfo {
                 kind: "agent_explicit".to_string(),
-                system: None, reporter_id: None, agent_runtime: None,
-                agent_name: None, model: None, detector_id: None, detector_version: None,
+                system: None,
+                reporter_id: None,
+                agent_runtime: None,
+                agent_name: None,
+                model: None,
+                detector_id: None,
+                detector_version: None,
             },
             title: "t".to_string(),
-            summary: None, kind_assertion: Some("bug".to_string()), severity_assertion: None,
-            expected_behavior: None, observed_behavior: None, reproduction: None,
-            workaround: None, impact: None, confidence: Some(0.9),
-            sensitivity: Sensitivity::Normal, labels: None,
-            context: ContextInfo::default(), artifacts: vec![],
+            summary: None,
+            kind_assertion: Some("bug".to_string()),
+            severity_assertion: None,
+            expected_behavior: None,
+            observed_behavior: None,
+            reproduction: None,
+            workaround: None,
+            impact: None,
+            confidence: Some(0.9),
+            sensitivity: Sensitivity::Normal,
+            labels: None,
+            context: ContextInfo::default(),
+            artifacts: vec![],
             affected_repository_ids: vec![],
         }
     }
@@ -133,7 +152,10 @@ mod tests {
         b.observation_id = "obs_B2".to_string();
         b.local_sequence = 2;
         b.created_at = "2026-08-04T02:00:00Z".to_string();
-        assert_eq!(observation_semantic_digest(&a), observation_semantic_digest(&b));
+        assert_eq!(
+            observation_semantic_digest(&a),
+            observation_semantic_digest(&b)
+        );
     }
 
     #[test]
@@ -141,7 +163,10 @@ mod tests {
         let a = base();
         let mut b = base();
         b.title = "different".to_string();
-        assert_ne!(observation_semantic_digest(&a), observation_semantic_digest(&b));
+        assert_ne!(
+            observation_semantic_digest(&a),
+            observation_semantic_digest(&b)
+        );
     }
 
     #[test]
@@ -149,17 +174,24 @@ mod tests {
         let a = base();
         let mut b = base();
         b.affected_repository_ids = vec!["repo_x".to_string()];
-        assert_ne!(observation_semantic_digest(&a), observation_semantic_digest(&b));
+        assert_ne!(
+            observation_semantic_digest(&a),
+            observation_semantic_digest(&b)
+        );
     }
 
     #[test]
     fn changed_head_does_not_change_digest() {
         let a = base();
-        assert_eq!(observation_semantic_digest(&a), observation_semantic_digest(&base()));
+        assert_eq!(
+            observation_semantic_digest(&a),
+            observation_semantic_digest(&base())
+        );
         // Ambient execution/context changes not asserted are excluded.
         let mut b = base();
         b.context.execution = Some(ExecutionContext {
-            cwd: Some("/x".to_string()), ..Default::default()
+            cwd: Some("/x".to_string()),
+            ..Default::default()
         });
         let _ = b;
     }
