@@ -45,10 +45,29 @@ the release process.
   `--tag v0.1.1` vs current main).
 
 ## [Unreleased]
+
+### Added
 - **Release workflow**: four-platform binaries, SHA-256 checksums, source-SHA
   provenance, version output, best-effort CycloneDX SBOM.
 - **Issue templates** for bugs, installation, agent integration, context
   adapters, export/schema compatibility, and features.
+- **repro_key localization label**: every report carries a deterministic
+  `repro_key` (`blake3(store | semantic_digest)[:24]`), stored as a
+  `labels.repro_key` and printed at filing so the reporter can echo it into
+  the session — the line a session-search tool indexes verbatim. The digest
+  strips the key so idempotent replays stay stable.
+- **Prefix observation ids**: `snag show` and `snag retract` resolve a unique
+  prefix of an observation id (GitHub-style); ambiguity and misses are typed
+  errors.
+
+### Changed
+- **Severity microcopy**: `--severity` help frames the assertion as a prior
+  (reviewers re-rank on disposition; reserve blocker/major for
+  fleet-blocking classes), and a high-severity report with a thin body
+  prints an inflation nudge at filing time.
+- **Context-file source merge**: a partial `source` object overlays fields
+  over the environment base instead of replacing the whole struct
+  (`SNAG_SOURCE_KIND` survives).
 
 ### Fixed
 - `snag report "<title>" --json` now treats a bare title as the observation
