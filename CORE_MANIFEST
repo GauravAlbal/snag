@@ -1,0 +1,38 @@
+# Shared core manifest: files that MUST be identical between this public
+# repo and its companion lane (used by the two-lane sync tooling).
+#
+# Sections:
+#   (top)   shared core — synced by the sync tooling (diff | push | pull)
+#   OVERLAY — files inside core dirs that are NOT shared; never synced
+#   KNOWN_DRIFT — files whose variants in the two lanes intentionally
+#                 differ; never synced, diff reports them as expected
+#
+# The sync parser reads only the non-comment lines: markers and file paths.
+# Keep the structure identical across the two lanes.
+
+# Sources (all Rust).
+src/*.rs
+
+# The remediation protocol.
+src/remediation/*.rs
+
+# Published JSON schemas.
+schemas/*
+
+# Public test suites.
+tests/cli.rs
+tests/concurrency.rs
+tests/git_identity.rs
+tests/migration.rs
+tests/robustness.rs
+tests/schema_compat.rs
+
+# Files that stay lane-local (never synced, never scanned as shared).
+OVERLAY
+tests/remediation.rs
+
+# Files whose two-lane variants intentionally diverge (never synced).
+KNOWN_DRIFT
+src/migrations.rs
+src/schema.rs
+tests/migration.rs
