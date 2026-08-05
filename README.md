@@ -74,6 +74,13 @@ simple one-observation-per-issue adapter ships as an example
 ([github-issues.py](examples/export-consumer/github-issues.py)), not as the
 canonical pipeline.
 
+> "The bottleneck wasn't tracking work. It was deciding which repeated
+> observations actually deserved to become work."
+>
+> — feedback from live agent use; see the [observation pipeline](docs/PIPELINE.md)
+> for the full model (observation → coalescing → ranking → execution candidate)
+> and the [dogfood case study](docs/CASE_STUDY.md).
+
 Snag is deliberately boring. It does one job — durable local capture — and
 stays out of the way while you work.
 
