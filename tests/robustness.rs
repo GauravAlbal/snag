@@ -641,9 +641,20 @@ fn test_prose_headings_intake() {
 #[test]
 fn test_outside_git_capture() {
     let ctx = TestContext::new();
-    // Run outside any git repo; capture must succeed and record no repository.
+    // Capture must succeed when run outside any git repository, and must NOT
+    // invent a repository identity. The temp dir is sometimes created inside a
+    // git checkout (e.g. a sandbox whose TMPDIR lives under a repo), so the
+    // "no repository" assertion is gated on the environment actually being
+    // outside a work tree.
     let plain = ctx.home_dir.path().join("plain");
     std::fs::create_dir_all(&plain).unwrap();
+    let inside_worktree = Proc::new("git")
+        .current_dir(&plain)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
+
     let mut c = ctx.cmd();
     c.current_dir(&plain);
     c.arg("report").arg("no repo here");
@@ -654,13 +665,15 @@ fn test_outside_git_capture() {
         .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
-    let repos: i64 = conn
-        .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        repos, 0,
-        "outside-git capture must not invent a repository identity"
-    );
+    if !inside_worktree {
+        let repos: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            repos, 0,
+            "outside-git capture must not invent a repository identity"
+        );
+    }
 }
 
 #[test]
