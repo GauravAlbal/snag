@@ -35,3 +35,14 @@ review) is advisory.
 
 Full playbook: `moat skill --print`. Per-session refresher: `moat prime`.
 <!-- /moat:onboarded -->
+
+
+## Snag reporting
+
+Use `snag` to capture material out-of-scope bugs, friction, or papercuts.
+Report when unexpected, costly, and plausibly systematic. Do not report ordinary
+failures or mistakes. Before completing a task, review for snags.
+
+`snag report "<title>" --kind <kind> --severity <minor|major|blocker> --observed "<what>"`
+
+Context is automatic. Full rubric: global `~/.claude/CLAUDE.md`.
