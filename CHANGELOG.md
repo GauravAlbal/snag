@@ -8,6 +8,15 @@ the release process.
 ## [Unreleased]
 
 ### Added
+- **License transition**: v0.2.0 and later are Apache-2.0 (v0.1.0 and earlier
+  remain MIT; the change is documented here per the release policy).
+- **Trademark policy**: `TRADEMARKS.md` governs use of the Snag name and logo.
+- **DCO**: contributions require signed-off commits (`git commit -s`) under
+  the Developer Certificate of Origin 1.1; no CLA.
+
+### Changed
+- License: MIT → Apache-2.0 (explicit contributor patent grant, notice
+  preservation, trademark exclusion).
 - **Public release hardening**: standalone README, public CLAUDE.md/AGENTS.md,
   trust-and-safety docs (SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, SUPPORT),
   stability guarantees, narrow roadmap, anonymized dogfood case study.

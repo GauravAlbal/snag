@@ -85,7 +85,20 @@ threat model", never for silence.
 - One logical change per commit. No whitespace-only commits.
 - Reference the issue/observation when one exists.
 
-## License
+## License and Developer Certificate of Origin
 
-By contributing you agree that your contributions are licensed under the MIT
-License — see [LICENSE](LICENSE).
+Snag is licensed under the **Apache License 2.0** — see [LICENSE](LICENSE).
+"Snag" and the Snag logo are governed by the
+[trademark policy](TRADEMARKS.md).
+
+Contributions are accepted under the **Developer Certificate of Origin 1.1**
+([DCO](https://developercertificate.org/)): every commit must carry a
+`Signed-off-by` trailer certifying that you created the contribution or have
+the right to submit it under the project license.
+
+```sh
+git commit -s
+```
+
+By contributing you agree your contributions are licensed under Apache-2.0
+and carry the DCO sign-off. There is no separate CLA.
