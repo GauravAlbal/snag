@@ -117,10 +117,16 @@ fn load_observation(store: &Store, observation_id: &str) -> Result<crate::types:
 ///
 /// Reporter assertions stay assertions (the packet never converts them into
 /// canonical facts). `current_state` is the reducer's projection; lineage and
-/// relationships come from the materialized remediation tables.
+/// relationships come from the materialized remediation tables. The packet
+/// identifies its store so a fresh agent can never mistake a scratch store's
+/// empty queue for the real one.
 pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::Value> {
     let observation = load_observation(store, observation_id)?;
     let reduced = crate::remediation::reducer::reduce_observation(&store.conn, observation_id)?;
+    let observation_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+        .unwrap_or(0);
 
     let repositories: Vec<String> = {
         let mut stmt = store.conn.prepare(
@@ -165,6 +171,11 @@ pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::V
 
     Ok(json!({
         "schema_version": 1,
+        "store": {
+            "store_id": store.store_id,
+            "db_path": store.db_path.display().to_string(),
+            "observations": observation_count,
+        },
         "observation": observation,
         "current_state": {
             "disposition": reduced.disposition,

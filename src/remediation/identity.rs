@@ -6,12 +6,58 @@
 //! `SNAG_REVIEW_SESSION_ID`), then a generated local session identifier.
 
 use crate::types::generate_id;
+use serde::{Deserialize, Serialize};
 
 /// The resolved reviewer + session pair for one remediation command.
 #[derive(Debug, Clone)]
 pub struct RemediationIdentity {
     pub reviewer: String,
     pub session_id: String,
+}
+
+/// Persisted per-store remediation session (the default identity when nothing
+/// external is supplied).
+///
+/// Without persistence, every CLI invocation mints a fresh `session_<ulid>`
+/// and the multi-command flow (claim -> … -> release) can never release its
+/// own lease. The file lives in the store's data dir so each store gets its
+/// own session; concurrent remediation lanes MUST set `SNAG_REVIEW_SESSION_ID`
+/// (or `--session-id`) to keep their claims isolated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionFile {
+    reviewer_id: String,
+    session_id: String,
+}
+
+fn session_file_path() -> Option<std::path::PathBuf> {
+    crate::store::Store::paths()
+        .ok()
+        .map(|(data_dir, _)| data_dir.join("review_session.json"))
+}
+
+fn read_session_file() -> Option<(String, String)> {
+    let path = session_file_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed: SessionFile = serde_json::from_str(&content).ok()?;
+    Some((parsed.reviewer_id, parsed.session_id))
+}
+
+fn write_session_file(reviewer: &str, session: &str) {
+    let Some(path) = session_file_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = SessionFile {
+        reviewer_id: reviewer.to_string(),
+        session_id: session.to_string(),
+    };
+    // Atomic publish: write a temp sibling, then rename.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_string(&payload).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
 }
 
 /// Read the remediation identity from `SNAG_CONTEXT_FILE`, if set.
@@ -29,25 +75,94 @@ fn from_context_file() -> Option<(String, String)> {
 /// 1. explicit CLI arguments;
 /// 2. remediation context file;
 /// 3. `SNAG_REVIEWER_ID` / `SNAG_REVIEW_SESSION_ID`;
-/// 4. generated local identifiers (stable per invocation).
+/// 4. the store's persisted session file (stable across CLI invocations);
+/// 5. generated identifiers, then persisted for the next invocation.
 pub fn resolve_identity(
     cli_reviewer: Option<&str>,
     cli_session: Option<&str>,
 ) -> RemediationIdentity {
-    let (reviewer, session_id) = if let Some(r) = cli_reviewer {
-        (r.to_string(), cli_session.unwrap_or("cli").to_string())
-    } else if let Some((r, s)) = from_context_file() {
-        (r, s)
-    } else {
-        (
-            std::env::var("SNAG_REVIEWER_ID").unwrap_or_else(|_| generate_id("reviewer")),
-            std::env::var("SNAG_REVIEW_SESSION_ID").unwrap_or_else(|_| generate_id("session")),
-        )
-    };
+    if let Some(r) = cli_reviewer {
+        // Reviewer given without a session: derive a stable per-store session
+        // (never the literal "cli" shared by every caller).
+        let session = cli_session
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| stable_session(r));
+        return RemediationIdentity {
+            reviewer: r.to_string(),
+            session_id: session,
+        };
+    }
+    if let Some(s) = cli_session {
+        // A session WITHOUT a reviewer must still be honored: claim-scoped
+        // commands (release) validate against the claim's stored session, and
+        // a multi-command remediation session passes --session-id on every
+        // step. Before this branch the flag fell through to the context file /
+        // env pair / session file and every `release --session-id <claim>`
+        // failed with a ClaimConflict naming a freshly-minted session.
+        let reviewer = std::env::var("SNAG_REVIEWER_ID")
+            .ok()
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "cli".to_string());
+        return RemediationIdentity {
+            reviewer,
+            session_id: s.to_string(),
+        };
+    }
+    if let Some((r, s)) = from_context_file() {
+        return RemediationIdentity {
+            reviewer: r,
+            session_id: s,
+        };
+    }
+    match (
+        std::env::var("SNAG_REVIEWER_ID"),
+        std::env::var("SNAG_REVIEW_SESSION_ID"),
+    ) {
+        (Ok(r), Ok(s)) if !r.is_empty() && !s.is_empty() => {
+            return RemediationIdentity {
+                reviewer: r,
+                session_id: s,
+            };
+        }
+        (Ok(r), _) if !r.is_empty() => {
+            // Reviewer set, session not: derive a stable per-store session for
+            // this reviewer so sequential commands share it.
+            let session = stable_session(&r);
+            return RemediationIdentity {
+                reviewer: r,
+                session_id: session,
+            };
+        }
+        _ => {}
+    }
+    if let Some((r, s)) = read_session_file() {
+        return RemediationIdentity {
+            reviewer: r,
+            session_id: s,
+        };
+    }
+    let reviewer = generate_id("reviewer");
+    let session_id = generate_id("session");
+    write_session_file(&reviewer, &session_id);
     RemediationIdentity {
         reviewer,
         session_id,
     }
+}
+
+/// A deterministic session for a reviewer when only the reviewer is known:
+/// stable across invocations on the same store, distinct across reviewers.
+fn stable_session(reviewer: &str) -> String {
+    let data_dir = crate::store::Store::paths()
+        .ok()
+        .map(|(d, _)| d.display().to_string())
+        .unwrap_or_default();
+    let mut h = blake3::Hasher::new();
+    h.update(b"review-session-v1");
+    h.update(data_dir.as_bytes());
+    h.update(b"|");
+    h.update(reviewer.as_bytes());
+    format!("session_{}", &h.finalize().to_hex()[..20])
 }
 
 /// The default lease duration in seconds (from `SNAG_REVIEW_LEASE` or 30m).
@@ -116,5 +231,18 @@ mod tests {
         let later = lease_expiry(now, 3600);
         assert!(later.as_str() > now);
         assert!(later.starts_with("2026-08-05T01:00:00"));
+    }
+
+    #[test]
+    fn session_without_reviewer_is_honored() {
+        // Regression (2026-08-05): `--session-id` alone fell through to the
+        // context/env/session-file and every claim-scoped `release
+        // --session-id <claim>` failed with a ClaimConflict naming a fresh
+        // session. The session flag must bind the identity by itself.
+        let identity = resolve_identity(None, Some("session_explicit"));
+        assert_eq!(identity.session_id, "session_explicit");
+        let pair = resolve_identity(Some("rev"), Some("session_pair"));
+        assert_eq!(pair.reviewer, "rev");
+        assert_eq!(pair.session_id, "session_pair");
     }
 }

@@ -271,6 +271,10 @@ pub enum ReviewCommand {
     /// Pull the next unhandled observation matching the filters
     Next(ReviewNextArgs),
     /// Acquire a claim lease on an observation
+    ///
+    /// Claim only observations in your lane: check the repos and labels for
+    /// ownership before claiming. The lease expires — process death never
+    /// strands work.
     Claim(ReviewClaimArgs),
     /// Release an active claim lease
     Release(ReviewReleaseArgs),
@@ -279,6 +283,11 @@ pub enum ReviewCommand {
     /// List observations with their review state
     List(ReviewListArgs),
     /// Adjudicate an observation with a disposition
+    ///
+    /// Negative dispositions are first-class outcomes. `confirmed` commits
+    /// your lane to the fix; observations owned by another lane should be
+    /// `deferred` with the owner lane in `--rationale`, then
+    /// `reopen-remediation` to keep them visible in the queue.
     Disposition(ReviewDispositionArgs),
     /// Reopen a previous disposition (append-only)
     Reopen(ReviewReopenArgs),
@@ -302,6 +311,8 @@ pub enum ReviewCommand {
     Show(ReviewShowArgs),
     /// List the observation's remediation event history
     History(ReviewHistoryArgs),
+    /// Validate a completion report against the recorded events
+    VerifyReport(ReviewVerifyReportArgs),
 }
 
 #[derive(Args)]
@@ -315,7 +326,10 @@ pub struct ReviewNextArgs {
     pub kind: Option<String>,
 
     /// Restrict to an asserted severity
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "restrict to an asserted severity (blocker|major|medium|minor|low) — the reporter's prior; disposition re-ranks"
+    )]
     pub severity: Option<String>,
 
     /// Only observations with no review activity yet
@@ -632,4 +646,10 @@ pub struct ReviewHistoryArgs {
 
     #[arg(long)]
     pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewVerifyReportArgs {
+    /// Path to the completion report (YAML or JSON)
+    pub report: std::path::PathBuf,
 }

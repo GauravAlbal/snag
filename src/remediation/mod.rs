@@ -12,6 +12,7 @@ pub mod events;
 pub mod identity;
 pub mod queue;
 pub mod reducer;
+pub mod report_check;
 pub mod verify;
 
 use crate::cli::ReviewCommand;
@@ -46,6 +47,7 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::ReopenRemediation(args) => reopen_remediation(args),
         ReviewCommand::Show(args) => show(args),
         ReviewCommand::History(args) => history(args),
+        ReviewCommand::VerifyReport(args) => verify_report_cmd(args),
     }
 }
 
@@ -273,13 +275,14 @@ fn refresh_review_state(tx: &rusqlite::Transaction, observation_id: &str) -> Res
 }
 
 /// `snag review claim <observation-id> [--lease 30m] [--task <id>]`
-fn claim(args: crate::cli::ReviewClaimArgs) -> Result<()> {
+fn claim(mut args: crate::cli::ReviewClaimArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let lease_seconds = match &args.lease {
         Some(raw) => identity::parse_duration(raw).map_err(SnagError::Validation)?,
         None => identity::default_lease_seconds(),
     };
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let now = utc_now();
     let store_id = store.store_id.clone();
     let tx = store
@@ -313,6 +316,9 @@ fn claim(args: crate::cli::ReviewClaimArgs) -> Result<()> {
             if let Some(t) = &args.task {
                 println!("task_id: {}", t);
             }
+            println!(
+                "lane check: claim only observations in your lane — verify repos/labels before working; release when done"
+            );
         }
         ClaimOutcome::Replayed {
             claim_id,
@@ -330,9 +336,10 @@ fn claim(args: crate::cli::ReviewClaimArgs) -> Result<()> {
 }
 
 /// `snag review release <observation-id> [--reason ...]`
-fn release(args: crate::cli::ReviewReleaseArgs) -> Result<()> {
+fn release(mut args: crate::cli::ReviewReleaseArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let now = utc_now();
     let store_id = store.store_id.clone();
     let tx = store
@@ -386,13 +393,14 @@ fn release(args: crate::cli::ReviewReleaseArgs) -> Result<()> {
 }
 
 /// `snag review heartbeat <observation-id> [--lease 30m]`
-fn heartbeat(args: crate::cli::ReviewHeartbeatArgs) -> Result<()> {
+fn heartbeat(mut args: crate::cli::ReviewHeartbeatArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let lease_seconds = match &args.lease {
         Some(raw) => identity::parse_duration(raw).map_err(SnagError::Validation)?,
         None => identity::default_lease_seconds(),
     };
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let now = utc_now();
     let store_id = store.store_id.clone();
     let tx = store
@@ -497,6 +505,7 @@ fn disposition(mut args: crate::cli::ReviewDispositionArgs) -> Result<()> {
     }
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -521,13 +530,13 @@ fn disposition(mut args: crate::cli::ReviewDispositionArgs) -> Result<()> {
             let t = args.of.ok_or_else(|| {
                 SnagError::Validation("duplicate requires --of <observation-id>".to_string())
             })?;
-            Some(t)
+            Some(resolve_observation_id(&tx, &t)?)
         }
         DISP_SUPERSEDED => {
             let t = args.by.ok_or_else(|| {
                 SnagError::Validation("superseded requires --by <observation-id>".to_string())
             })?;
-            Some(t)
+            Some(resolve_observation_id(&tx, &t)?)
         }
         _ => {
             if args.of.is_some() || args.by.is_some() {
@@ -621,11 +630,27 @@ fn disposition(mut args: crate::cli::ReviewDispositionArgs) -> Result<()> {
         )?;
     }
     refresh_review_state(&tx, &args.observation_id)?;
+    crate::failpoint::failpoint("remediation_before_commit");
     tx.commit()?;
+    crate::failpoint::failpoint("remediation_after_commit");
     println!(
         "Disposition {} -> {} (sequence {})",
         args.observation_id, args.disposition, disposition_set.local_sequence
     );
+    // Lane microcopy at the decision point.
+    match args.disposition.as_str() {
+        DISP_CONFIRMED => {
+            println!(
+                "lane check: confirmed commits YOUR lane to the fix — if this belongs to another lane, use deferred with the owner lane in --rationale, then reopen-remediation to keep it visible"
+            );
+        }
+        DISP_DEFERRED => {
+            println!(
+                "ownership: name the owner lane in --rationale; reopen-remediation keeps the observation visible in the queue instead of handled"
+            );
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -634,9 +659,10 @@ fn disposition(mut args: crate::cli::ReviewDispositionArgs) -> Result<()> {
 /// Reopening is append-only: the earlier disposition events remain, the
 /// current disposition row is marked retracted, and the observation returns
 /// to the queue.
-fn reopen(args: crate::cli::ReviewReopenArgs) -> Result<()> {
+fn reopen(mut args: crate::cli::ReviewReopenArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -744,6 +770,8 @@ fn relate(mut args: crate::cli::ReviewRelateArgs) -> Result<()> {
     }
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.left = resolve_observation_id(&store.conn, &args.left)?;
+    args.right = resolve_observation_id(&store.conn, &args.right)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -914,9 +942,10 @@ fn reduced_in_tx(
 }
 
 /// `snag review promote <observation-id> --finding-id <finding-id>`
-fn promote(args: crate::cli::ReviewPromoteArgs) -> Result<()> {
+fn promote(mut args: crate::cli::ReviewPromoteArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -969,9 +998,10 @@ fn promote(args: crate::cli::ReviewPromoteArgs) -> Result<()> {
 
 /// `snag review attach-task <observation-id> --task-id <task-id>` (multiple
 /// task ids supported; each event is its own link).
-fn attach_task(args: crate::cli::ReviewAttachTaskArgs) -> Result<()> {
+fn attach_task(mut args: crate::cli::ReviewAttachTaskArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -1004,9 +1034,10 @@ fn attach_task(args: crate::cli::ReviewAttachTaskArgs) -> Result<()> {
 /// `snag review attach-fix <observation-id> --commit <sha> --repo <repo-id>`
 /// A commit alone never implies success (the reducer keeps the state at
 /// `candidate_fix` until accepted verification arrives).
-fn attach_fix(args: crate::cli::ReviewAttachFixArgs) -> Result<()> {
+fn attach_fix(mut args: crate::cli::ReviewAttachFixArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -1062,7 +1093,7 @@ fn attach_fix(args: crate::cli::ReviewAttachFixArgs) -> Result<()> {
 /// `snag review attach-verification <observation-id> --receipt <ref> --status <s>`
 /// `accepted` is the only status that yields `verified_fixed`; rejected and
 /// invalid leave remediation open.
-fn attach_verification(args: crate::cli::ReviewAttachVerificationArgs) -> Result<()> {
+fn attach_verification(mut args: crate::cli::ReviewAttachVerificationArgs) -> Result<()> {
     if !VERIFICATION_STATUSES.contains(&args.status.as_str()) {
         anyhow::bail!(SnagError::Validation(format!(
             "unknown verification status '{}'; allowed: {}",
@@ -1072,6 +1103,7 @@ fn attach_verification(args: crate::cli::ReviewAttachVerificationArgs) -> Result
     }
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -1132,9 +1164,10 @@ fn attach_verification(args: crate::cli::ReviewAttachVerificationArgs) -> Result
 /// confirmed observations require a defer, at least one task link, or
 /// verification evidence; an observation with neither a disposition nor any
 /// remediation evidence cannot be marked handled.
-fn mark_handled(args: crate::cli::ReviewMarkHandledArgs) -> Result<()> {
+fn mark_handled(mut args: crate::cli::ReviewMarkHandledArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -1188,9 +1221,10 @@ fn mark_handled(args: crate::cli::ReviewMarkHandledArgs) -> Result<()> {
 
 /// `snag review reopen-remediation <observation-id> --rationale …` — append-only
 /// reopening of a handled remediation.
-fn reopen_remediation(args: crate::cli::ReviewReopenRemediationArgs) -> Result<()> {
+fn reopen_remediation(mut args: crate::cli::ReviewReopenRemediationArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let store_id = store.store_id.clone();
     let now = utc_now();
     let tx = store
@@ -1234,8 +1268,9 @@ fn reopen_remediation(args: crate::cli::ReviewReopenRemediationArgs) -> Result<(
 /// `snag review show <observation-id> [--format json]` — the full evidence
 /// packet (the same versioned envelope `next --format agent` emits), so a
 /// remediation session can re-inspect any queued observation.
-fn show(args: crate::cli::ReviewShowArgs) -> Result<()> {
+fn show(mut args: crate::cli::ReviewShowArgs) -> Result<()> {
     let store = Store::open_read_only()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let packet = agent_packet(&store, &args.observation_id)?;
     if args.format.as_deref() == Some("json") || args.format.as_deref() == Some("agent") {
         println!("{}", serde_json::to_string_pretty(&packet)?);
@@ -1259,6 +1294,15 @@ fn show(args: crate::cli::ReviewShowArgs) -> Result<()> {
                 .unwrap_or("-"),
             packet["current_state"]["handled"]
         );
+        if let Some(claim) = packet["current_state"]["active_claim"].as_object() {
+            println!(
+                "claim: {} by {} (session {}) until {}",
+                claim["claim_id"].as_str().unwrap_or("?"),
+                claim["claimed_by"].as_str().unwrap_or("?"),
+                claim["claim_session_id"].as_str().unwrap_or("?"),
+                claim["lease_expires_at"].as_str().unwrap_or("?")
+            );
+        }
         if let Some(eb) = o["expected_behavior"].as_str() {
             println!("expected: {eb}");
         }
@@ -1288,8 +1332,9 @@ fn show(args: crate::cli::ReviewShowArgs) -> Result<()> {
 
 /// `snag review history <observation-id> [--format json]` — every remediation
 /// event for the observation in stream order (append-only audit surface).
-fn history(args: crate::cli::ReviewHistoryArgs) -> Result<()> {
+fn history(mut args: crate::cli::ReviewHistoryArgs) -> Result<()> {
     let store = Store::open_read_only()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let packet = agent_packet(&store, &args.observation_id)?;
     let events = packet["remediation_history"]
         .as_array()
@@ -1308,6 +1353,75 @@ fn history(args: crate::cli::ReviewHistoryArgs) -> Result<()> {
         println!("no remediation events for {}", args.observation_id);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Completion-report validation.
+// ---------------------------------------------------------------------------
+
+/// `snag review verify-report <file>` — validate a remediation agent's
+/// completion report (YAML or JSON) against the recorded events. Reports ALL
+/// mismatches in one pass; exit 1 when any claim fails to trace.
+fn verify_report_cmd(args: crate::cli::ReviewVerifyReportArgs) -> Result<()> {
+    let store = Store::open_read_only()?;
+    let failures = crate::remediation::report_check::verify_report(&store, &args.report)?;
+    if failures.is_empty() {
+        println!(
+            "Completion report OK ({} item(s) consistent with recorded events)",
+            crate::remediation::report_check::item_count(&args.report)?
+        );
+        return Ok(());
+    }
+    for f in &failures {
+        eprintln!("{}: {}", f.observation_id, f.message);
+    }
+    anyhow::bail!(SnagError::Validation(format!(
+        "completion report failed {} check(s)",
+        failures.len()
+    )));
+}
+
+// ---------------------------------------------------------------------------
+// Observation id resolution (GitHub-style short prefixes).
+// ---------------------------------------------------------------------------
+
+/// Resolve a possibly-abbreviated observation id: an exact match wins; a
+/// unique prefix of the full id (`obs_01kz8…` abbreviated) resolves;
+/// ambiguity and misses are typed errors. Keeps the CLI usable when agents
+/// copy/truncate ids mid-session.
+pub fn resolve_observation_id(conn: &rusqlite::Connection, input: &str) -> Result<String> {
+    let exact: Option<String> = conn
+        .query_row(
+            "SELECT observation_id FROM observations WHERE observation_id = ?1",
+            rusqlite::params![input],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = exact {
+        return Ok(id);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT observation_id FROM observations WHERE observation_id LIKE ?1 ORDER BY observation_id",
+    )?;
+    let rows: Vec<String> = {
+        let matches = stmt.query_map(rusqlite::params![format!("{input}%")], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut v = Vec::new();
+        for r in matches {
+            v.push(r?);
+        }
+        v
+    };
+    match rows.len() {
+        0 => anyhow::bail!(SnagError::NotFound(format!(
+            "observation matching '{input}'"
+        ))),
+        1 => Ok(rows[0].clone()),
+        n => anyhow::bail!(SnagError::Validation(format!(
+            "observation id '{input}' is ambiguous: matches {n} observations"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,18 +1489,32 @@ fn next(args: crate::cli::ReviewNextArgs) -> Result<()> {
     let selected = queue::select_next(&tx, &filters)?;
 
     let Some(observation_id) = selected else {
-        // Typed empty-queue response, not an error.
+        // Typed empty-queue response, not an error. It names the active store
+        // so a wrong-store (e.g. leaked XDG_DATA_HOME) is one-glance obvious
+        // instead of a baffling empty queue.
+        let observation_count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+            .unwrap_or(0);
         if args.format.as_deref() == Some("agent") {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "schema_version": 1,
                     "queue": "empty",
+                    "store": {
+                        "store_id": store.store_id,
+                        "db_path": store.db_path.display().to_string(),
+                        "observations": observation_count,
+                    },
                     "message": "no unhandled observations match the filters",
                 }))?
             );
         } else {
             println!("empty queue: no unhandled observations match the filters");
+            println!(
+                "store: {} ({observation_count} observations)",
+                store.db_path.display()
+            );
         }
         tx.commit()?;
         return Ok(());
@@ -1443,9 +1571,11 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
     let mut sql = String::from(
         "SELECT o.observation_id, o.title, o.severity_assertion, o.kind_assertion,
                 COALESCE(rs.state, 'unreviewed') AS state,
-                rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id
+                rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id,
+                c.claim_session_id, c.claimed_by
          FROM observations o
          LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         LEFT JOIN remediation_claims c ON c.claim_id = rs.active_claim_id
          WHERE 1=1",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1484,11 +1614,13 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
             row.get::<_, Option<String>>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, title, sev, kind, state, disp, handled, claim) = r?;
+        let (id, title, sev, kind, state, disp, handled, claim, claim_session, claimed_by) = r?;
         if args.format.as_deref() == Some("json") {
             out.push(serde_json::json!({
                 "observation_id": id,
@@ -1499,6 +1631,8 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
                 "disposition": disp,
                 "handled": handled == 1,
                 "active_claim_id": claim,
+                "active_claim_session_id": claim_session,
+                "active_claim_claimed_by": claimed_by,
             }));
         } else {
             // Observation ids first: they became the cross-session language.

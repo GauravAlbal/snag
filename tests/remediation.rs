@@ -152,6 +152,13 @@ fn t1_empty_queue_is_typed_not_error() {
     let text = String::from_utf8(out.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["queue"], "empty");
+    // The empty envelope names the active store: a wrong-store (leaked
+    // XDG_DATA_HOME) is one-glance obvious instead of a baffling empty queue.
+    assert_eq!(
+        parsed["store"]["db_path"],
+        ctx.data_dir.join("snag.sqlite").display().to_string()
+    );
+    assert_eq!(parsed["store"]["observations"], 0);
 }
 
 #[test]
@@ -1621,3 +1628,131 @@ fn t9_backup_restore_preserves_remediation_state() {
         "created + reviewed + disposition_set + verification"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T7: crash injection (zero-visible-event | one-complete-event outcomes).
+// ---------------------------------------------------------------------------
+
+/// Run a remediation command with a failpoint; return whether it succeeded.
+fn run_with_failpoint(ctx: &TestContext, failpoint: &str, args: &[&str]) -> bool {
+    let mut child = Proc::new(ctx.bin());
+    let out = child
+        .args(args)
+        .env("XDG_DATA_HOME", ctx.home_dir.path())
+        .env("HOME", ctx.home_dir.path())
+        .env("SNAG_REVIEWER_ID", "rev_alice")
+        .env("SNAG_REVIEW_SESSION_ID", "sess_alice")
+        .env("SNAG_FAILPOINT", failpoint)
+        .output()
+        .unwrap();
+    out.status.success()
+}
+
+fn disposition_event_count(ctx: &TestContext, obs: &str) -> i64 {
+    let conn = ctx.conn();
+    conn.query_row(
+        "SELECT COUNT(*) FROM records WHERE entity_id = ?1 AND record_type IN ('observation_reviewed','observation_disposition_set')",
+        [obs],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn t7_crash_before_commit_leaves_no_visible_disposition() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "crash-disp", "bug", "major");
+    let before = record_count(&ctx);
+
+    assert!(!run_with_failpoint(
+        &ctx,
+        "remediation_before_commit",
+        &["review", "disposition", &a, "confirmed"]
+    ));
+    assert_eq!(
+        record_count(&ctx),
+        before,
+        "zero visible events before commit"
+    );
+    assert_eq!(disposition_event_count(&ctx, &a), 0);
+    assert_eq!(
+        ctx.conn()
+            .query_row("SELECT COUNT(*) FROM observation_dispositions", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+
+    // After the crash the same submission succeeds completely.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    assert_eq!(
+        disposition_event_count(&ctx, &a),
+        2,
+        "reviewed + disposition_set"
+    );
+    assert_eq!(
+        ctx.conn()
+            .query_row("SELECT COUNT(*) FROM observation_dispositions", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn t7_crash_after_event_insert_rolls_back_completely() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "crash-insert", "bug", "major");
+    let before = record_count(&ctx);
+
+    assert!(!run_with_failpoint(
+        &ctx,
+        "remediation_after_event_insert",
+        &["review", "disposition", &a, "confirmed"]
+    ));
+    // The event row was inserted but the tx rolled back: zero visible events.
+    assert_eq!(
+        record_count(&ctx),
+        before,
+        "event insert + rollback leaves nothing"
+    );
+    assert_eq!(disposition_event_count(&ctx, &a), 0);
+}
+
+#[test]
+fn t7_crash_after_commit_leaves_one_complete_event() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "crash-commit", "bug", "major");
+
+    // Abort after commit: the disposition is fully visible (one complete event
+    // pair), not a half-state.
+    assert!(!run_with_failpoint(
+        &ctx,
+        "remediation_after_commit",
+        &["review", "disposition", &a, "confirmed"]
+    ));
+    assert_eq!(disposition_event_count(&ctx, &a), 2);
+    let conn = ctx.conn();
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM observation_review_state WHERE observation_id = ?1",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "confirmed");
+    // The store still verifies end to end.
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+}
+
+// ---------------------------------------------------------------------------
