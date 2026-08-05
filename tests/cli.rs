@@ -325,3 +325,85 @@ fn test_restore_protocol() {
     // Verify
     ctx.cmd().arg("verify").arg("--full").assert().success();
 }
+
+fn latest_backup(ctx: &TestContext) -> std::path::PathBuf {
+    let backups_dir = ctx.data_dir.join("backups");
+    let mut archive_path = None;
+    for entry in std::fs::read_dir(&backups_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map_or(false, |e| e == "gz") {
+            if archive_path.is_none() || path > archive_path.clone().unwrap() {
+                archive_path = Some(path);
+            }
+        }
+    }
+    archive_path.expect("Backup archive not found")
+}
+
+/// End-to-end P0 chain: report with an artifact, verify the live store,
+/// backup, independently verify the backup archive, verify that a tampered
+/// bundle is rejected, then restore the archive into a fresh store.
+#[test]
+fn test_e2e_backup_restore_roundtrip() {
+    let ctx = TestContext::new();
+
+    // A real artifact file in a git-worktree-like temp location.
+    let art = ctx.home_dir.path().join("evidence.txt");
+    std::fs::write(&art, b"THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG\n").unwrap();
+
+    ctx.cmd()
+        .arg("report")
+        .arg("E2E roundtrip")
+        .arg("--artifact")
+        .arg(&art)
+        .arg("--idempotency-key")
+        .arg("e2e_1")
+        .assert()
+        .success();
+
+    // Live full verification.
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+
+    // Backup.
+    ctx.cmd().arg("backup").assert().success();
+    let archive = latest_backup(&ctx);
+
+    // Independent backup verification of the archive.
+    ctx.cmd().arg("verify").arg("--backup").arg(&archive).assert().success();
+
+    // Tamper with the archive: verify must fail.
+    {
+        let t = ctx.home_dir.path().join(format!("tampered_{}.tar.gz", ulid::Ulid::generate()));
+        std::fs::copy(&archive, &t).unwrap();
+        // Flip a byte in the middle of the archive to corrupt it.
+        let bytes = std::fs::read(&t).unwrap();
+        let mut b = bytes.clone();
+        let idx = b.len() / 2;
+        b[idx] ^= 0xFF;
+        std::fs::write(&t, b).unwrap();
+        ctx.cmd().arg("verify").arg("--backup").arg(&t).assert().failure();
+        std::fs::remove_file(&t).unwrap();
+    }
+
+    // Restore into a FRESH store (empty) — non-destructive path.
+    let ctx2 = TestContext::new();
+    ctx2.cmd().arg("restore").arg(&archive).assert().success();
+    ctx2.cmd().arg("verify").arg("--full").assert().success();
+
+    // The restored observation + artifact are present and correct.
+    ctx2.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("E2E roundtrip"));
+
+    // Artifact bytes survive in the restored objects store.
+    let restored_db = rusqlite::Connection::open(ctx2.data_dir.join("snag.sqlite")).unwrap();
+    let digest: String = restored_db.query_row("SELECT digest FROM artifacts LIMIT 1", [], |r| r.get(0)).unwrap();
+    let hex = digest.strip_prefix("blake3:").unwrap();
+    let obj = ctx2.data_dir.join("objects/blake3").join(&hex[0..2]).join(hex);
+    assert_eq!(
+        std::fs::read(&obj).unwrap(),
+        b"THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG\n"
+    );
+}

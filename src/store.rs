@@ -1,4 +1,4 @@
-use crate::schema::{apply_migrations, init_connection};
+use crate::schema::{apply_migrations, initialize_reader_connection, initialize_writer_connection};
 use crate::types::{generate_id, Observation};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -31,7 +31,7 @@ impl Store {
         let db_path = data_dir.join("snag.sqlite");
         fs::create_dir_all(&data_dir)?;
         let mut conn = Connection::open(&db_path)?;
-        init_connection(&conn)?;
+        initialize_writer_connection(&conn)?;
         
         let tx = conn.transaction()?;
         tx.commit()?;
@@ -60,7 +60,7 @@ impl Store {
         }
         
         let conn = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        init_connection(&conn)?;
+        initialize_reader_connection(&conn)?;
         
         let store_id: String = conn.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |row| row.get(0))?;
 

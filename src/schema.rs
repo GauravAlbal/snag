@@ -1,6 +1,8 @@
 use rusqlite::{Connection, Result};
 
-pub fn init_connection(conn: &Connection) -> Result<()> {
+/// Writer connection: may mutate journal mode and schema. Called on r/w opens
+/// and on migration paths.
+pub fn initialize_writer_connection(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
@@ -10,6 +12,30 @@ pub fn init_connection(conn: &Connection) -> Result<()> {
         ",
     )?;
     Ok(())
+}
+
+/// Reader connection: only connection-local options that are legal on a
+/// `SQLITE_OPEN_READ_ONLY` connection. Never attempts to mutate journal mode
+/// or schema (both would fail or write on a read-only database).
+pub fn initialize_reader_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 5000;
+        ",
+    )?;
+    Ok(())
+}
+
+/// Maintenance connection: read-write but without a forced migration/schema
+/// mutation unless an explicit maintenance action requests it.
+pub fn initialize_maintenance_connection(conn: &Connection) -> Result<()> {
+    initialize_writer_connection(conn)
+}
+
+/// Backwards-compatible alias kept for any remaining callers.
+pub fn init_connection(conn: &Connection) -> Result<()> {
+    initialize_writer_connection(conn)
 }
 
 pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
