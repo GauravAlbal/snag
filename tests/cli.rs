@@ -721,3 +721,180 @@ fn test_read_purity() {
         "read commands must not mutate the database file"
     );
 }
+
+/// Dogfood finding (fixed): `report "<title>" --json` must treat the title
+/// as the observation title and emit a JSON response, not misread the title
+/// as a JSON intake file path.
+#[test]
+fn test_report_json_output_mode_with_title() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("JSON output mode test")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"schema_version\": 1"))
+        .stdout(predicate::str::contains("\"observation_id\""));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "--json with a bare title must persist exactly one observation"
+    );
+}
+
+/// Backward compatibility: `report --json <file>` still reads a JSON
+/// observation input document from an existing file.
+#[test]
+fn test_report_json_intake_from_file() {
+    let ctx = TestContext::new();
+    let payload = ctx.home_dir.path().join("input.json");
+    std::fs::write(
+        &payload,
+        r#"{"schema_version": 1, "title": "File intake test", "kind_assertion": "bug"}"#,
+    )
+    .unwrap();
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .arg(&payload)
+        .assert()
+        .success();
+    ctx.cmd()
+        .arg("list")
+        .arg("--kind")
+        .arg("bug")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("File intake test"));
+}
+
+/// Dogfood finding (fixed): the bare fast path `snag "<title>"` must accept
+/// the structured flags without requiring the `report` subcommand.
+#[test]
+fn test_bare_fast_path_structured_flags() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("bare flags test")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recorded obs_"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "bare fast path must persist one observation"
+    );
+    ctx.cmd()
+        .arg("list")
+        .arg("--kind")
+        .arg("bug")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bare flags test"));
+    ctx.cmd()
+        .arg("list")
+        .arg("--kind")
+        .arg("papercut")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bare flags test").not());
+}
+
+/// The context protocol is versioned: a SNAG_CONTEXT_FILE with an unsupported
+/// schema_version is rejected with a typed error; version 1 is accepted.
+#[test]
+fn test_context_file_schema_version_validation() {
+    let ctx = TestContext::new();
+    let bad = ctx.home_dir.path().join("ctx-bad.json");
+    std::fs::write(&bad, r#"{"schema_version": 2}"#).unwrap();
+    ctx.cmd()
+        .env("SNAG_CONTEXT_FILE", &bad)
+        .arg("report")
+        .arg("rejected context version")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Unsupported schema"));
+    assert!(
+        !ctx.data_dir.join("snag.sqlite").exists(),
+        "rejected context must not create a store"
+    );
+
+    let ok = ctx.home_dir.path().join("ctx-ok.json");
+    std::fs::write(
+        &ok,
+        r#"{"schema_version": 1, "source": {"kind": "agent_explicit", "agent_runtime": "claude-code"}}"#,
+    )
+    .unwrap();
+    ctx.cmd()
+        .env("SNAG_CONTEXT_FILE", &ok)
+        .arg("report")
+        .arg("accepted context version")
+        .assert()
+        .success();
+}
+
+/// `snag context --format json` emits a versioned envelope.
+#[test]
+fn test_context_json_has_schema_version() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("context")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"schema_version\": 1"));
+}
+
+/// Piping output into a consumer that closes early (`snag list | head -1`)
+/// must exit quietly — not panic on a broken pipe.
+#[test]
+fn test_closed_pipe_exits_cleanly() {
+    let ctx = TestContext::new();
+    ctx.cmd().arg("report").arg("pipe test").assert().success();
+    let bin = assert_cmd::cargo::cargo_bin("snag");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' list | head -1", bin.display()))
+        .env("XDG_DATA_HOME", ctx.home_dir.path())
+        .env("HOME", ctx.home_dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "pipeline must exit 0, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "closed pipe must not panic: {stderr}"
+    );
+}
+
+/// `snag doctor` reports the exact store paths, effective context source, and
+/// version so users never have to infer where data lives.
+#[test]
+fn test_doctor_reports_paths_and_version() {
+    let ctx = TestContext::new();
+    let expected_db = ctx.data_dir.join("snag.sqlite");
+    ctx.cmd()
+        .env_remove("SNAG_CONTEXT_FILE")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "snag {} (doctor)",
+            env!("CARGO_PKG_VERSION")
+        )))
+        .stdout(predicate::str::contains("Database:"))
+        .stdout(predicate::str::contains(expected_db.display().to_string()))
+        .stdout(predicate::str::contains("Objects:"))
+        .stdout(predicate::str::contains("Backups:"))
+        .stdout(predicate::str::contains("Context file:"))
+        .stdout(predicate::str::contains("(not set)"));
+}

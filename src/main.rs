@@ -23,6 +23,13 @@ use clap::Parser;
 use cli::{Cli, Command};
 
 fn main() -> anyhow::Result<()> {
+    // Exit quietly when stdout closes early (e.g. `snag list | head`): with
+    // Rust's default ignore-SIGPIPE behavior the write would panic instead.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -46,21 +53,21 @@ fn main() -> anyhow::Result<()> {
             if let Some(title) = cli.title {
                 report::handle(cli::ReportArgs {
                     title: Some(title),
-                    kind: None,
-                    severity: None,
-                    expected: None,
-                    observed: None,
-                    workaround: None,
-                    repro: None,
-                    json: false,
-                    stdin: false,
-                    artifacts: vec![],
-                    idempotency_key: None,
-                    repo_id: None,
-                    session_id: None,
-                    pearl_id: None,
-                    attempt_id: None,
-                    affected_repos: vec![],
+                    kind: cli.kind,
+                    severity: cli.severity,
+                    expected: cli.expected,
+                    observed: cli.observed,
+                    workaround: cli.workaround,
+                    repro: cli.repro,
+                    json: cli.json,
+                    stdin: cli.stdin,
+                    artifacts: cli.artifacts,
+                    idempotency_key: cli.idempotency_key,
+                    repo_id: cli.repo_id,
+                    session_id: cli.session_id,
+                    pearl_id: cli.pearl_id,
+                    attempt_id: cli.attempt_id,
+                    affected_repos: cli.affected_repos,
                 })
             } else {
                 // Should be unreachable due to clap validation, but just in case

@@ -4,15 +4,39 @@ use anyhow::Result;
 use std::fs;
 
 pub fn handle(_args: DoctorArgs) -> Result<()> {
-    println!("Running snag doctor...\n");
+    println!("snag {} (doctor)", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    // Effective context source.
+    let ctx_file = std::env::var("SNAG_CONTEXT_FILE").ok();
+    println!(
+        "Context file:  {}",
+        ctx_file.as_deref().unwrap_or("(not set)")
+    );
+    let source_kind = std::env::var("SNAG_SOURCE_KIND").unwrap_or_else(|_| "human_explicit".into());
+    match std::env::var("SNAG_REPORTER_ID").ok() {
+        Some(reporter) => {
+            println!("Context env:   SNAG_SOURCE_KIND={source_kind}  SNAG_REPORTER_ID={reporter}")
+        }
+        None => println!("Context env:   SNAG_SOURCE_KIND={source_kind}"),
+    }
+
+    // Store paths. Reported even when no store exists yet, so users never have
+    // to guess where data would live.
+    let (data_dir, db_path) = Store::paths()?;
+    let objects_dir = data_dir.join("objects").join("blake3");
+    let backups_dir = data_dir.join("backups");
+    println!("Database:      {}", db_path.display());
+    println!("Objects:       {}", objects_dir.display());
+    println!("Backups:       {}", backups_dir.display());
+    println!();
 
     // Store access
     match Store::open_read_only() {
         Ok(store) => {
-            println!("✅ Store access: OK ({})", store.data_dir.display());
+            println!("✅ Store access: OK");
 
             // Check backups
-            let backups_dir = store.data_dir.join("backups");
             if backups_dir.exists() {
                 let count = fs::read_dir(&backups_dir)?.count();
                 println!("✅ Backups directory: OK ({} backups found)", count);

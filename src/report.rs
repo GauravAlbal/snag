@@ -8,7 +8,7 @@ use crate::types::{ArtifactReference, Observation, generate_id};
 use anyhow::Result;
 use serde_json::json;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Crash-injection failpoint (T6): see `crate::failpoint::failpoint`.
 /// Parsed report inputs after CLI/JSON/prose merging (CLI explicit flags win).
@@ -80,7 +80,18 @@ fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
         take!(impact, parsed.impact);
     }
 
-    if args.json {
+    // `--json` selects JSON intake (stdin when no title, `-` for stdin
+    // explicitly, or a JSON file when the title names an existing file) AND
+    // JSON output. A bare title with `--json` is treated as the observation
+    // title with JSON output — previously it was misread as a file path and
+    // failed with a validation error (dogfood finding, fixed). With `--stdin`
+    // the prose intake owns stdin and `--json` only selects JSON output.
+    let json_intake = args.json
+        && !args.stdin
+        && (args.title.is_none()
+            || args.title.as_deref() == Some("-")
+            || Path::new(args.title.as_deref().unwrap()).is_file());
+    if json_intake {
         let path = args.title.clone().unwrap_or_else(|| "-".to_string());
         let mut buffer = String::new();
         if path == "-" {
