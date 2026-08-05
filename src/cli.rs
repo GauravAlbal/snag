@@ -15,7 +15,10 @@ pub struct Cli {
     #[arg(long)]
     pub kind: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "asserted impact (blocker|major|medium|minor|low) — a prior, not a posterior: reviewers re-rank on disposition; reserve blocker/major for fleet-blocking classes"
+    )]
     pub severity: Option<String>,
 
     #[arg(long)]
@@ -108,7 +111,10 @@ pub struct ReportArgs {
     #[arg(long)]
     pub kind: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "asserted impact (blocker|major|medium|minor|low) — a prior, not a posterior: reviewers re-rank on disposition; reserve blocker/major for fleet-blocking classes"
+    )]
     pub severity: Option<String>,
 
     #[arg(long)]

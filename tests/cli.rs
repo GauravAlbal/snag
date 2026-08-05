@@ -1066,3 +1066,44 @@ fn repro_key_is_labeled_deterministic_and_distinct() {
         .to_string();
     assert_ne!(key1, key3);
 }
+
+/// Severity microcopy: a high-severity assertion with a thin body prints the
+/// inflation nudge; a full-bodied report does not.
+#[test]
+fn thin_high_severity_report_nudges() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.arg("report");
+        for a in args {
+            c.arg(a);
+        }
+        c.output().unwrap()
+    };
+    let out = run(&["thin blocker", "--kind", "bug", "--severity", "blocker"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("severity is a prior"),
+        "nudge expected: {text}"
+    );
+
+    let out = run(&[
+        "full major",
+        "--kind",
+        "bug",
+        "--severity",
+        "major",
+        "--expected",
+        "x",
+        "--observed",
+        "y",
+    ]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !text.contains("severity is a prior"),
+        "no nudge for a full body: {text}"
+    );
+}

@@ -492,6 +492,22 @@ fn emit_response(want_json: bool, obs: &Observation, record_hash: &str) -> Resul
                 "  record this key in the session notes so a session-search tool can localize this observation's filing session"
             );
         }
+        // Severity microcopy: a high-severity assertion with a thin body is
+        // the classic inflation signal — the queue trusts the assertion as a
+        // prior, so the body is what lets the reviewer re-rank honestly.
+        let high_severity = matches!(
+            obs.severity_assertion.as_deref(),
+            Some("major" | "medium" | "blocker")
+        );
+        if high_severity
+            && obs.expected_behavior.is_none()
+            && obs.observed_behavior.is_none()
+            && obs.reproduction.is_none()
+        {
+            println!(
+                "note: high severity with a thin body — add expected/observed/repro so the queue can prioritize honestly (severity is a prior)"
+            );
+        }
     }
     Ok(())
 }
