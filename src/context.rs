@@ -8,9 +8,9 @@ use std::env;
 
 fn build_repo_context(args: &ReportArgs, git_ctx: &crate::git::GitContext) -> RepositoryContext {
     let mut repo_ctx = RepositoryContext {
-        repository_id: env::var("VX_REPOSITORY_ID").ok(),
-        checkout_id: env::var("VX_CHECKOUT_ID").ok(),
-        worktree_id: env::var("VX_WORKTREE_ID").ok(),
+        repository_id: None,
+        checkout_id: None,
+        worktree_id: None,
         repository_root: git_ctx.repository_root.clone(),
         git_common_dir: git_ctx.git_common_dir.clone(),
         git_head: git_ctx.git_head.clone(),
@@ -26,18 +26,17 @@ fn build_repo_context(args: &ReportArgs, git_ctx: &crate::git::GitContext) -> Re
 }
 
 fn build_exec_context(args: &ReportArgs, cwd: &std::path::Path) -> ExecutionContext {
+    // Session/work-item identity flows through the CLI (`--session-id`,
+    // `--task-id`), the context file, or the reporter; no internal env
+    // wiring leaks into the public surface.
     let mut exec_ctx = ExecutionContext {
         cwd: Some(cwd.to_string_lossy().to_string()),
-        workspace_id: env::var("ARQ_WORKSPACE_ID").ok(),
-        program_id: env::var("ARQ_PROGRAM_ID").ok(),
-        session_id: env::var("ARQ_SESSION_ID").ok(),
-        // Legacy fleet wiring feeds the generic work-item field; the public
-        // surface is `task_id` (CLI `--task-id`, JSON `execution.task_id`).
-        task_id: env::var("VX_PEARL_ID").ok(),
-        attempt_id: env::var("VX_ATTEMPT_ID").ok(),
-        authority_sequence: env::var("VX_AUTHORITY_SEQUENCE")
-            .ok()
-            .and_then(|v| v.parse().ok()),
+        workspace_id: None,
+        program_id: None,
+        session_id: None,
+        task_id: None,
+        attempt_id: None,
+        authority_sequence: None,
         tool_name: None,
         tool_invocation_id: None,
         command_shape: None,
