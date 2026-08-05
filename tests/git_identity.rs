@@ -165,6 +165,13 @@ fn test_ambiguous_remote_aliases() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("ambiguous"));
+    // No third repository may have been created for the ambiguous checkout.
+    let repos = store_rows(&ctx, "SELECT repository_id, created_at FROM repositories");
+    assert_eq!(
+        repos.len(),
+        2,
+        "ambiguous alias must not invent a third repository"
+    );
 }
 
 /// An explicit --repo-id is honored and linked (G28).

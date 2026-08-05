@@ -254,4 +254,14 @@ fn test_v1_migration_malformed_payload_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid legacy payload"));
+    // The malformed legacy row must survive untouched (never silently discarded).
+    let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let bad: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE observation_id='obs_bad'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bad, 1, "irreconcilable legacy row must be preserved");
 }

@@ -29,6 +29,16 @@ impl TestContext {
     }
 }
 
+fn obs_count(ctx: &TestContext) -> i64 {
+    let db = ctx.data_dir.join("snag.sqlite");
+    if !db.exists() {
+        return 0;
+    }
+    let conn = Connection::open(db).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+        .unwrap()
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let st = Proc::new("git")
         .args(args)
@@ -191,6 +201,11 @@ fn test_missing_and_modified_artifact_fail_verify() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid"));
+    assert_eq!(
+        std::fs::read(&obj).unwrap(),
+        b"tampered",
+        "object must hold the corrupted bytes"
+    );
 }
 
 #[test]
@@ -211,6 +226,13 @@ fn test_orphan_object_reported() {
         .assert()
         .success()
         .stdout(predicate::str::contains("orphan"));
+    assert!(
+        ctx.data_dir
+            .join("objects/blake3/ab")
+            .join("a".repeat(64))
+            .exists(),
+        "orphan object file must remain on disk"
+    );
 }
 
 // =====================================================================
@@ -261,6 +283,10 @@ fn test_export_wrong_predecessor_rejected() {
         ),
     );
     rebuild_stream(&ctx, &stream, "wrongpred").failure();
+    assert!(
+        !ctx.home_dir.path().join("dest-wrongpred").exists(),
+        "wrong-predecessor stream must never publish a destination"
+    );
 }
 
 #[test]
@@ -282,6 +308,10 @@ fn test_export_duplicate_and_missing_sequence_rejected() {
         ),
     );
     rebuild_stream(&ctx, &dup, "dupseq").failure();
+    assert!(
+        !ctx.home_dir.path().join("dest-dupseq").exists(),
+        "duplicate-sequence stream must never publish a destination"
+    );
 
     // Missing sequence: header claims 2 records through 2 but only seq 1 present.
     let miss = format!(
@@ -294,6 +324,10 @@ fn test_export_duplicate_and_missing_sequence_rejected() {
         ),
     );
     rebuild_stream(&ctx, &miss, "missseq").failure();
+    assert!(
+        !ctx.home_dir.path().join("dest-missseq").exists(),
+        "missing-sequence stream must never publish a destination"
+    );
 }
 
 #[test]
@@ -303,6 +337,10 @@ fn test_export_unsupported_schema_rejected() {
         r#"{{"export_kind":"export_header","export_schema_version":99,"minimum_reader_version":1,"store_id":"s","first_sequence":1,"through_sequence":0,"previous_checkpoint_hash":"{ZERO}","head_record_hash":"{ZERO}","record_count":0}}"#
     );
     rebuild_stream(&ctx, &bad_hdr, "hdr99").failure();
+    assert!(
+        !ctx.home_dir.path().join("dest-hdr99").exists(),
+        "unsupported header schema must never publish a destination"
+    );
 
     let bad_rec = obs_record(
         1,
@@ -315,6 +353,10 @@ fn test_export_unsupported_schema_rejected() {
     );
     let stream = format!("{h}\n{r}", h = header("s", 1, 1, 1), r = bad_rec);
     rebuild_stream(&ctx, &stream, "rec99").failure();
+    assert!(
+        !ctx.home_dir.path().join("dest-rec99").exists(),
+        "unsupported record schema must never publish a destination"
+    );
 }
 
 #[test]
@@ -388,6 +430,10 @@ fn test_backup_component_substitution_detected() {
         .arg(&mix_dir)
         .assert()
         .failure();
+    assert!(
+        mix_dir.join("snag.sqlite").exists() && mix_dir.join("manifest.json").exists(),
+        "mixed bundle must still contain both components for the swap to be detectable"
+    );
 }
 
 fn extract(archive: &Path, dest: &Path) {
@@ -687,6 +733,11 @@ fn test_invalid_json_schema_rejected() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Unsupported schema"));
+    assert_eq!(
+        obs_count(&ctx),
+        0,
+        "unsupported schema must not create an observation"
+    );
 }
 
 #[test]
@@ -704,6 +755,11 @@ fn test_artifact_per_file_limit() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("50 MiB"));
+    assert_eq!(
+        obs_count(&ctx),
+        0,
+        "oversized artifact must not create an observation"
+    );
 }
 
 #[test]

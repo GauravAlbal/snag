@@ -55,6 +55,11 @@ fn test_bare_fast_path() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Recorded obs_"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "bare fast path must persist exactly one observation"
+    );
 }
 
 #[test]
@@ -74,6 +79,11 @@ fn test_structured_cli_report() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Recorded obs_"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "structured CLI report must persist one observation"
+    );
 }
 
 #[test]
@@ -104,6 +114,11 @@ fn test_list_filters_gap() {
         .assert()
         .success()
         .stdout(predicate::str::contains("List filter test").not());
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "one observation must exist for list filtering"
+    );
 }
 
 // ==========================================
@@ -126,6 +141,11 @@ fn test_json_intake_gap() {
         .write_stdin(json_payload)
         .assert()
         .success();
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "JSON intake must persist one observation"
+    );
 }
 
 #[test]
@@ -161,6 +181,11 @@ fn test_idempotency_gap() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("different semantic payload"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "idempotency replay must not create a second observation"
+    );
 }
 
 #[test]
@@ -203,6 +228,11 @@ fn test_certification_mission() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Backup verified and saved"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "certification mission must persist exactly one observation"
+    );
 }
 
 #[test]
@@ -232,6 +262,11 @@ fn test_metadata_tamper() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Hash chain mismatch"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "tampered record must still be one observation"
+    );
 }
 
 #[test]
@@ -347,6 +382,11 @@ fn test_restore_protocol() {
 
     // Verify
     ctx.cmd().arg("verify").arg("--full").assert().success();
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "restored store must contain the original observation"
+    );
 }
 
 fn latest_backup(ctx: &TestContext) -> std::path::PathBuf {
@@ -361,6 +401,12 @@ fn latest_backup(ctx: &TestContext) -> std::path::PathBuf {
         }
     }
     archive_path.expect("Backup archive not found")
+}
+
+fn obs_count(ctx: &TestContext) -> i64 {
+    let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+        .unwrap()
 }
 
 /// End-to-end P0 chain: report with an artifact, verify the live store,
@@ -531,6 +577,11 @@ fn test_idempotency_conflict_typed() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("different semantic payload"));
+    assert_eq!(
+        obs_count(&ctx),
+        1,
+        "conflicting replay must not create a second observation"
+    );
 }
 
 /// G36: list --since, --format json (versioned envelope), --limit, retracted
