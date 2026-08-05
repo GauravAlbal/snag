@@ -1,4 +1,5 @@
 use crate::cli::RebuildArgs;
+use crate::failpoint::failpoint;
 use crate::record::CanonicalRecordV1;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -60,6 +61,7 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
         rusqlite::params![store_id],
     )?;
     store.store_id = store_id.clone();
+    failpoint("rebuild_after_header_validation");
 
     let tx = store.conn.transaction()?;
     let mut count = 0;
@@ -265,6 +267,7 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
         current_expected_sequence += 1;
         current_previous_hash = computed_hash;
         count += 1;
+        failpoint("rebuild_mid_stream");
     }
 
     // 11. Verify final sequence and head hash
@@ -284,9 +287,11 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
 
     // Run full verification
     crate::verify::full_verify(&mut store).context("Failed verification after rebuild")?;
-
+    failpoint("rebuild_after_verification");
+    failpoint("rebuild_after_construction");
     // 12. Atomically finalize destination
     // Since Store has open connections, we drop it to ensure files are closed
+    failpoint("rebuild_before_publication");
     drop(store);
     std::fs::rename(&temp_dest, &args.destination)?;
 

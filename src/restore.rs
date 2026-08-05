@@ -1,4 +1,5 @@
 use crate::cli::RestoreArgs;
+use crate::failpoint::failpoint;
 use crate::store::Store;
 use crate::verify;
 use anyhow::{Context, Result};
@@ -99,6 +100,7 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
 
     // 3. Preserve the active DB + WAL/SHM + metadata as a timestamped forensic copy.
     let forensic_dir = forensic_copy(&data_dir)?;
+    failpoint("restore_after_forensic_copy");
 
     let previous_head: String = if final_db.exists() {
         Connection::open(&final_db)
@@ -119,6 +121,7 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
     //    temp name in the data dir (same filesystem for atomic rename).
     let candidate = data_dir.join(format!("snag.sqlite.candidate.{}", ulid::Ulid::generate()));
     fs::copy(&restored_db, &candidate)?;
+    failpoint("restore_after_candidate_creation");
     {
         let conn = Connection::open(&candidate)?;
         conn.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -146,6 +149,7 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
         verify::full_verify(&mut cand_store)
             .context("restored candidate failed full verification")?;
     }
+    failpoint("restore_after_candidate_verification");
 
     // 7. Merge the bundle's objects into the active objects dir (idempotent,
     //    content-addressed). Copy only objects not already present.
@@ -167,8 +171,10 @@ pub fn handle(args: RestoreArgs) -> Result<()> {
             fs::remove_file(&p)?;
         }
     }
+    failpoint("restore_before_active_switch");
     fs::rename(&candidate, &final_db)?;
     sync_dir(&data_dir)?;
+    failpoint("restore_after_active_switch");
 
     // 10. Run full verification on the switched active store before success.
     {

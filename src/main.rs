@@ -5,6 +5,7 @@ pub mod context;
 pub mod doctor;
 pub mod error;
 pub mod export;
+pub mod failpoint;
 pub mod git;
 pub mod idempotency;
 pub mod identity;

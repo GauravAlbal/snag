@@ -1,4 +1,5 @@
 use crate::cli::BackupArgs;
+use crate::failpoint::failpoint;
 use crate::store::Store;
 use crate::verify;
 use anyhow::{Context, Result};
@@ -169,10 +170,12 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         }
         dest.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA wal_checkpoint(TRUNCATE);")?;
     }
+    failpoint("backup_after_db_copy");
 
     // 2. Copy artifact objects so the bundle is self-contained.
     let src_objects = store.data_dir.join("objects");
     let dst_objects = stage_root.join("objects");
+    failpoint("backup_during_object_copy");
     if src_objects.exists() {
         copy_objects(&src_objects, &dst_objects)?;
     }
@@ -180,6 +183,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     // 3. Full verification of the staged copy BEFORE publication.
     let mut staged_store = Store::open_read_only_at(stage_root)?;
     verify::full_verify(&mut staged_store).context("backup copy failed full verification")?;
+    failpoint("backup_after_verification");
 
     let conn = Connection::open(&staged_db)?;
     let through_sequence: i64 = conn.query_row(
@@ -254,6 +258,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     });
     let manifest_path = stage_root.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    failpoint("backup_after_manifest_write");
 
     // Durability: sync staged DB + manifests + objects before publishing.
     sync_tree(stage_root)?;
@@ -269,6 +274,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     let archive_name = format!("snag-backup-{}-{}.tar.gz", ts, short_hash);
     let final_archive = backups_dir.join(&archive_name);
     let tmp_archive = backups_dir.join(format!("{}.tmp.{}", archive_name, ulid::Ulid::generate()));
+    failpoint("backup_before_publish");
 
     {
         let tar_gz = File::create(&tmp_archive)?;
@@ -287,6 +293,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     File::open(&tmp_archive)?.sync_all()?;
     fs::rename(&tmp_archive, &final_archive)?;
     sync_dir(&backups_dir)?;
+    failpoint("backup_after_publish");
 
     // 8. Record the backup checkpoint ONLY after publication succeeded.
     {
