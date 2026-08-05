@@ -494,3 +494,530 @@ fn t2_concurrent_acquisition_yields_exactly_one_winner() {
     assert_eq!(winners, 1, "exactly one session may hold the claim");
     assert_eq!(claim_count(&ctx), 1);
 }
+
+// ---------------------------------------------------------------------------
+// T3: dispositions.
+// ---------------------------------------------------------------------------
+
+fn current_disposition(ctx: &TestContext, obs: &str) -> Option<String> {
+    let conn = ctx.conn();
+    conn.query_row(
+        "SELECT disposition FROM observation_dispositions
+         WHERE observation_id = ?1 AND retracted_by_record_sequence IS NULL
+         ORDER BY source_record_sequence DESC LIMIT 1",
+        [obs],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+fn review_state(ctx: &TestContext, obs: &str) -> (String, bool) {
+    let conn = ctx.conn();
+    conn.query_row(
+        "SELECT state, handled FROM observation_review_state WHERE observation_id = ?1",
+        [obs],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn t3_every_disposition_transitions_state() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "disp-a", "bug", "major");
+    let b = report(&ctx, "disp-b", "bug", "major");
+    let c = report(&ctx, "disp-c", "bug", "major");
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    assert_eq!(current_disposition(&ctx, &a).unwrap(), "confirmed");
+    assert_eq!(review_state(&ctx, &a).0, "confirmed");
+    assert!(!review_state(&ctx, &a).1, "confirmed alone is not handled");
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("duplicate")
+        .arg("--of")
+        .arg(&b)
+        .assert()
+        .success();
+    assert_eq!(review_state(&ctx, &a).0, "negative_disposition");
+    assert!(review_state(&ctx, &a).1);
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&b)
+        .arg("environmental")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&c)
+        .arg("expected-behavior")
+        .assert()
+        .success();
+    assert_eq!(current_disposition(&ctx, &c).unwrap(), "expected_behavior");
+    assert!(review_state(&ctx, &c).1);
+}
+
+#[test]
+fn t3_target_required_and_validated() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "tgt-a", "bug", "major");
+    let b = report(&ctx, "tgt-b", "bug", "major");
+
+    // duplicate requires --of; superseded requires --by.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("duplicate")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("superseded")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    // Target must exist.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("duplicate")
+        .arg("--of")
+        .arg("obs_nonexistent")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    // Self-target rejected.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("duplicate")
+        .arg("--of")
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("own target"), "{err}");
+
+    // --of is invalid for non-target dispositions.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .arg("--of")
+        .arg(&b)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn t3_disposition_cycles_rejected_but_chains_allowed() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "cyc-a", "bug", "major");
+    let b = report(&ctx, "cyc-b", "bug", "major");
+    let c = report(&ctx, "cyc-c", "bug", "major");
+
+    // Chain: a dup-of b, c dup-of a — both valid.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("duplicate")
+        .arg("--of")
+        .arg(&b)
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&c)
+        .arg("duplicate")
+        .arg("--of")
+        .arg(&a)
+        .assert()
+        .success();
+
+    // b dup-of a closes the a->b->a cycle: rejected.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&b)
+        .arg("duplicate")
+        .arg("--of")
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "b dup-of a must close a cycle");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("cycle"), "{err}");
+}
+
+#[test]
+fn t3_idempotency_replays_and_conflicts() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "idem-a", "bug", "major");
+    let before = record_count(&ctx);
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .arg("--idempotency-key")
+        .arg("ik1")
+        .assert()
+        .success();
+    // Identical replay: no new records.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .arg("--idempotency-key")
+        .arg("ik1")
+        .assert()
+        .success();
+    assert_eq!(
+        record_count(&ctx),
+        before + 2,
+        "reviewed + disposition_set, no replay dupes"
+    );
+
+    // Conflicting reuse of the key fails.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("deferred")
+        .arg("--idempotency-key")
+        .arg("ik1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("Idempotency conflict"), "{err}");
+
+    // Later adjudication is auditable: the earlier disposition remains in the
+    // stream, the current one is the latest.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("deferred")
+        .assert()
+        .success();
+    assert_eq!(current_disposition(&ctx, &a).unwrap(), "deferred");
+    let conn = ctx.conn();
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE record_type = 'observation_disposition_set' AND entity_id = ?1",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 2, "both dispositions stay in the stream");
+}
+
+#[test]
+fn t3_reopen_returns_observation_to_queue() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "reopen-a", "bug", "major");
+    let b = report(&ctx, "reopen-b", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("duplicate")
+        .arg("--of")
+        .arg(&b)
+        .assert()
+        .success();
+    assert!(review_state(&ctx, &a).1);
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("reopen")
+        .arg(&a)
+        .arg("--rationale")
+        .arg("rechecked")
+        .assert()
+        .success();
+    assert_eq!(review_state(&ctx, &a).0, "reopened");
+    assert!(!review_state(&ctx, &a).1);
+    // Back in the queue.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("next")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8(out.stdout).unwrap().contains(&a));
+
+    // Reopening with no disposition fails.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("reopen")
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+// ---------------------------------------------------------------------------
+// T4: relationships.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t4_symmetric_canonical_ordering_and_idempotency() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "rel-a", "bug", "major");
+    let b = report(&ctx, "rel-b", "bug", "major");
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&b)
+        .arg("--relation")
+        .arg("same-finding")
+        .assert()
+        .success();
+    // Reverse assertion is the same canonical relationship; idempotent.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&b)
+        .arg(&a)
+        .arg("--relation")
+        .arg("same_finding")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("idempotent")
+    );
+
+    let conn = ctx.conn();
+    let (left, right): (String, String) = conn
+        .query_row(
+            "SELECT left_observation_id, right_observation_id FROM observation_relationships",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(left, a);
+    assert_eq!(right, b);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observation_relationships", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "one canonical row for both assertions");
+}
+
+#[test]
+fn t4_directional_preservation_and_cycle_rejection() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "dir-a", "bug", "major");
+    let b = report(&ctx, "dir-b", "bug", "major");
+    let c = report(&ctx, "dir-c", "bug", "major");
+
+    // Direction preserved for upstream-cause.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&b)
+        .arg("--relation")
+        .arg("upstream-cause")
+        .assert()
+        .success();
+    let conn = ctx.conn();
+    let (left, right): (String, String) = conn
+        .query_row(
+            "SELECT left_observation_id, right_observation_id FROM observation_relationships WHERE relation='upstream_cause'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (left, right),
+        (a.clone(), b.clone()),
+        "direction must be preserved"
+    );
+
+    // duplicate_of chain: c->b, then a->c.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&c)
+        .arg(&b)
+        .arg("--relation")
+        .arg("duplicate-of")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&c)
+        .arg("--relation")
+        .arg("duplicate-of")
+        .assert()
+        .success();
+    // b->a would close c->b->a->c: rejected.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&b)
+        .arg(&a)
+        .arg("--relation")
+        .arg("duplicate-of")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "b->a with a->c and c->b closes a duplicate_of cycle"
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("cycle"), "{err}");
+}
+
+#[test]
+fn t4_retraction_is_append_only() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "ret-a", "bug", "major");
+    let b = report(&ctx, "ret-b", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&b)
+        .arg("--relation")
+        .arg("related")
+        .assert()
+        .success();
+    let conn = ctx.conn();
+    let rel: String = conn
+        .query_row(
+            "SELECT relationship_id FROM observation_relationships",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("unrelate")
+        .arg(&rel)
+        .arg("--rationale")
+        .arg("wrong")
+        .assert()
+        .success();
+    let retracted: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observation_relationships WHERE retracted_by_record_sequence IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retracted, 1, "row is marked retracted, not deleted");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observation_relationships", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "no hard delete");
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE record_type = 'observation_relationship_retracted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 1);
+
+    // Retracting again fails (no live relationship).
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("unrelate")
+        .arg(&rel)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn t4_invalid_endpoints_and_self_rejected() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "end-a", "bug", "major");
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg("obs_nonexistent")
+        .arg("--relation")
+        .arg("related")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&a)
+        .arg("--relation")
+        .arg("related")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let b = report(&ctx, "end-b", "bug", "major");
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("relate")
+        .arg(&a)
+        .arg(&b)
+        .arg("--relation")
+        .arg("nonsense")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}

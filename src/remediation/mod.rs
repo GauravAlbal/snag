@@ -32,6 +32,10 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::Release(args) => release(args),
         ReviewCommand::Heartbeat(args) => heartbeat(args),
         ReviewCommand::List(args) => list(args),
+        ReviewCommand::Disposition(args) => disposition(args),
+        ReviewCommand::Reopen(args) => reopen(args),
+        ReviewCommand::Relate(args) => relate(args),
+        ReviewCommand::Unrelate(args) => unrelate(args),
     }
 }
 
@@ -434,9 +438,462 @@ fn heartbeat(args: crate::cli::ReviewHeartbeatArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Queue retrieval.
+// Dispositions (append-only adjudication).
 // ---------------------------------------------------------------------------
 
+/// Check whether adding edge (observation -> target) of the given disposition
+/// type would close a cycle among current (non-retracted) directional
+/// disposition edges. Adding L->R is a cycle iff R can already reach L, so
+/// the walk seeds from the target and tests for the observation.
+fn disposition_cycle_would_form(
+    tx: &rusqlite::Transaction,
+    disposition: &str,
+    observation: &str,
+    target: &str,
+) -> Result<bool> {
+    let mut stmt = tx.prepare(
+        "WITH RECURSIVE reach(x) AS (
+             SELECT target_observation_id FROM observation_dispositions
+             WHERE observation_id = ?3 AND disposition = ?1
+               AND retracted_by_record_sequence IS NULL AND target_observation_id IS NOT NULL
+             UNION
+             SELECT d.target_observation_id FROM observation_dispositions d
+             JOIN reach r ON d.observation_id = r.x
+             WHERE d.disposition = ?1 AND d.retracted_by_record_sequence IS NULL
+               AND d.target_observation_id IS NOT NULL
+         )
+         SELECT 1 FROM reach WHERE x = ?2 LIMIT 1",
+    )?;
+    let hit = stmt
+        .query_row(rusqlite::params![disposition, observation, target], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+/// `snag review disposition <observation-id> <disposition> [--of|--by] …`
+fn disposition(mut args: crate::cli::ReviewDispositionArgs) -> Result<()> {
+    // CLI surface accepts hyphenated forms (`expected-behavior`); the event
+    // vocabulary is underscored (`expected_behavior`). Normalize in place so
+    // every downstream use (payloads, rows, cycle checks) is normalized.
+    args.disposition = args.disposition.replace('-', "_");
+    if !DISPOSITIONS.contains(&args.disposition.as_str()) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "unknown disposition '{}'; allowed: {}",
+            args.disposition,
+            DISPOSITIONS.join(", ")
+        )));
+    }
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id = ?1)",
+        rusqlite::params![args.observation_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        anyhow::bail!(SnagError::NotFound(format!(
+            "observation {}",
+            args.observation_id
+        )));
+    }
+
+    // Target validation: duplicate --of, superseded --by, others forbid both.
+    let target = match args.disposition.as_str() {
+        DISP_DUPLICATE => {
+            let t = args.of.ok_or_else(|| {
+                SnagError::Validation("duplicate requires --of <observation-id>".to_string())
+            })?;
+            Some(t)
+        }
+        DISP_SUPERSEDED => {
+            let t = args.by.ok_or_else(|| {
+                SnagError::Validation("superseded requires --by <observation-id>".to_string())
+            })?;
+            Some(t)
+        }
+        _ => {
+            if args.of.is_some() || args.by.is_some() {
+                anyhow::bail!(SnagError::Validation(
+                    "--of/--by are only valid for duplicate/superseded dispositions".to_string()
+                ));
+            }
+            None
+        }
+    };
+    if let Some(t) = &target {
+        if t == &args.observation_id {
+            anyhow::bail!(SnagError::Validation(
+                "an observation cannot be its own target".to_string()
+            ));
+        }
+        let target_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id = ?1)",
+            rusqlite::params![t],
+            |row| row.get(0),
+        )?;
+        if !target_exists {
+            anyhow::bail!(SnagError::NotFound(format!("target observation {t}")));
+        }
+        // Directional terminal chains must stay acyclic.
+        if disposition_cycle_would_form(&tx, &args.disposition, &args.observation_id, t)? {
+            anyhow::bail!(SnagError::Validation(format!(
+                "{} would create a cycle: {} already leads to {}",
+                args.disposition, t, args.observation_id
+            )));
+        }
+    }
+
+    // The disposition record's id is bound inside its own payload.
+    let disp_id = generate_id("disp");
+    let _reviewed = append_event(
+        &tx,
+        &store_id,
+        RECORD_REVIEWED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::Reviewed(ReviewedPayload {
+            disposition: args.disposition.clone(),
+            target_observation_id: target.clone(),
+            rationale: args.rationale.clone(),
+            evidence_json: args.evidence.clone(),
+            reviewer: identity.reviewer.clone(),
+            review_session_id: identity.session_id.clone(),
+            created_at: now.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+        })),
+    )?;
+    let disposition_set = append_event_with_id(
+        &tx,
+        &store_id,
+        RECORD_DISPOSITION_SET,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::DispositionSet(DispositionSetPayload {
+            disposition_id: disp_id.clone(),
+            disposition: args.disposition.clone(),
+            target_observation_id: target.clone(),
+            rationale: args.rationale.clone(),
+            evidence_json: args.evidence.clone(),
+            reviewer: identity.reviewer.clone(),
+            review_session_id: identity.session_id.clone(),
+            created_at: now.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+        })),
+        Some(disp_id.clone()),
+    )?;
+
+    if !disposition_set.replayed {
+        tx.execute(
+            "INSERT INTO observation_dispositions (
+                disposition_id, observation_id, disposition, target_observation_id,
+                rationale, evidence_json, reviewer, review_session_id, created_at,
+                source_record_sequence, idempotency_key
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                disp_id,
+                &args.observation_id,
+                &args.disposition,
+                &target,
+                &args.rationale,
+                &args.evidence,
+                &identity.reviewer,
+                &identity.session_id,
+                &now,
+                disposition_set.local_sequence,
+                &args.idempotency_key,
+            ],
+        )?;
+    }
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Disposition {} -> {} (sequence {})",
+        args.observation_id, args.disposition, disposition_set.local_sequence
+    );
+    Ok(())
+}
+
+/// `snag review reopen <observation-id> [--rationale …]`
+///
+/// Reopening is append-only: the earlier disposition events remain, the
+/// current disposition row is marked retracted, and the observation returns
+/// to the queue.
+fn reopen(args: crate::cli::ReviewReopenArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    let has_disposition: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observation_dispositions
+         WHERE observation_id = ?1 AND retracted_by_record_sequence IS NULL)",
+        rusqlite::params![args.observation_id],
+        |row| row.get(0),
+    )?;
+    if !has_disposition {
+        anyhow::bail!(SnagError::Validation(format!(
+            "observation {} has no current disposition to reopen",
+            args.observation_id
+        )));
+    }
+
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_REOPENED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::Reopened(ReopenedPayload {
+            rationale: args.rationale.clone(),
+            reviewer: identity.reviewer.clone(),
+            review_session_id: identity.session_id.clone(),
+            created_at: now.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+        })),
+    )?;
+    if !appended.replayed {
+        tx.execute(
+            "UPDATE observation_dispositions SET retracted_by_record_sequence = ?1
+             WHERE observation_id = ?2 AND retracted_by_record_sequence IS NULL",
+            rusqlite::params![appended.local_sequence, args.observation_id],
+        )?;
+    }
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Reopened {} (sequence {})",
+        args.observation_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Relationships (explicit reviewer assertions).
+// ---------------------------------------------------------------------------
+
+/// Canonical endpoint ordering for symmetric relations (left < right by id).
+fn canonical_endpoints(relation: &str, left: &str, right: &str) -> (String, String) {
+    if SYMMETRIC_RELATIONSHIPS.contains(&relation) && left > right {
+        (right.to_string(), left.to_string())
+    } else {
+        (left.to_string(), right.to_string())
+    }
+}
+
+/// Check whether adding edge (left -> right) of the given directional relation
+/// would close a cycle among current (non-retracted) edges of the same type.
+/// Adding L->R is a cycle iff R can already reach L, so the walk seeds from
+/// the right endpoint and tests for the left.
+fn relationship_cycle_would_form(
+    tx: &rusqlite::Transaction,
+    relation: &str,
+    left: &str,
+    right: &str,
+) -> Result<bool> {
+    let mut stmt = tx.prepare(
+        "WITH RECURSIVE reach(x) AS (
+             SELECT right_observation_id FROM observation_relationships
+             WHERE left_observation_id = ?3 AND relation = ?1
+               AND retracted_by_record_sequence IS NULL
+             UNION
+             SELECT r2.right_observation_id FROM observation_relationships r2
+             JOIN reach r ON r2.left_observation_id = r.x
+             WHERE r2.relation = ?1 AND r2.retracted_by_record_sequence IS NULL
+         )
+         SELECT 1 FROM reach WHERE x = ?2 LIMIT 1",
+    )?;
+    let hit = stmt
+        .query_row(rusqlite::params![relation, left, right], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+/// `snag review relate <left> <right> --relation <relation> [--rationale …]`
+fn relate(mut args: crate::cli::ReviewRelateArgs) -> Result<()> {
+    // CLI surface accepts hyphenated forms (`same-finding`); the event
+    // vocabulary is underscored (`same_finding`). Normalize in place so every
+    // downstream use (payloads, rows, canonical ordering, cycle checks) is
+    // normalized.
+    args.relation = args.relation.replace('-', "_");
+    if !RELATIONSHIPS.contains(&args.relation.as_str()) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "unknown relation '{}'; allowed: {}",
+            args.relation,
+            RELATIONSHIPS.join(", ")
+        )));
+    }
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    if args.left == args.right {
+        anyhow::bail!(SnagError::Validation(
+            "an observation cannot relate to itself".to_string()
+        ));
+    }
+    for endpoint in [&args.left, &args.right] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id = ?1)",
+            rusqlite::params![endpoint],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!(SnagError::NotFound(format!("observation {endpoint}")));
+        }
+    }
+
+    let (left, right) = canonical_endpoints(&args.relation, &args.left, &args.right);
+
+    // Duplicate assertion (same canonical endpoints + relation, still live) is
+    // idempotent: return the existing relationship, no new event.
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT relationship_id FROM observation_relationships
+             WHERE left_observation_id = ?1 AND right_observation_id = ?2
+               AND relation = ?3 AND retracted_by_record_sequence IS NULL
+             ORDER BY source_record_sequence ASC LIMIT 1",
+            rusqlite::params![left, right, args.relation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(rid) = existing {
+        println!("Relationship already exists: {} (idempotent)", rid);
+        tx.commit()?;
+        return Ok(());
+    }
+
+    if DIRECTIONAL_RELATIONSHIPS.contains(&args.relation.as_str())
+        && relationship_cycle_would_form(&tx, &args.relation, &left, &right)?
+    {
+        anyhow::bail!(SnagError::Validation(format!(
+            "{} would create a cycle between {} and {}",
+            args.relation, left, right
+        )));
+    }
+
+    let rel_id = generate_id("rel");
+    let appended = append_event_with_id(
+        &tx,
+        &store_id,
+        RECORD_RELATIONSHIP_ADDED,
+        &args.left,
+        RecordPayload::Remediation(RemediationEvent::RelationshipAdded(
+            RelationshipAddedPayload {
+                relationship_id: rel_id.clone(),
+                left_observation_id: left.clone(),
+                right_observation_id: right.clone(),
+                relation: args.relation.clone(),
+                rationale: args.rationale.clone(),
+                evidence_json: args.evidence.clone(),
+                reviewer: identity.reviewer.clone(),
+                review_session_id: identity.session_id.clone(),
+                created_at: now.clone(),
+                idempotency_key: args.idempotency_key.clone(),
+            },
+        )),
+        Some(rel_id.clone()),
+    )?;
+    if !appended.replayed {
+        tx.execute(
+            "INSERT INTO observation_relationships (
+                relationship_id, left_observation_id, right_observation_id, relation,
+                rationale, evidence_json, reviewer, review_session_id, created_at,
+                source_record_sequence, idempotency_key
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                rel_id,
+                left,
+                right,
+                &args.relation,
+                &args.rationale,
+                &args.evidence,
+                &identity.reviewer,
+                &identity.session_id,
+                &now,
+                appended.local_sequence,
+                &args.idempotency_key,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    println!(
+        "Related {} {} {} (sequence {})",
+        args.left, args.relation, args.right, appended.local_sequence
+    );
+    Ok(())
+}
+
+/// `snag review unrelate <relationship-id> [--rationale …]` — append-only
+/// retraction, no hard delete.
+fn unrelate(args: crate::cli::ReviewUnrelateArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    let live: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observation_relationships
+         WHERE relationship_id = ?1 AND retracted_by_record_sequence IS NULL)",
+        rusqlite::params![args.relationship_id],
+        |row| row.get(0),
+    )?;
+    if !live {
+        anyhow::bail!(SnagError::NotFound(format!(
+            "relationship {}",
+            args.relationship_id
+        )));
+    }
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_RELATIONSHIP_RETRACTED,
+        &args.relationship_id,
+        RecordPayload::Remediation(RemediationEvent::RelationshipRetracted(
+            RelationshipRetractedPayload {
+                relationship_id: args.relationship_id.clone(),
+                rationale: args.rationale.clone(),
+                reviewer: identity.reviewer.clone(),
+                review_session_id: identity.session_id.clone(),
+                created_at: now.clone(),
+                idempotency_key: args.idempotency_key.clone(),
+            },
+        )),
+    )?;
+    if !appended.replayed {
+        tx.execute(
+            "UPDATE observation_relationships SET retracted_by_record_sequence = ?1
+             WHERE relationship_id = ?2 AND retracted_by_record_sequence IS NULL",
+            rusqlite::params![appended.local_sequence, args.relationship_id],
+        )?;
+    }
+    tx.commit()?;
+    println!(
+        "Unrelated {} (sequence {})",
+        args.relationship_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Queue retrieval.
+// ---------------------------------------------------------------------------
 fn resolve_repo_filter(store: &mut Store, repo: Option<&str>) -> Result<Option<String>> {
     let Some(repo) = repo else { return Ok(None) };
     if repo == "current" {

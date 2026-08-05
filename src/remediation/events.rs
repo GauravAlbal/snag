@@ -439,6 +439,24 @@ pub fn payload_created_at(payload: &crate::record::RecordPayload) -> Option<&str
     }
 }
 
+/// Payload equality ignoring the volatile, command-generated fields (`created_at`,
+/// `disposition_id`, `relationship_id`): a replay with the same idempotency
+/// key is a replay of the same submission intent, not a new event — the
+/// original event's identity and timestamp stand.
+fn payload_equal_ignoring_volatile(a: &RecordPayload, b: &RecordPayload) -> bool {
+    let mut ja: serde_json::Value = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
+    let mut jb: serde_json::Value = serde_json::to_value(b).unwrap_or(serde_json::Value::Null);
+    if let (Some(x), Some(y)) = (ja.as_object_mut(), jb.as_object_mut()) {
+        x.remove("created_at");
+        y.remove("created_at");
+        x.remove("disposition_id");
+        y.remove("disposition_id");
+        x.remove("relationship_id");
+        y.remove("relationship_id");
+    }
+    ja == jb
+}
+
 /// Outcome of appending (or replaying) one remediation event.
 #[derive(Debug, Clone)]
 pub struct AppendedEvent {
@@ -467,6 +485,19 @@ pub fn append_event(
     entity_id: &str,
     payload: RecordPayload,
 ) -> anyhow::Result<AppendedEvent> {
+    append_event_with_id(tx, store_id, record_type, entity_id, payload, None)
+}
+
+/// `append_event` with a caller-supplied record id (used when an event's
+/// payload binds its own record identity, e.g. `disposition_id`).
+pub fn append_event_with_id(
+    tx: &rusqlite::Transaction,
+    store_id: &str,
+    record_type: &str,
+    entity_id: &str,
+    payload: RecordPayload,
+    record_id: Option<String>,
+) -> anyhow::Result<AppendedEvent> {
     let idem = payload_idempotency_key(&payload);
     if let Some(ik) = idem {
         let mut stmt = tx.prepare(
@@ -487,7 +518,7 @@ pub fn append_event(
             .optional()?;
         if let Some((old_id, old_seq, old_hash, old_payload_json)) = existing {
             let old_payload: RecordPayload = serde_json::from_str(&old_payload_json)?;
-            if old_payload == payload {
+            if payload_equal_ignoring_volatile(&old_payload, &payload) {
                 return Ok(AppendedEvent {
                     record_id: old_id,
                     local_sequence: old_seq,
@@ -517,7 +548,7 @@ pub fn append_event(
         });
     crate::failpoint::failpoint("remediation_after_record_alloc");
 
-    let record_id = generate_id("rec");
+    let record_id = record_id.unwrap_or_else(|| generate_id("rec"));
     // The record's captured_at is the payload's created_at (the command
     // stamps both at the same instant), so the canonical kernel and the
     // payload never disagree about the event time.

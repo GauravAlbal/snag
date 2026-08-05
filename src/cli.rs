@@ -278,6 +278,14 @@ pub enum ReviewCommand {
     Heartbeat(ReviewHeartbeatArgs),
     /// List observations with their review state
     List(ReviewListArgs),
+    /// Adjudicate an observation with a disposition
+    Disposition(ReviewDispositionArgs),
+    /// Reopen a previous disposition (append-only)
+    Reopen(ReviewReopenArgs),
+    /// Assert a relationship between two observations
+    Relate(ReviewRelateArgs),
+    /// Retract a relationship assertion (append-only)
+    Unrelate(ReviewUnrelateArgs),
 }
 
 #[derive(Args)]
@@ -389,4 +397,96 @@ pub struct ReviewListArgs {
 
     #[arg(long)]
     pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewDispositionArgs {
+    pub observation_id: String,
+
+    /// One of: confirmed, duplicate, expected-behavior, environmental,
+    /// insufficient-evidence, deferred, superseded
+    pub disposition: String,
+
+    /// Target observation (required for `duplicate`)
+    #[arg(long = "of")]
+    pub of: Option<String>,
+
+    /// Successor observation (required for `superseded`)
+    #[arg(long = "by")]
+    pub by: Option<String>,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub evidence: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewReopenArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewRelateArgs {
+    pub left: String,
+    pub right: String,
+
+    /// One of: same-finding, duplicate-of, upstream-cause,
+    /// downstream-symptom, related, supersedes
+    #[arg(long)]
+    pub relation: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub evidence: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewUnrelateArgs {
+    pub relationship_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
