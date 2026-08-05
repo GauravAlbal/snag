@@ -96,6 +96,7 @@ struct Work {
     latest_verification_status: Option<String>,
     observation_reopened: bool,
     remediation_reopened: bool,
+    marked_handled: bool,
 }
 
 impl Work {
@@ -134,7 +135,8 @@ fn derive_state(w: &mut Work) {
             }
             DISP_CONFIRMED => {
                 // Remediation progression: accepted verification is the only
-                // terminal; commits alone never imply success.
+                // terminal; commits alone never imply success. A durable
+                // mark-handled declaration survives the re-derivation.
                 if w.latest_verification_status.as_deref() == Some(VERIFY_ACCEPTED) {
                     w.state = STATE_VERIFIED_FIXED.to_string();
                     w.handled = true;
@@ -147,11 +149,10 @@ fn derive_state(w: &mut Work) {
                 } else {
                     w.state = STATE_CONFIRMED.to_string();
                 }
-                // confirmed alone is not handled; marked-handled or an
-                // accepted receipt flips the flag.
-                if w.latest_verification_status.as_deref() != Some(VERIFY_ACCEPTED) {
-                    w.handled = false;
-                }
+                // confirmed alone is not handled; an explicit mark-handled
+                // declaration or an accepted receipt flips the flag.
+                w.handled = w.marked_handled
+                    || w.latest_verification_status.as_deref() == Some(VERIFY_ACCEPTED);
                 w.observation_reopened = false;
             }
             _ => {
@@ -224,6 +225,7 @@ fn apply_event(w: &mut Work, ev: &ReducedEvent) {
             w.disposition = None;
             w.disposition_target = None;
             w.handled = false;
+            w.marked_handled = false;
             w.observation_reopened = true;
             w.state = STATE_REOPENED.to_string();
         }
@@ -268,12 +270,14 @@ fn apply_event(w: &mut Work, ev: &ReducedEvent) {
             derive_state(w);
         }
         (RECORD_MARKED_HANDLED, R(E::MarkedHandled(_))) => {
+            w.marked_handled = true;
             w.handled = true;
             w.remediation_reopened = false;
             derive_state(w);
         }
         (RECORD_REMEDIATION_REOPENED, R(E::RemediationReopened(_))) => {
             w.handled = false;
+            w.marked_handled = false;
             w.remediation_reopened = true;
             w.state = STATE_REOPENED.to_string();
         }

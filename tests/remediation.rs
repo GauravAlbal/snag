@@ -1021,3 +1021,392 @@ fn t4_invalid_endpoints_and_self_rejected() {
         .unwrap();
     assert!(!out.status.success());
 }
+
+// ---------------------------------------------------------------------------
+// T5: remediation lineage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t5_promotion_requires_confirmed_and_links_finding() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "prom-a", "bug", "major");
+
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("promote")
+        .arg(&a)
+        .arg("--finding-id")
+        .arg("f1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "promote before confirmed must fail");
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("promote")
+        .arg(&a)
+        .arg("--finding-id")
+        .arg("f1")
+        .assert()
+        .success();
+    let conn = ctx.conn();
+    let finding: String = conn
+        .query_row(
+            "SELECT target_id FROM remediation_links WHERE observation_id = ?1 AND link_type = 'finding'",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(finding, "f1");
+    let (state, _) = review_state(&ctx, &a);
+    assert_eq!(state, "promoted");
+}
+
+#[test]
+fn t5_multiple_tasks_and_commits_and_verification_statuses() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "multi", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-task")
+        .arg(&a)
+        .arg("--task-id")
+        .arg("t1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-task")
+        .arg(&a)
+        .arg("--task-id")
+        .arg("t2")
+        .assert()
+        .success();
+    let conn = ctx.conn();
+    let tasks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM remediation_links WHERE observation_id = ?1 AND link_type = 'task'",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tasks, 2, "multiple task links");
+    let (state, _) = review_state(&ctx, &a);
+    assert_eq!(state, "remediation_in_progress");
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&a)
+        .arg("--commit")
+        .arg("sha1")
+        .arg("--repo")
+        .arg("r1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&a)
+        .arg("--commit")
+        .arg("sha2")
+        .arg("--repo")
+        .arg("r1")
+        .assert()
+        .success();
+    let commits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM remediation_links WHERE observation_id = ?1 AND link_type = 'commit'",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(commits, 2, "multiple commit links");
+    // Commit alone never verifies: still candidate_fix, not handled.
+    let (state, handled) = review_state(&ctx, &a);
+    assert_eq!(state, "candidate_fix");
+    assert!(!handled, "a commit alone must not imply success");
+}
+
+#[test]
+fn t5_accepted_verification_verifies_rejected_does_not() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "verify-a", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+
+    // Invalid status rejected up front.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("rx")
+        .arg("--status")
+        .arg("bogus")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&a)
+        .arg("--commit")
+        .arg("sha1")
+        .arg("--repo")
+        .arg("r1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("r_rej")
+        .arg("--status")
+        .arg("rejected")
+        .assert()
+        .success();
+    let (state, handled) = review_state(&ctx, &a);
+    assert_eq!(
+        state, "candidate_fix",
+        "rejected verification keeps remediation open"
+    );
+    assert!(!handled);
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("r_acc")
+        .arg("--status")
+        .arg("accepted")
+        .assert()
+        .success();
+    let (state, handled) = review_state(&ctx, &a);
+    assert_eq!(state, "verified_fixed");
+    assert!(handled);
+}
+
+#[test]
+fn t5_reopen_after_verification_is_append_only() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "reopen-rem", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&a)
+        .arg("--commit")
+        .arg("sha1")
+        .arg("--repo")
+        .arg("r1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("r1")
+        .arg("--status")
+        .arg("accepted")
+        .assert()
+        .success();
+    let (state, handled) = review_state(&ctx, &a);
+    assert_eq!(state, "verified_fixed");
+    assert!(handled);
+
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("reopen-remediation")
+        .arg(&a)
+        .arg("--rationale")
+        .arg("regression")
+        .assert()
+        .success();
+    let (state, handled) = review_state(&ctx, &a);
+    assert_eq!(state, "reopened");
+    assert!(!handled, "reopening un-handles");
+
+    // A fresh accepted receipt re-verifies; all events remain in the stream.
+    let conn = ctx.conn();
+    let events_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE entity_id = ?1",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&a)
+        .arg("--receipt")
+        .arg("r2")
+        .arg("--status")
+        .arg("accepted")
+        .assert()
+        .success();
+    let (state, handled) = review_state(&ctx, &a);
+    assert_eq!(state, "verified_fixed");
+    assert!(handled);
+    let events_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records WHERE entity_id = ?1",
+            [&a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events_after, events_before + 1, "reopening is append-only");
+}
+
+#[test]
+fn t5_mark_handled_rules() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "mh-a", "bug", "major");
+    // No disposition, no evidence: refused.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("mark-handled")
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+
+    // Confirmed with no task/commit/verification: refused.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&a)
+        .arg("confirmed")
+        .assert()
+        .success();
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("mark-handled")
+        .arg(&a)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("task link"), "{err}");
+
+    // With a task link: allowed.
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-task")
+        .arg(&a)
+        .arg("--task-id")
+        .arg("t1")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("mark-handled")
+        .arg(&a)
+        .assert()
+        .success();
+    assert!(review_state(&ctx, &a).1);
+
+    // Reopen-remediation on a non-handled observation fails.
+    let out = ctx
+        .cmd_as("alice")
+        .arg("review")
+        .arg("reopen-remediation")
+        .arg(report(&ctx, "mh-b", "bug", "major"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+// ---------------------------------------------------------------------------
+// T6: negative disposition workflow (handled without patch).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t6_negative_dispositions_handle_without_task_or_patch() {
+    let ctx = TestContext::new();
+    let mut obs = Vec::new();
+    for (title, disp, flag, arg) in [
+        ("n1", "duplicate", "--of", "n_target"),
+        ("n2", "environmental", "", ""),
+        ("n3", "expected-behavior", "", ""),
+        ("n4", "insufficient-evidence", "", ""),
+    ] {
+        let a = report(&ctx, title, "bug", "major");
+        let mut cmd = ctx.cmd_as("alice");
+        cmd.arg("review").arg("disposition").arg(&a).arg(disp);
+        if !flag.is_empty() {
+            let target = report(&ctx, arg, "bug", "major");
+            cmd.arg(flag).arg(&target);
+            obs.push(target);
+        }
+        cmd.assert().success();
+        let (state, handled) = review_state(&ctx, &a);
+        assert_eq!(state, "negative_disposition", "{title}");
+        assert!(handled, "{title}: negative disposition is handled");
+        // mark-handled succeeds without any task or patch.
+        ctx.cmd_as("alice")
+            .arg("review")
+            .arg("mark-handled")
+            .arg(&a)
+            .assert()
+            .success();
+        obs.push(a);
+    }
+    // The duplicate target is also adjudicated so nothing remains queued.
+    for t in obs.iter().filter(|t| ctx.conn().query_row("SELECT COUNT(*) FROM observation_dispositions WHERE observation_id = ?1 AND retracted_by_record_sequence IS NULL", [t], |r| r.get::<_, i64>(0)).unwrap() == 0) {
+        ctx.cmd_as("alice").arg("review").arg("disposition").arg(t).arg("environmental").assert().success();
+    }
+    // Every negative disposition leaves the default queue; none can be
+    // pulled by next (even by another session).
+    let out = ctx
+        .cmd_as("bob")
+        .arg("review")
+        .arg("next")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("empty queue")
+    );
+    for a in obs {
+        let (state, handled) = review_state(&ctx, &a);
+        assert_eq!(state, "negative_disposition");
+        assert!(handled);
+    }
+}

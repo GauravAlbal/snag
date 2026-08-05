@@ -286,6 +286,18 @@ pub enum ReviewCommand {
     Relate(ReviewRelateArgs),
     /// Retract a relationship assertion (append-only)
     Unrelate(ReviewUnrelateArgs),
+    /// Promote a confirmed observation to a finding
+    Promote(ReviewPromoteArgs),
+    /// Attach owned work (multiple task ids supported)
+    AttachTask(ReviewAttachTaskArgs),
+    /// Attach a candidate fixing commit
+    AttachFix(ReviewAttachFixArgs),
+    /// Attach verification evidence (accepted is the only verifying status)
+    AttachVerification(ReviewAttachVerificationArgs),
+    /// Declare an observation durably handled
+    MarkHandled(ReviewMarkHandledArgs),
+    /// Reopen a handled remediation (append-only)
+    ReopenRemediation(ReviewReopenRemediationArgs),
 }
 
 #[derive(Args)]
@@ -477,6 +489,117 @@ pub struct ReviewRelateArgs {
 #[derive(Args)]
 pub struct ReviewUnrelateArgs {
     pub relationship_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewPromoteArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub finding_id: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAttachTaskArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub task_id: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAttachFixArgs {
+    pub observation_id: String,
+
+    /// The candidate fixing commit SHA
+    #[arg(long)]
+    pub commit: String,
+
+    #[arg(long)]
+    pub repo: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAttachVerificationArgs {
+    pub observation_id: String,
+
+    /// Verification receipt reference
+    #[arg(long)]
+    pub receipt: String,
+
+    /// accepted | rejected | abstained | invalid | unknown
+    #[arg(long)]
+    pub status: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewMarkHandledArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewReopenRemediationArgs {
+    pub observation_id: String,
 
     #[arg(long)]
     pub rationale: Option<String>,

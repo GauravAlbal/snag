@@ -19,6 +19,7 @@ use crate::record::RecordPayload;
 use crate::remediation::events::*;
 use crate::remediation::identity::{RemediationIdentity, lease_expiry, resolve_identity, utc_now};
 use crate::remediation::queue::{NextFilters, agent_packet, render_next_text};
+use crate::remediation::reducer::STATE_VERIFIED_FIXED;
 use crate::store::Store;
 use crate::types::generate_id;
 use anyhow::Result;
@@ -36,6 +37,12 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::Reopen(args) => reopen(args),
         ReviewCommand::Relate(args) => relate(args),
         ReviewCommand::Unrelate(args) => unrelate(args),
+        ReviewCommand::Promote(args) => promote(args),
+        ReviewCommand::AttachTask(args) => attach_task(args),
+        ReviewCommand::AttachFix(args) => attach_fix(args),
+        ReviewCommand::AttachVerification(args) => attach_verification(args),
+        ReviewCommand::MarkHandled(args) => mark_handled(args),
+        ReviewCommand::ReopenRemediation(args) => reopen_remediation(args),
     }
 }
 
@@ -887,6 +894,332 @@ fn unrelate(args: crate::cli::ReviewUnrelateArgs) -> Result<()> {
     println!(
         "Unrelated {} (sequence {})",
         args.relationship_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Promotion and remediation lineage.
+// ---------------------------------------------------------------------------
+
+/// Load the reduced state for a validation check (inside the mutation tx).
+fn reduced_in_tx(
+    tx: &rusqlite::Transaction,
+    observation_id: &str,
+) -> Result<crate::remediation::reducer::ReducedObservation> {
+    crate::remediation::reducer::reduce_observation(tx, observation_id)
+}
+
+/// `snag review promote <observation-id> --finding-id <finding-id>`
+fn promote(args: crate::cli::ReviewPromoteArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let reduced = reduced_in_tx(&tx, &args.observation_id)?;
+    if reduced.disposition.as_deref() != Some(DISP_CONFIRMED) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "promotion requires a confirmed disposition (current: {})",
+            reduced.disposition.as_deref().unwrap_or("none")
+        )));
+    }
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_PROMOTED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::Promoted(PromotedPayload {
+            finding_id: args.finding_id.clone(),
+            reviewer: identity.reviewer.clone(),
+            review_session_id: identity.session_id.clone(),
+            created_at: now.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+        })),
+    )?;
+    if !appended.replayed {
+        tx.execute(
+            "INSERT INTO remediation_links (
+                link_id, observation_id, link_type, target_id, created_at,
+                source_record_sequence, idempotency_key
+            ) VALUES (?1, ?2, 'finding', ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                appended.record_id,
+                &args.observation_id,
+                &args.finding_id,
+                &now,
+                appended.local_sequence,
+                &args.idempotency_key,
+            ],
+        )?;
+    }
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Promoted {} -> finding {} (sequence {})",
+        args.observation_id, args.finding_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+/// `snag review attach-task <observation-id> --task-id <task-id>` (multiple
+/// task ids supported; each event is its own link).
+fn attach_task(args: crate::cli::ReviewAttachTaskArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Requires a confirmed disposition (owned work belongs to a confirmed
+    // problem); the claim-time fold-in (`claim --task`) already implies the
+    // claim context but still requires confirmation to attach lineage.
+    let reduced = reduced_in_tx(&tx, &args.observation_id)?;
+    if reduced.disposition.as_deref() != Some(DISP_CONFIRMED) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "task links require a confirmed disposition (current: {})",
+            reduced.disposition.as_deref().unwrap_or("none")
+        )));
+    }
+    attach_task_if_absent(
+        &store_id,
+        &tx,
+        &args.observation_id,
+        &identity,
+        &args.task_id,
+        &now,
+    )?;
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!("Attached task {} to {}", args.task_id, args.observation_id);
+    Ok(())
+}
+
+/// `snag review attach-fix <observation-id> --commit <sha> --repo <repo-id>`
+/// A commit alone never implies success (the reducer keeps the state at
+/// `candidate_fix` until accepted verification arrives).
+fn attach_fix(args: crate::cli::ReviewAttachFixArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let reduced = reduced_in_tx(&tx, &args.observation_id)?;
+    if reduced.disposition.as_deref() != Some(DISP_CONFIRMED) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "fix links require a confirmed disposition (current: {})",
+            reduced.disposition.as_deref().unwrap_or("none")
+        )));
+    }
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_FIX_ATTACHED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::FixAttached(FixAttachedPayload {
+            commit_sha: args.commit.clone(),
+            repository_id: args.repo.clone(),
+            reviewer: identity.reviewer.clone(),
+            review_session_id: identity.session_id.clone(),
+            created_at: now.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+        })),
+    )?;
+    if !appended.replayed {
+        tx.execute(
+            "INSERT INTO remediation_links (
+                link_id, observation_id, link_type, target_id, repository_id, created_at,
+                source_record_sequence, idempotency_key
+            ) VALUES (?1, ?2, 'commit', ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                appended.record_id,
+                &args.observation_id,
+                &args.commit,
+                &args.repo,
+                &now,
+                appended.local_sequence,
+                &args.idempotency_key,
+            ],
+        )?;
+    }
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Attached fix {}@{} to {} (sequence {})",
+        args.repo, args.commit, args.observation_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+/// `snag review attach-verification <observation-id> --receipt <ref> --status <s>`
+/// `accepted` is the only status that yields `verified_fixed`; rejected and
+/// invalid leave remediation open.
+fn attach_verification(args: crate::cli::ReviewAttachVerificationArgs) -> Result<()> {
+    if !VERIFICATION_STATUSES.contains(&args.status.as_str()) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "unknown verification status '{}'; allowed: {}",
+            args.status,
+            VERIFICATION_STATUSES.join(", ")
+        )));
+    }
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let reduced = reduced_in_tx(&tx, &args.observation_id)?;
+    if reduced.disposition.as_deref() != Some(DISP_CONFIRMED) {
+        anyhow::bail!(SnagError::Validation(format!(
+            "verification requires a confirmed disposition (current: {})",
+            reduced.disposition.as_deref().unwrap_or("none")
+        )));
+    }
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_VERIFICATION_ATTACHED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::VerificationAttached(
+            VerificationAttachedPayload {
+                receipt_ref: args.receipt.clone(),
+                status: args.status.clone(),
+                reviewer: identity.reviewer.clone(),
+                review_session_id: identity.session_id.clone(),
+                created_at: now.clone(),
+                idempotency_key: args.idempotency_key.clone(),
+            },
+        )),
+    )?;
+    if !appended.replayed {
+        tx.execute(
+            "INSERT INTO remediation_links (
+                link_id, observation_id, link_type, target_id, status, created_at,
+                source_record_sequence, idempotency_key
+            ) VALUES (?1, ?2, 'verification', ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                appended.record_id,
+                &args.observation_id,
+                &args.receipt,
+                &args.status,
+                &now,
+                appended.local_sequence,
+                &args.idempotency_key,
+            ],
+        )?;
+    }
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Attached verification {} ({}) to {} (sequence {})",
+        args.receipt, args.status, args.observation_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+/// `snag review mark-handled <observation-id> [--rationale …]`
+///
+/// Rules: negative dispositions may be marked handled without a patch;
+/// confirmed observations require a defer, at least one task link, or
+/// verification evidence; an observation with neither a disposition nor any
+/// remediation evidence cannot be marked handled.
+fn mark_handled(args: crate::cli::ReviewMarkHandledArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let reduced = reduced_in_tx(&tx, &args.observation_id)?;
+    match reduced.disposition.as_deref() {
+        Some(DISP_CONFIRMED) => {
+            let has_evidence = !reduced.task_ids.is_empty()
+                || !reduced.verification_receipts.is_empty()
+                || reduced.state == STATE_VERIFIED_FIXED;
+            if !has_evidence {
+                anyhow::bail!(SnagError::Validation(
+                    "confirmed observations require a task link, verification evidence, or a defer disposition before mark-handled".to_string()
+                ));
+            }
+        }
+        Some(_) => {}
+        None => {
+            let has_evidence = !reduced.task_ids.is_empty()
+                || !reduced.verification_receipts.is_empty()
+                || reduced.promoted_finding_id.is_some();
+            if !has_evidence {
+                anyhow::bail!(SnagError::Validation(
+                    "cannot mark handled an observation with no disposition and no remediation evidence".to_string()
+                ));
+            }
+        }
+    }
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_MARKED_HANDLED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::MarkedHandled(MarkedHandledPayload {
+            rationale: args.rationale.clone(),
+            reviewer: identity.reviewer.clone(),
+            review_session_id: identity.session_id.clone(),
+            created_at: now.clone(),
+            idempotency_key: args.idempotency_key.clone(),
+        })),
+    )?;
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Marked {} handled (sequence {})",
+        args.observation_id, appended.local_sequence
+    );
+    Ok(())
+}
+
+/// `snag review reopen-remediation <observation-id> --rationale …` — append-only
+/// reopening of a handled remediation.
+fn reopen_remediation(args: crate::cli::ReviewReopenRemediationArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let mut store = Store::open_read_write()?;
+    let store_id = store.store_id.clone();
+    let now = utc_now();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let reduced = reduced_in_tx(&tx, &args.observation_id)?;
+    if !reduced.handled {
+        anyhow::bail!(SnagError::Validation(format!(
+            "observation {} is not handled; nothing to reopen",
+            args.observation_id
+        )));
+    }
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_REMEDIATION_REOPENED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::RemediationReopened(
+            RemediationReopenedPayload {
+                rationale: args.rationale.clone(),
+                reviewer: identity.reviewer.clone(),
+                review_session_id: identity.session_id.clone(),
+                created_at: now.clone(),
+                idempotency_key: args.idempotency_key.clone(),
+            },
+        )),
+    )?;
+    refresh_review_state(&tx, &args.observation_id)?;
+    tx.commit()?;
+    println!(
+        "Reopened remediation for {} (sequence {})",
+        args.observation_id, appended.local_sequence
     );
     Ok(())
 }
