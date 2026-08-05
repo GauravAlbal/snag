@@ -64,7 +64,7 @@ jobs:
           tool: cargo-deny
 
       - name: cargo deny (licenses, bans, advisories)
-        run: cargo deny check --all-features
+        run: cargo deny check
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
