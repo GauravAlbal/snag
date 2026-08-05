@@ -1,6 +1,6 @@
 name: CI
 
-on:
+"on":
   push:
     branches: [master, feat/*]
   pull_request:
@@ -9,13 +9,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  certify:
-    runs-on: ubuntu-latest
+  gates:
+    name: Gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy --target ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -29,4 +42,37 @@ jobs:
         run: cargo test --all-targets --all-features --no-fail-fast
 
       - name: Release build smoke
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Version output
+        run: ./target/${{ matrix.target }}/release/snag --version
+
+  deps:
+    name: Dependencies (licenses, bans, advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny (licenses, bans, advisories)
+        run: cargo deny check --all-features
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        # Advisory exceptions require a documented justification in the PR
+        # (see CONTRIBUTING.md "Dependency and advisory policy"). Ignore lists
+        # live here, keyed to the RUSTSEC id, never added silently.
+        run: cargo audit
