@@ -14,6 +14,7 @@ pub mod migrations;
 pub mod parser;
 pub mod rebuild;
 pub mod record;
+pub mod remediation;
 pub mod report;
 pub mod restore;
 pub mod schema;

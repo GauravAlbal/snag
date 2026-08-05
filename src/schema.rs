@@ -227,6 +227,14 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
         )?;
     }
 
+    if current_version < 5 {
+        crate::migrations::migrate_v4_to_v5(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (5, datetime('now'))",
+            [],
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }
