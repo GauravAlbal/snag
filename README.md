@@ -5,7 +5,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)
+![Version](https://img.shields.io/badge/version-0.2.0--dev-blue.svg)
 
 </div>
 
@@ -25,15 +25,24 @@ instruction block plus an optional context file, nothing more.
 
 ## Quick install
 
+**Release binaries** (recommended) — download the platform binary for the
+latest release from the [releases page](https://github.com/GauravAlbal/snag/releases),
+verify with `shasum -a 256 -c SHA256SUMS.txt`, or use the one-line installer:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/main/install.sh | bash
 ```
 
-The installer downloads the platform binary from the latest GitHub release,
-verifies its SHA-256 checksum, and puts `snag` on your PATH. Prefer a manual
-install?
+The installer downloads the platform binary from the latest GitHub release
+and verifies its SHA-256 checksum.
+
+**From source** — two contracts, keep them distinct:
 
 ```bash
+# Reproducible released version (v0.1.0)
+cargo install --git https://github.com/GauravAlbal/snag --tag v0.1.0
+
+# Current unreleased main (reports itself as 0.2.0-dev)
 cargo install --git https://github.com/GauravAlbal/snag
 ```
 
@@ -73,6 +82,13 @@ issue. Filing issues is an explicit, downstream, opt-in step; a deliberately
 simple one-observation-per-issue adapter ships as an example
 ([github-issues.py](examples/export-consumer/github-issues.py)), not as the
 canonical pipeline.
+
+> "The bottleneck wasn't tracking work. It was deciding which repeated
+> observations actually deserved to become work."
+>
+> — feedback from live agent use; see the [observation pipeline](docs/PIPELINE.md)
+> for the full model (observation → coalescing → ranking → execution candidate)
+> and the [dogfood case study](docs/CASE_STUDY.md).
 
 Snag is deliberately boring. It does one job — durable local capture — and
 stays out of the way while you work.
