@@ -71,6 +71,14 @@ pub fn observation_semantic_digest(obs: &Observation) -> String {
         .collect();
     artifact_digests.sort();
 
+    // The snag-generated repro_key label is tooling metadata (session
+    // localization), not observation content: it must never perturb the
+    // semantic digest, or idempotent replays would diverge.
+    let mut semantic_labels = obs.labels.clone();
+    if let Some(labels) = semantic_labels.as_mut() {
+        labels.remove("repro_key");
+    }
+
     let payload = SemanticIdempotencyPayload {
         schema_version: obs.schema_version,
         title: obs.title.clone(),
@@ -84,7 +92,7 @@ pub fn observation_semantic_digest(obs: &Observation) -> String {
         impact: obs.impact.clone(),
         confidence: obs.confidence,
         sensitivity: serde_json::to_string(&obs.sensitivity).unwrap_or_default(),
-        labels: obs.labels.clone(),
+        labels: semantic_labels,
         source: obs.source.clone(),
         execution_session_id: exec.0,
         execution_task_id: exec.1,

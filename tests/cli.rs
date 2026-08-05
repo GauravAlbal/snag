@@ -1004,3 +1004,65 @@ fn test_doctor_reports_paths_and_version() {
         .stdout(predicate::str::contains("Context file:"))
         .stdout(predicate::str::contains("(not set)"));
 }
+
+/// repro_key: every report carries a deterministic localization label that
+/// survives idempotent replays (stable across same-key replays, distinct
+/// across distinct content) and is excluded from the semantic digest.
+#[test]
+fn repro_key_is_labeled_deterministic_and_distinct() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |title: &str, ik: Option<&str>| {
+        let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.arg("report")
+            .arg(title)
+            .arg("--kind")
+            .arg("bug")
+            .arg("--severity")
+            .arg("minor");
+        if let Some(k) = ik {
+            c.arg("--idempotency-key").arg(k);
+        }
+        c.output().unwrap()
+    };
+    let out1 = run("repro key test", Some("ik_rk"));
+    assert!(out1.status.success());
+    let text1 = String::from_utf8(out1.stdout).unwrap();
+    let key1 = text1
+        .lines()
+        .find_map(|l| l.strip_prefix("repro key: "))
+        .expect("repro key printed")
+        .to_string();
+    assert_eq!(key1.len(), 24);
+
+    // Idempotent replay: no duplicate, same key.
+    let out2 = run("repro key test", Some("ik_rk"));
+    assert!(
+        String::from_utf8(out2.stdout)
+            .unwrap()
+            .contains("already exists")
+    );
+    let conn = rusqlite::Connection::open(home.path().join("snag/snag.sqlite")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE title = 'repro key test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let stored: String = conn
+        .query_row("SELECT json_extract(labels_json, '$.repro_key') FROM observations WHERE title = 'repro key test'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, key1);
+
+    // Distinct content gets a distinct key.
+    let out3 = run("different repro content", None);
+    let key3 = String::from_utf8(out3.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("repro key: "))
+        .expect("repro key printed")
+        .to_string();
+    assert_ne!(key1, key3);
+}

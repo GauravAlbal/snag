@@ -454,8 +454,13 @@ fn insert_created_observation(
 }
 
 fn emit_response(want_json: bool, obs: &Observation, record_hash: &str) -> Result<()> {
+    let repro_key = obs
+        .labels
+        .as_ref()
+        .and_then(|l| l.get("repro_key"))
+        .cloned();
     if want_json {
-        let result = json!({
+        let mut result = json!({
             "schema_version": 1,
             "observation_id": obs.observation_id,
             "store_id": obs.store_id,
@@ -470,6 +475,9 @@ fn emit_response(want_json: bool, obs: &Observation, record_hash: &str) -> Resul
             "artifacts": obs.artifacts.len(),
             "warnings": []
         });
+        if let Some(k) = &repro_key {
+            result["repro_key"] = serde_json::json!(k);
+        }
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!(
@@ -478,6 +486,12 @@ fn emit_response(want_json: bool, obs: &Observation, record_hash: &str) -> Resul
         );
         println!("artifacts: {}", obs.artifacts.len());
         println!("sync: local");
+        if let Some(k) = &repro_key {
+            println!("repro key: {}", k);
+            println!(
+                "  record this key in the session notes so a session-search tool can localize this observation's filing session"
+            );
+        }
     }
     Ok(())
 }
@@ -529,7 +543,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
-    let obs = Observation {
+    let mut obs = Observation {
         schema_version: 1,
         observation_id: obs_id.clone(),
         store_id: store.store_id.clone(),
@@ -554,6 +568,25 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         affected_repository_ids: inputs.affected_repos,
     };
 
+    // repro_key: a deterministic, store-scoped hash key that localizes this
+    // observation's filing session. Derived from the semantic digest (stable
+    // across idempotent replays), attached as a snag-owned label so it flows
+    // into the canonical payload, and printed at filing so the reporter can
+    // echo it into the session — that line is what a session-search tool
+    // indexes verbatim. The digest function strips repro_key so tooling
+    // metadata never perturbs idempotency semantics.
+    let semantic_digest = crate::idempotency::observation_semantic_digest(&obs);
+    let repro_key = {
+        let mut h = blake3::Hasher::new();
+        h.update(store.store_id.as_bytes());
+        h.update(b"|");
+        h.update(semantic_digest.as_bytes());
+        h.finalize().to_hex()[..24].to_string()
+    };
+    let mut labels = obs.labels.clone().unwrap_or_default();
+    labels.insert("repro_key".to_string(), repro_key);
+    obs.labels = Some(labels);
+
     use crate::record::{CanonicalRecordV1, RecordPayload};
     let canonical_record = CanonicalRecordV1 {
         local_sequence: local_sequence as u64,
@@ -564,7 +597,6 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         payload: RecordPayload::Observation(obs.clone()),
     };
     let canonical_payload = serde_json::to_string(&canonical_record.payload)?;
-    let semantic_digest = crate::idempotency::observation_semantic_digest(&obs);
 
     if matches!(
         try_idempotency_replay(
