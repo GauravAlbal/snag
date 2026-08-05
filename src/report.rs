@@ -411,69 +411,140 @@ fn list_json(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
         let local_sequence: i64 = row.get(1)?;
         let captured_at: String = row.get(2)?;
         let title: String = row.get(3)?;
+        let retracted: bool = row.get(4)?;
         obs.push(json!({
             "observation_id": observation_id,
             "local_sequence": local_sequence,
             "captured_at": captured_at,
-            "title": title
+            "title": title,
+            "retracted": retracted,
         }));
     }
-    println!("{}", serde_json::to_string_pretty(&obs)?);
+    // G36: JSON uses a versioned envelope, not a raw array.
+    let envelope = json!({
+        "schema_version": 1,
+        "count": obs.len(),
+        "observations": obs,
+    });
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
     Ok(())
 }
 
 fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
-    println!("{:<20} | {:<8} | {:<25} | {}", "ID", "Seq", "Date", "Title");
-    println!("{:-<20}-+-{:-<8}-+-{:-<25}-+-{:-<30}", "", "", "", "");
+    println!("{:<20} | {:<6} | {:<24} | {:<26} | {}", "ID", "Seq", "Date", "Title", "Retracted");
+    println!("{:-<20}-+-{:-<6}-+-{:-<24}-+-{:-<26}-+-{:-<10}", "", "", "", "", "");
     while let Some(row) = rows.next()? {
         let observation_id: String = row.get(0)?;
         let local_sequence: i64 = row.get(1)?;
         let captured_at: String = row.get(2)?;
         let title: String = row.get(3)?;
-        println!("{:<20} | {:<8} | {:<25} | {}", observation_id, local_sequence, captured_at, title);
+        let retracted: bool = row.get(4)?;
+        let mark = if retracted { "RETRACTED" } else { "" };
+        println!("{:<20} | {:<6} | {:<24} | {:<26} | {}", observation_id, local_sequence, captured_at, title, mark);
     }
     Ok(())
 }
 
+/// Parse a relative duration like `7d`, `12h`, `30m`, `45s` into seconds, with
+/// a typed error for anything malformed (G36).
+fn parse_since(s: &str) -> anyhow::Result<i64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num.parse().map_err(|_| {
+        crate::error::SnagError::Validation(format!("invalid --since duration: {}", s))
+    })?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        _ => {
+            return Err(crate::error::SnagError::Validation(format!(
+                "invalid --since duration unit: {}", s
+            )).into())
+        }
+    };
+    Ok(secs)
+}
+
 pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
+    if let Some(fmt) = &args.format {
+        if fmt != "json" && fmt != "table" {
+            return Err(crate::error::SnagError::Validation(format!(
+                "invalid --format: {}", fmt
+            )).into());
+        }
+    }
+
     let store = Store::open_read_only()?;
-    
+
     let mut query = String::from(
-        "SELECT r.record_id, r.local_sequence, r.captured_at, o.title 
+        "SELECT r.record_id, r.local_sequence, r.captured_at, o.title,
+                EXISTS (SELECT 1 FROM records rr WHERE rr.entity_id = o.observation_id AND rr.record_type = 'observation_retracted') AS retracted
          FROM records r 
          JOIN observations o ON r.record_id = o.observation_id 
          WHERE r.record_type = 'observation_created'"
     );
-    
+
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    
+
     if let Some(sk) = &args.source {
         query.push_str(" AND o.source_kind = ?");
         params.push(Box::new(sk.clone()));
     }
-    
+
     if let Some(k) = &args.kind {
         query.push_str(" AND o.kind_assertion = ?");
         params.push(Box::new(k.clone()));
     }
-    
-    if let Some(repo) = &args.repo {
-        query.push_str(" AND EXISTS (SELECT 1 FROM observation_repositories u JOIN repository_aliases a ON u.repository_id = a.repository_id WHERE u.observation_id = o.observation_id AND a.alias = ?)");
-        params.push(Box::new(repo.clone()));
+
+    if let Some(since) = &args.since {
+        let secs = parse_since(since)?;
+        let cutoff = (time::OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        query.push_str(" AND r.captured_at >= ?");
+        params.push(Box::new(cutoff));
     }
-    
+
+    if let Some(repo) = &args.repo {
+        // `current` resolves through the actual current context (G36).
+        if repo == "current" {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let git_ctx = crate::git::collect_git_context(&cwd).unwrap_or_default();
+            let repo_id: Option<String> = if let Some(dir) = &git_ctx.git_common_dir {
+                store.conn.query_row(
+                    "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
+                    rusqlite::params![dir], |r| r.get(0)).ok()
+            } else {
+                None
+            };
+            match repo_id {
+                Some(rid) => {
+                    query.push_str(" AND EXISTS (SELECT 1 FROM observation_repositories u WHERE u.observation_id = o.observation_id AND u.repository_id = ?)");
+                    params.push(Box::new(rid));
+                }
+                None => query.push_str(" AND 0"),
+            }
+        } else {
+            // A repository ID or an unambiguous alias both work.
+            query.push_str(" AND EXISTS (SELECT 1 FROM observation_repositories u WHERE u.observation_id = o.observation_id AND (u.repository_id = ? OR u.repository_id IN (SELECT repository_id FROM repository_aliases WHERE alias = ?)))");
+            params.push(Box::new(repo.clone()));
+            params.push(Box::new(repo.clone()));
+        }
+    }
+
     query.push_str(" ORDER BY r.local_sequence DESC");
-    
+
     if let Some(limit) = args.limit {
         query.push_str(" LIMIT ?");
         params.push(Box::new(limit as i64));
     }
-    
+
     let mut stmt = store.conn.prepare(&query)?;
-    // Convert Vec<Box<dyn ToSql>> to a slice of references
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut rows = stmt.query(param_refs.as_slice())?;
-    
+
     if args.format.as_deref() == Some("json") {
         list_json(&mut rows)?;
     } else {

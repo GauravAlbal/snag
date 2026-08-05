@@ -472,3 +472,67 @@ fn test_idempotency_conflict_typed() {
     ctx.cmd().arg("report").arg("different payload").arg("--idempotency-key").arg("k2").assert().failure()
         .stderr(predicate::str::contains("different semantic payload"));
 }
+
+/// G36: list --since, --format json (versioned envelope), --limit, retracted
+/// state, and invalid --format failure.
+#[test]
+fn test_list_since_json_retracted() {
+    let ctx = TestContext::new();
+    ctx.cmd().arg("report").arg("recent thing").assert().success();
+
+    let recent: String = ctx.cmd().arg("list").arg("--format").arg("json").output().unwrap().stdout.into_iter().map(|b| b as char).collect();
+    let v: serde_json::Value = serde_json::from_str(&recent).unwrap();
+    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["observations"][0]["title"], "recent thing");
+    assert_eq!(v["observations"][0]["retracted"], false);
+
+    // --since 7d includes it; --since 0s excludes it.
+    ctx.cmd().arg("list").arg("--since").arg("7d").assert().success().stdout(predicate::str::contains("recent thing"));
+    ctx.cmd().arg("list").arg("--since").arg("0s").assert().success().stdout(predicate::str::contains("recent thing").not());
+
+    // Invalid duration -> typed failure.
+    ctx.cmd().arg("list").arg("--since").arg("bogus").assert().failure().stderr(predicate::str::contains("invalid --since"));
+
+    // Invalid format -> typed failure.
+    ctx.cmd().arg("list").arg("--format").arg("xml").assert().failure().stderr(predicate::str::contains("invalid --format"));
+
+    // Retracted state is surfaced.
+    let id: String = {
+        let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+        conn.query_row("SELECT observation_id FROM observations LIMIT 1", [], |r| r.get(0)).unwrap()
+    };
+    ctx.cmd().arg("retract").arg(&id).assert().success();
+    ctx.cmd().arg("list").arg("--format").arg("json").assert().success().stdout(predicate::str::contains("\"retracted\": true"));
+}
+
+/// G37: read-only commands (list/show/context/export/verify/doctor) must not
+/// mutate sequence, migrations, store metadata, backup checkpoints, or the DB.
+#[test]
+fn test_read_purity() {
+    let ctx = TestContext::new();
+    ctx.cmd().arg("report").arg("purity").assert().success();
+
+    let db_path = ctx.data_dir.join("snag.sqlite");
+    let before = std::fs::read(&db_path).unwrap();
+    let seq_before: i64 = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row("SELECT COALESCE(MAX(local_sequence),0) FROM records", [], |r| r.get(0)).unwrap()
+    };
+
+    ctx.cmd().arg("list").assert().success();
+    ctx.cmd().arg("show").arg("x").assert().failure(); // not found, but must not mutate
+    let _ = ctx.cmd().arg("context").arg("--format").arg("json").assert().success();
+    let out_path = ctx.home_dir.path().join("purity-export.jsonl");
+    ctx.cmd().arg("export").arg("--output").arg(&out_path).assert().success();
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+    ctx.cmd().arg("doctor").assert().success();
+
+    let after = std::fs::read(&db_path).unwrap();
+    let seq_after: i64 = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row("SELECT COALESCE(MAX(local_sequence),0) FROM records", [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(seq_before, seq_after, "read commands must not advance the sequence");
+    assert_eq!(before, after, "read commands must not mutate the database file");
+}
