@@ -10,6 +10,17 @@ use serde_json::json;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
+/// Crash-injection failpoint (T6): when the `SNAG_FAILPOINT` env var equals
+/// `stage`, terminate the process abruptly, simulating a crash at that precise
+/// point. The enclosing SQLite transaction guarantees the observable outcome is
+/// either no observation or the one complete, committed observation.
+pub fn failpoint(stage: &str) {
+    if std::env::var("SNAG_FAILPOINT").as_deref() == Ok(stage) {
+        eprintln!("snag: failpoint abort at {}", stage);
+        std::process::abort();
+    }
+}
+
 pub fn handle(args: ReportArgs) -> Result<()> {
     // 1. Parse input
     let mut title = args.title.clone();
@@ -259,6 +270,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     affected_repos = all_repo_ids;
 
     // 4. Begin Transaction and allocate
+    failpoint("before_tx");
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -278,6 +290,8 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         .unwrap_or_else(|_| {
             "0000000000000000000000000000000000000000000000000000000000000000".to_string()
         });
+
+    failpoint("after_seq");
 
     let obs_id = generate_id("obs");
     let now = time::OffsetDateTime::now_utc()
@@ -393,6 +407,8 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         ],
     )?;
 
+    failpoint("after_record_insert");
+
     tx.execute(
         "INSERT INTO observations (
             observation_id, store_id, local_sequence, schema_version, captured_at, source_kind,
@@ -430,6 +446,8 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         ],
     )?;
 
+    failpoint("after_obs_insert");
+
     // Insert artifacts
     for art in &obs.artifacts {
         tx.execute(
@@ -463,7 +481,13 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         )?;
     }
 
+    failpoint("after_artifacts");
+
     tx.commit()?;
+
+    // Crash after the transaction is committed but before the response is
+    // written: the observation must be durably present.
+    failpoint("after_commit");
 
     if args.json {
         let result = json!({
