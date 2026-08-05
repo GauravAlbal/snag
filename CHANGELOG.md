@@ -5,23 +5,20 @@ All notable changes to snag are documented here. Format follows
 [SemVer](https://semver.org/). See [docs/RELEASING.md](docs/RELEASING.md) for
 the release process.
 
-> **Version state on `main`:** development for v0.2.0; `snag --version` reports
-> `0.2.0-dev` on unreleased builds. The named release `v0.1.0` (MIT) is the
-> last released version; v0.2.0 and later are Apache-2.0.
+> **Version state on `main`:** v0.1.1 (Apache-2.0) is the current release. The
+> prior MIT release `v0.1.0` is retired (its release and tag are removed);
+> v0.1.1 re-licenses the same core under Apache-2.0 and all later versions
+> stay Apache-2.0.
 
-## [Unreleased]
-
-### Added
-- **License transition**: v0.2.0 and later are Apache-2.0 (v0.1.0 and earlier
-  remain MIT; the change is documented here per the release policy).
-- **Trademark policy**: `TRADEMARKS.md` governs use of the Snag name and logo.
-- **DCO**: contributions require signed-off commits (`git commit -s`) under
-  the Developer Certificate of Origin 1.1; no CLA.
+## [0.1.1] - 2026-08-05
 
 ### Changed
-- License: MIT → Apache-2.0 (explicit contributor patent grant, notice
-  preservation, trademark exclusion).
-- **Public release hardening**: standalone README, public CLAUDE.md/AGENTS.md,
+- **Apache-2.0 re-release**: v0.1.1 is licensed Apache-2.0 (explicit
+  contributor patent grant, notice preservation, trademark exclusion) and
+  supersedes the MIT `v0.1.0` release, which is retired (release + tag
+  removed). The LICENSE and `Cargo.toml` carry Apache-2.0 from this version
+  onward; all later versions stay Apache-2.0.
+- **Public release hardening**: standalone README, public AGENTS.md,
   trust-and-safety docs (SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, SUPPORT),
   stability guarantees, narrow roadmap, anonymized dogfood case study.
 - **Context protocol as a public API**: `SNAG_CONTEXT_FILE` documents are now
@@ -37,6 +34,17 @@ the release process.
   from GitHub Releases and verifies its SHA-256 checksum.
 - **CI matrix** over macOS arm64 and Linux x86_64/aarch64, plus
   `cargo deny` and `cargo audit` dependency gates.
+- **Observation pipeline positioning**: `docs/PIPELINE.md` and a README
+  pull-quote place Snag as the stage before the task tracker.
+
+### Added
+- **Trademark policy**: `TRADEMARKS.md` governs use of the Snag name and logo.
+- **DCO**: contributions require signed-off commits (`git commit -s`) under
+  the Developer Certificate of Origin 1.1; no CLA.
+- **Release hygiene**: distinct install contracts in the README (released
+  `--tag v0.1.1` vs current main).
+
+## [Unreleased]
 - **Release workflow**: four-platform binaries, SHA-256 checksums, source-SHA
   provenance, version output, best-effort CycloneDX SBOM.
 - **Issue templates** for bugs, installation, agent integration, context
@@ -85,5 +93,5 @@ Certified v0.1.0 — 59-test surface, three hard gates, tag `v0.1.0`.
 - **Testing**: 59 tests across cli, git_identity, migration, concurrency,
   robustness suites; GitHub Actions CI.
 
-[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/GauravAlbal/snag/releases/tag/v0.1.0
+[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/GauravAlbal/snag/releases/tag/v0.1.1
