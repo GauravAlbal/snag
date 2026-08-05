@@ -2,7 +2,7 @@
 name = "snag"
 version = "0.1.0"
 edition = "2024"
-description = "Durable observation capture for agent fleets: atomic bug/friction reports with repo, worktree, pearl, and tool context."
+description = "Durable observation outbox for coding agents: capture out-of-scope bugs and friction with evidence, then keep going."
 license = "MIT"
 repository = "https://github.com/13banditos/snag"
 readme = "README.md"
@@ -21,12 +21,22 @@ serde_json = "1.0.151"
 tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
-time = { version = "0.3.55", features = ["formatting", "macros"] }
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 ulid = "3.0.0"
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+# Lean release binaries for distribution (mirrors the launch profile used by
+# popular Rust CLIs: size-optimized, LTO, single codegen unit, stripped).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

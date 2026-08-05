@@ -1,48 +1,58 @@
-<!-- moat:onboarded -->
-## Moat ship loop (BINDING)
+# Snag
 
-This repo ships through the **moat acceptance loop** — no change is done without
-a mechanically-produced receipt. The full loop, before you touch code:
+Snag is a durable observation outbox for coding agents: when you encounter an
+out-of-scope bug, regression, misleading interface, recurring workaround, or
+tooling failure, record it with `snag` while the evidence is fresh, then
+continue the assigned task. See [README.md](README.md) and
+[AGENTS.md](AGENTS.md).
 
-```
-0a. FUZZY ask (a vibe, "make X better", unstated shape)? GRILL it into a
-    spec first — eagerly. Do the brownfield homework, then interrogate the
-    forks until the ask is one specific job. Cheapest point to get it right.
-0b. PLAN-shaped (intent / PRD / multi-step)? GROUND it: run the blind-spot
-    pass (moat dialectic_run / tribunal) before contracting; engage a must_ask.
-1.  moat contract --repo . --title "..." --ac "<criterion>" --touch <path>
-2.  build the change (worktree recommended)
-3.  validate, then commit normally; the pre-commit hook checks packet coverage
-4.  MODE FIRST: is this pearl under an active Conductor epic?
-    IF CONDUCTED:
-      moat ready <pearl> --worktree <path> --epic <epic>
-      STOP. The ready SHA is frozen. Do NOT commit, rebase, submit, close, push,
-      move the branch, write main, or run conduct after ready. The operator/
-      Conductor runs moat conduct <epic>.
-    ELSE STANDALONE:
-      moat submit --packet <p> --workspace .
-      ACCEPTED -> close work, push (pre-push checks HEAD coverage)
-      REJECTED -> fix the NAMED violation, never weaken a gate
-      INSTRUMENT INVALID -> stop, report; trust nothing from the run
-      ABSTAINED -> honorable; routes to the operator queue
+## Build and test
+
+Requires Rust stable (edition 2024). SQLite is bundled — no system dependency.
+
+```sh
+cargo build --release        # binary: target/release/snag
 ```
 
-Gates are mechanical walls: tests pass in a clean sandbox, created tests must
-fail at baseline, test-value floor, and — if this repo is thermo-calibrated —
-the **thermo floor** rejects a change that makes a function MORE complex past the
-repo threshold (simplify it, don't override). The thermo ceiling (LLM structural
-review) is advisory.
+The three gates below are the contract. CI runs exactly these; they must pass
+before any change is merged.
 
-Full playbook: `moat skill --print`. Per-session refresher: `moat prime`.
-<!-- /moat:onboarded -->
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features --no-fail-fast
+```
 
+## Contribution rules
 
-## Snag reporting
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
+- Keep changes scoped to the named ask. No bundled refactors, no drive-by
+  edits. If a change touches behavior, it ships with a test that fails on the
+  old behavior.
+- Security vulnerabilities: report privately per [SECURITY.md](SECURITY.md),
+  never in a public issue.
+- Reporting bugs: use the issue templates (include `snag --version`,
+  OS/architecture, install method, and redacted `snag doctor` output).
 
-Use `snag` to capture material out-of-scope bugs, friction, or papercuts.
-Report when unexpected, costly, and plausibly systematic. Do not report ordinary
-failures or mistakes. Before completing a task, review for snags.
+## Snag reporting (capture-and-move-on)
 
-`snag report "<title>" --kind <kind> --severity <minor|major|blocker> --observed "<what>"`
+When you encounter a material bug, regression, misleading interface, recurring
+workaround, or tooling failure outside the current task, record it with `snag`
+while the evidence is fresh, then continue the assigned task.
 
-Context is automatic. Full rubric: global `~/.claude/CLAUDE.md`.
+Do not broaden the current task to fix the snag unless explicitly asked.
+Do not report ordinary implementation errors or your own transient mistakes.
+
+```sh
+snag report "<specific symptom>" \
+  --kind <bug|papercut|friction|usability> \
+  --severity <minor|major|blocker> \
+  --observed "<what happened>" \
+  --expected "<what should have happened>" \
+  --repro "<minimal reproduction, when known>" \
+  --workaround "<workaround used, when any>"
+```
+
+Before completing a task, review whether any qualifying snag occurred and
+report the observation ids. Run `snag doctor` to see where data lives and
+`snag verify --full` to confirm store health.

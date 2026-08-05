@@ -9,6 +9,53 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    // Fast-path structured flags (mirror ReportArgs so `snag "<title>"
+    // --kind bug --severity minor` works without the `report` subcommand).
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    #[arg(long)]
+    pub severity: Option<String>,
+
+    #[arg(long)]
+    pub expected: Option<String>,
+
+    #[arg(long)]
+    pub observed: Option<String>,
+
+    #[arg(long)]
+    pub workaround: Option<String>,
+
+    #[arg(long)]
+    pub repro: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long)]
+    pub stdin: bool,
+
+    #[arg(long = "artifact")]
+    pub artifacts: Vec<PathBuf>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+
+    #[arg(long)]
+    pub repo_id: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub pearl_id: Option<String>,
+
+    #[arg(long)]
+    pub attempt_id: Option<String>,
+
+    #[arg(long = "affected-repo")]
+    pub affected_repos: Vec<String>,
 }
 
 impl Cli {
@@ -18,7 +65,8 @@ impl Cli {
             Some(Command::List(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Context(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Export(args)) => args.format.as_deref() == Some("json"),
-            _ => false,
+            Some(_) => false,
+            None => self.json,
         }
     }
 }
@@ -34,7 +82,7 @@ pub enum Command {
     Show(ShowArgs),
     /// Shows what Snag would attach to a report from the current process
     Context(ContextArgs),
-    /// Produces deterministic Panopticon-ready records
+    /// Produces a deterministic JSONL export stream
     Export(ExportArgs),
     /// Creates and verifies a point-in-time database backup and its manifest
     Backup(BackupArgs),

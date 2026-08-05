@@ -4,5 +4,8 @@
 /.pearls/
 /runs/
 
+# internal acceptance configuration (kept local)
+.moat.json
+
 # session working artifact
 .cert-reqs-digest.md

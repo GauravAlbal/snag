@@ -8,19 +8,41 @@ the release process.
 ## [Unreleased]
 
 ### Added
-- Project identity: Cargo.toml metadata (description, license, repository),
-  `LICENSE` (MIT), root `README.md`.
-- Operational documentation: `docs/RUNBOOK.md`, `docs/RELEASING.md`,
-  `CHANGELOG.md` (this file).
-- Release automation: tag-triggered `.github/workflows/release.yml` building
-  release artifacts; CI now runs a release-profile build smoke.
-- Rewrote `AUDIT.md` to post-certification state (was the pre-certification
-  gap list).
+- **Public release hardening**: standalone README, public CLAUDE.md/AGENTS.md,
+  trust-and-safety docs (SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, SUPPORT),
+  stability guarantees, narrow roadmap, anonymized dogfood case study.
+- **Context protocol as a public API**: `SNAG_CONTEXT_FILE` documents are now
+  versioned (`schema_version: 1` enforced, future versions rejected with a
+  typed error); `snag context --format json` emits a versioned envelope;
+  published JSON Schemas in `schemas/` with a compatibility test suite
+  (`tests/schema_compat.rs`) that validates the binary's real output.
+- **Generic agent integrations** under `examples/agents/` (Claude Code, Codex,
+  Gemini CLI, OpenCode, generic shell agents) with no private tooling.
+- **Downstream consumer example** under `examples/export-consumer/`
+  (stdlib-only Python: header validation, sequence contiguity, checkpointing).
+- **One-line installer** (`install.sh`): downloads the platform release binary
+  from GitHub Releases and verifies its SHA-256 checksum.
+- **CI matrix** over macOS arm64/x86_64 and Linux x86_64/aarch64, plus
+  `cargo deny` and `cargo audit` dependency gates.
+- **Release workflow**: four-platform binaries, SHA-256 checksums, source-SHA
+  provenance, version output, best-effort CycloneDX SBOM.
+- **Issue templates** for bugs, installation, agent integration, context
+  adapters, export/schema compatibility, and features.
+
+### Fixed
+- `snag report "<title>" --json` now treats a bare title as the observation
+  title with JSON output (previously it misread the title as a JSON intake
+  file path and failed). File intake (`--json <file>`) and stdin intake are
+  unchanged.
+- Structured flags now work on the bare fast path:
+  `snag "<title>" --kind bug --severity minor`.
+- `snag doctor` now prints the exact store paths (database, objects, backups),
+  the effective context source, and the Snag version, even when no store
+  exists yet.
 
 ## [0.1.0] - 2026-08-04
 
-Certified v0.1.0 — accepted through the moat acceptance loop and merged via
-PR #1 (merge `b8dda31`). 59/59 tests, moat ACCEPTED, tag `v0.1.0`.
+Certified v0.1.0 — 59-test surface, three hard gates, tag `v0.1.0`.
 
 ### Added
 - **Canonical record kernel**: hash-chained, globally-sequenced records
@@ -31,8 +53,8 @@ PR #1 (merge `b8dda31`). 59/59 tests, moat ACCEPTED, tag `v0.1.0`.
   `retract`.
 - **Context**: git repo/checkout/worktree identity (real git common dir,
   linked worktrees), `SNAG_CONTEXT_FILE` overlay with explicit
-  CLI > context-file > env > git precedence, `VX_*`/`ARQ_*`/`SNAG_*` env
-  variables, affected-repo resolution with typed failures.
+  CLI > context-file > env > git precedence, affected-repo resolution with
+  typed failures.
 - **Idempotency**: stable semantic digest; same key + same digest replays,
   same key + different digest conflicts.
 - **Recovery chain**: `backup` (self-contained bundle + manifest), `restore`
@@ -44,9 +66,9 @@ PR #1 (merge `b8dda31`). 59/59 tests, moat ACCEPTED, tag `v0.1.0`.
   forensic copy on failure.
 - **Read purity**: distinct reader/writer/maintenance connection modes;
   list/show/context/export/verify/doctor proven non-mutating.
-- **Robustness**: crash injection (T6), 32-writer concurrency (T5), git
-  process-kill with bounded budget, artifact constraints (symlink rejection,
-  per-file and total limits), 30s `busy_timeout`.
+- **Robustness**: crash injection, 32-writer concurrency, git process-kill
+  with bounded budget, artifact constraints (symlink rejection, per-file and
+  total limits), 30s `busy_timeout`.
 - **Testing**: 59 tests across cli, git_identity, migration, concurrency,
   robustness suites; GitHub Actions CI.
 
