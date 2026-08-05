@@ -151,16 +151,56 @@ fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn handle(_args: BackupArgs) -> Result<()> {
-    let store = Store::open_read_only()?;
-    let backups_dir = store.data_dir.join("backups");
-    fs::create_dir_all(&backups_dir)?;
+/// Aggregated statistics read from the staged backup copy, used to build the
+/// manifest and the backup_checkpoints row.
+struct ManifestStats {
+    through_sequence: i64,
+    head_record_hash: String,
+    observation_count: i64,
+    action_count: i64,
+    record_count: i64,
+    artifact_count: i64,
+    integrity_check: String,
+    foreign_key_check: i64,
+    store_id: String,
+}
 
-    // Stage the bundle in a temp dir so publication can be an atomic rename.
-    let staging = tempfile::tempdir_in(&backups_dir).context("failed to create staging dir")?;
-    let stage_root = staging.path();
+fn read_manifest_stats(conn: &Connection) -> Result<ManifestStats> {
+    let head_record_hash: String = conn
+        .query_row(
+            "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| {
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        });
+    Ok(ManifestStats {
+        through_sequence: conn.query_row(
+            "SELECT COALESCE(MAX(local_sequence), 0) FROM records",
+            [],
+            |r| r.get(0),
+        )?,
+        head_record_hash,
+        observation_count: conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))?,
+        action_count: conn
+            .query_row("SELECT COUNT(*) FROM observation_actions", [], |r| r.get(0))?,
+        record_count: conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?,
+        artifact_count: conn.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?,
+        integrity_check: conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?,
+        foreign_key_check: conn.query_row(
+            "SELECT count(*) FROM pragma_foreign_key_check",
+            [],
+            |r| r.get(0),
+        )?,
+        store_id: conn.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |r| {
+            r.get(0)
+        })?,
+    })
+}
 
-    // 1. Quiesced online backup of the live DB into the staging area.
+/// Quiesced online copy of the live DB into the staging area.
+fn stage_online_copy(store: &Store, stage_root: &Path) -> Result<PathBuf> {
     let staged_db = stage_root.join("snag.sqlite");
     {
         let mut dest = Connection::open(&staged_db)?;
@@ -171,56 +211,34 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         dest.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA wal_checkpoint(TRUNCATE);")?;
     }
     failpoint("backup_after_db_copy");
+    Ok(staged_db)
+}
 
-    // 2. Copy artifact objects so the bundle is self-contained.
-    let src_objects = store.data_dir.join("objects");
-    let dst_objects = stage_root.join("objects");
+/// Copy artifact objects so the bundle is self-contained (idempotent).
+fn copy_objects_if_present(src: &Path, dst: &Path) -> Result<()> {
     failpoint("backup_during_object_copy");
-    if src_objects.exists() {
-        copy_objects(&src_objects, &dst_objects)?;
+    if src.exists() {
+        copy_objects(src, dst)?;
     }
+    Ok(())
+}
 
-    // 3. Full verification of the staged copy BEFORE publication.
+/// Full verification of the staged copy BEFORE publication.
+fn verify_staged(stage_root: &Path) -> Result<()> {
     let mut staged_store = Store::open_read_only_at(stage_root)?;
     verify::full_verify(&mut staged_store).context("backup copy failed full verification")?;
     failpoint("backup_after_verification");
+    Ok(())
+}
 
-    let conn = Connection::open(&staged_db)?;
-    let through_sequence: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(local_sequence), 0) FROM records",
-        [],
-        |r| r.get(0),
-    )?;
-    let head_record_hash: String = conn
-        .query_row(
-            "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|_| {
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
-        });
-    let observation_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))?;
-    let action_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM observation_actions", [], |r| r.get(0))?;
-    let record_count: i64 = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))?;
-    let artifact_count: i64 = conn.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
-    let integrity_check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    let foreign_key_check: i64 =
-        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
-            r.get(0)
-        })?;
-    let store_id: String =
-        conn.query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |r| {
-            r.get(0)
-        })?;
-
-    // 4. Objects manifest (verifies every artifact path/length/digest).
-    let (obj_errors, object_manifest_entries) = build_objects_manifest(&conn, stage_root)?;
+/// Write objects-manifest.json (verifies every artifact path/length/digest) and
+/// return its path plus digest.
+fn write_objects_manifest(conn: &Connection, stage_root: &Path) -> Result<(PathBuf, String)> {
+    let (obj_errors, object_manifest_entries) = build_objects_manifest(conn, stage_root)?;
     if !obj_errors.is_empty() {
         anyhow::bail!("artifact verification failed: {}", obj_errors.join("; "));
     }
+    let artifact_count: i64 = conn.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
     let objects_manifest_path = stage_root.join("objects-manifest.json");
     fs::write(
         &objects_manifest_path,
@@ -231,47 +249,68 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         }))?,
     )?;
     let artifact_manifest_digest = file_digest(&objects_manifest_path)?;
+    Ok((objects_manifest_path, artifact_manifest_digest))
+}
 
-    // 5. Database digest after verification (represents the published bytes).
-    let database_digest = file_digest(&staged_db)?;
-
-    // 6. Manifest with real, populated values (no placeholders).
+/// Write manifest.json with real, populated values; return path and timestamp.
+fn write_manifest(
+    stage_root: &Path,
+    stats: &ManifestStats,
+    database_digest: &str,
+    artifact_manifest_digest: &str,
+) -> Result<(PathBuf, String)> {
     let created_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
     let manifest = json!({
         "schema_version": MANIFEST_SCHEMA_VERSION,
-        "store_id": store_id,
+        "store_id": stats.store_id,
         "created_at": created_at,
-        "through_sequence": through_sequence,
-        "head_record_hash": head_record_hash,
+        "through_sequence": stats.through_sequence,
+        "head_record_hash": stats.head_record_hash,
         "database_digest": database_digest,
-        "integrity_check": integrity_check,
-        "foreign_key_check": foreign_key_check,
+        "integrity_check": stats.integrity_check,
+        "foreign_key_check": stats.foreign_key_check,
         "record_chain_check": true,
-        "observation_count": observation_count,
-        "action_count": action_count,
-        "record_count": record_count,
-        "artifact_count": artifact_count,
+        "observation_count": stats.observation_count,
+        "action_count": stats.action_count,
+        "record_count": stats.record_count,
+        "artifact_count": stats.artifact_count,
         "artifact_manifest_digest": artifact_manifest_digest,
         "self_contained": true,
     });
     let manifest_path = stage_root.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
     failpoint("backup_after_manifest_write");
+    Ok((manifest_path, created_at))
+}
 
-    // Durability: sync staged DB + manifests + objects before publishing.
-    sync_tree(stage_root)?;
+/// Files that make up the published bundle.
+struct StagedBundle {
+    staged_db: PathBuf,
+    manifest_path: PathBuf,
+    objects_manifest_path: PathBuf,
+    dst_objects: PathBuf,
+}
 
-    // 7. Publish atomically: temp name -> fsync -> rename.
+/// Publish atomically: temp archive -> fsync -> rename. Returns final path.
+fn durable_publish(
+    backups_dir: &Path,
+    bundle: &StagedBundle,
+    head_record_hash: &str,
+    created_at: &str,
+) -> Result<PathBuf> {
     let short_hash = head_record_hash
         .strip_prefix("blake3:")
-        .unwrap_or(&head_record_hash)
+        .unwrap_or(head_record_hash)
         .chars()
         .take(8)
         .collect::<String>();
-    let ts = created_at.replace(':', "");
-    let archive_name = format!("snag-backup-{}-{}.tar.gz", ts, short_hash);
+    let archive_name = format!(
+        "snag-backup-{}-{}.tar.gz",
+        created_at.replace(':', ""),
+        short_hash
+    );
     let final_archive = backups_dir.join(&archive_name);
     let tmp_archive = backups_dir.join(format!("{}.tmp.{}", archive_name, ulid::Ulid::generate()));
     failpoint("backup_before_publish");
@@ -280,11 +319,11 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         let tar_gz = File::create(&tmp_archive)?;
         let enc = GzEncoder::new(tar_gz, Compression::default());
         let mut builder = tar::Builder::new(enc);
-        builder.append_path_with_name(&staged_db, "snag.sqlite")?;
-        builder.append_path_with_name(&manifest_path, "manifest.json")?;
-        builder.append_path_with_name(&objects_manifest_path, "objects-manifest.json")?;
-        if dst_objects.exists() {
-            append_dir(&mut builder, &dst_objects, "objects")?;
+        builder.append_path_with_name(&bundle.staged_db, "snag.sqlite")?;
+        builder.append_path_with_name(&bundle.manifest_path, "manifest.json")?;
+        builder.append_path_with_name(&bundle.objects_manifest_path, "objects-manifest.json")?;
+        if bundle.dst_objects.exists() {
+            append_dir(&mut builder, &bundle.dst_objects, "objects")?;
         }
         let enc = builder.into_inner()?;
         let raw = enc.finish()?;
@@ -292,28 +331,82 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     }
     File::open(&tmp_archive)?.sync_all()?;
     fs::rename(&tmp_archive, &final_archive)?;
-    sync_dir(&backups_dir)?;
+    sync_dir(backups_dir)?;
     failpoint("backup_after_publish");
+    Ok(final_archive)
+}
 
-    // 8. Record the backup checkpoint ONLY after publication succeeded.
-    {
-        let mut rw = Store::open_read_write()?;
-        let tx = rw.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO backup_checkpoints (backup_id, store_id, created_at, through_sequence, head_record_hash, database_digest, manifest_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                ulid::Ulid::generate().to_string(),
-                store_id,
-                created_at,
-                through_sequence,
-                head_record_hash,
-                database_digest,
-                artifact_manifest_digest,
-            ],
-        )?;
-        tx.commit()?;
-    }
+/// Record the backup checkpoint ONLY after publication succeeded.
+fn record_checkpoint(
+    stats: &ManifestStats,
+    database_digest: &str,
+    artifact_manifest_digest: &str,
+    created_at: &str,
+) -> Result<()> {
+    let mut rw = Store::open_read_write()?;
+    let tx = rw.conn.transaction()?;
+    tx.execute(
+        "INSERT INTO backup_checkpoints (backup_id, store_id, created_at, through_sequence, head_record_hash, database_digest, manifest_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            ulid::Ulid::generate().to_string(),
+            stats.store_id,
+            created_at,
+            stats.through_sequence,
+            stats.head_record_hash,
+            database_digest,
+            artifact_manifest_digest,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn handle(_args: BackupArgs) -> Result<()> {
+    let store = Store::open_read_only()?;
+    let backups_dir = store.data_dir.join("backups");
+    fs::create_dir_all(&backups_dir)?;
+
+    // Stage the bundle in a temp dir so publication can be an atomic rename.
+    let staging = tempfile::tempdir_in(&backups_dir).context("failed to create staging dir")?;
+    let stage_root = staging.path();
+
+    let staged_db = stage_online_copy(&store, stage_root)?;
+    let src_objects = store.data_dir.join("objects");
+    let dst_objects = stage_root.join("objects");
+    copy_objects_if_present(&src_objects, &dst_objects)?;
+    verify_staged(stage_root)?;
+
+    let conn = Connection::open(&staged_db)?;
+    let stats = read_manifest_stats(&conn)?;
+    let (objects_manifest_path, artifact_manifest_digest) =
+        write_objects_manifest(&conn, stage_root)?;
+    let database_digest = file_digest(&staged_db)?;
+    let (manifest_path, created_at) = write_manifest(
+        stage_root,
+        &stats,
+        &database_digest,
+        &artifact_manifest_digest,
+    )?;
+
+    // Durability: sync staged DB + manifests + objects before publishing.
+    sync_tree(stage_root)?;
+
+    let bundle = StagedBundle {
+        staged_db: staged_db.clone(),
+        manifest_path,
+        objects_manifest_path,
+        dst_objects,
+    };
+    let final_archive =
+        durable_publish(&backups_dir, &bundle, &stats.head_record_hash, &created_at)?;
+
+    record_checkpoint(
+        &stats,
+        &database_digest,
+        &artifact_manifest_digest,
+        &created_at,
+    )?;
 
     println!("Backup verified and saved to: {}", final_archive.display());
     Ok(())
