@@ -2,6 +2,12 @@
 name = "snag"
 version = "0.1.0"
 edition = "2024"
+description = "Durable observation capture for agent fleets: atomic bug/friction reports with repo, worktree, pearl, and tool context."
+license = "MIT"
+repository = "https://github.com/13banditos/snag"
+readme = "README.md"
+keywords = ["observability", "agent", "reporting", "incident", "sqlite"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"

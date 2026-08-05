@@ -27,3 +27,6 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --all-features --no-fail-fast
+
+      - name: Release build smoke
+        run: cargo build --release
