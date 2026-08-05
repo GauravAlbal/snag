@@ -146,6 +146,59 @@ fn ensure_worktree_for(
     }
 }
 
+/// Precedence step 4: an existing checkout binding for this git common dir.
+fn resolve_by_checkout(store: &mut Store, dir: &str) -> anyhow::Result<Option<String>> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.query_row(
+        "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
+        params![dir],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Precedence step 6: mint a brand new repository identity.
+fn create_new_repo(store: &mut Store, now: &str) -> anyhow::Result<String> {
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let rid = generate_id("repo");
+    tx.execute(
+        "INSERT INTO repositories (repository_id, created_at) VALUES (?1, ?2)",
+        params![&rid, now],
+    )?;
+    tx.commit()?;
+    Ok(rid)
+}
+
+/// Precedence steps 4-6 for a repository with a known git common dir: known
+/// checkout binding, then unique remote alias, then a new identity (which
+/// appends a warning).
+fn resolve_from_git_dir(
+    store: &mut Store,
+    git_ctx: &GitContext,
+    dir: &str,
+    now: &str,
+    warnings: &mut Vec<String>,
+) -> anyhow::Result<String> {
+    // 4. Known checkout binding.
+    if let Some(rid) = resolve_by_checkout(store, dir)? {
+        return Ok(rid);
+    }
+    // 5. Unique remote alias.
+    if let Some(rid) = unique_alias_match(store, &git_ctx.git_remote_aliases)? {
+        return Ok(rid);
+    }
+    // 6. New identity.
+    let rid = create_new_repo(store, now)?;
+    warnings
+        .push("created a new repository identity (no known checkout or unique alias)".to_string());
+    Ok(rid)
+}
+
 /// Primary repository resolution with G28 precedence:
 ///   1. explicit CLI repository ID
 ///   2. context-file repository ID
@@ -169,43 +222,7 @@ pub fn resolve_repository(
     let repository_id = if let Some(explicit) = explicit_repo_id {
         ensure_explicit_repo(store, explicit, &now)?
     } else if let Some(dir) = &git_ctx.git_common_dir {
-        // 4. Known checkout binding.
-        let existing: Option<String> = {
-            let tx = store
-                .conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.query_row(
-                "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
-                params![dir],
-                |r| r.get(0),
-            )
-            .optional()?
-        };
-        if let Some(rid) = existing {
-            rid
-        } else {
-            // 5. Unique remote alias.
-            match unique_alias_match(store, &git_ctx.git_remote_aliases)? {
-                Some(rid) => rid,
-                None => {
-                    // 6. New identity.
-                    let tx = store
-                        .conn
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                    let rid = generate_id("repo");
-                    tx.execute(
-                        "INSERT INTO repositories (repository_id, created_at) VALUES (?1, ?2)",
-                        params![&rid, &now],
-                    )?;
-                    tx.commit()?;
-                    warnings.push(
-                        "created a new repository identity (no known checkout or unique alias)"
-                            .to_string(),
-                    );
-                    rid
-                }
-            }
-        }
+        resolve_from_git_dir(store, git_ctx, dir, &now, &mut warnings)?
     } else {
         return Ok(RepositoryResolution {
             repository_id: String::new(),

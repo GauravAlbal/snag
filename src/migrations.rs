@@ -35,59 +35,9 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
         ",
     )?;
 
-    // Park all old sequences out of the positive range so new global sequences
-    // cannot collide with a not-yet-rewritten legacy row.
-    tx.execute_batch(
-        "
-        UPDATE observations SET local_sequence = -(1000000000 + local_sequence);
-        UPDATE observation_actions SET local_sequence = -(2000000000 + local_sequence);
-        ",
-    )?;
+    park_sequences(tx)?;
 
-    let mut old_records: Vec<OldRecord> = Vec::new();
-
-    let mut stmt = tx.prepare(
-        "SELECT observation_id, captured_at, canonical_payload_json, local_sequence FROM observations")?;
-    let obs_iter = stmt.query_map([], |row| {
-        Ok(OldRecord {
-            id: row.get(0)?,
-            typ: "observation_created".to_string(),
-            entity_id: row.get(0)?,
-            captured_at: row.get(1)?,
-            payload: row.get(2)?,
-            seq: row.get(3)?,
-            class_order: 0,
-        })
-    })?;
-    for obs in obs_iter {
-        old_records.push(obs?);
-    }
-
-    let mut stmt = tx.prepare(
-        "SELECT action_id, observation_id, action_type, created_at, action_payload_json, local_sequence FROM observation_actions")?;
-    let act_iter = stmt.query_map([], |row| {
-        Ok(OldRecord {
-            id: row.get(0)?,
-            typ: format!("observation_{}", row.get::<_, String>(2)?),
-            entity_id: row.get(1)?,
-            captured_at: row.get(3)?,
-            payload: row.get(4)?,
-            seq: row.get(5)?,
-            class_order: 1,
-        })
-    })?;
-    for act in act_iter {
-        old_records.push(act?);
-    }
-
-    // G33 deterministic ordering: captured_at, class order, original seq, id.
-    old_records.sort_by(|a, b| {
-        a.captured_at
-            .cmp(&b.captured_at)
-            .then_with(|| a.class_order.cmp(&b.class_order))
-            .then_with(|| a.seq.cmp(&b.seq))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    let old_records = collect_legacy_records(tx)?;
 
     let store_id: String = tx
         .query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |row| {
@@ -103,47 +53,7 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
 
     #[allow(clippy::explicit_counter_loop)]
     for rec in old_records {
-        let record_payload: crate::record::RecordPayload = serde_json::from_str(&rec.payload)
-            .map_err(|e| anyhow::anyhow!("invalid legacy payload for {}: {}", rec.id, e))?;
-        let canonical_record = crate::record::CanonicalRecordV1 {
-            local_sequence: new_sequence,
-            record_id: rec.id.clone(),
-            record_type: rec.typ.clone(),
-            entity_id: rec.entity_id.clone(),
-            captured_at: rec.captured_at.clone(),
-            payload: record_payload,
-        };
-        let record_hash = canonical_record.compute_hash(&store_id, &previous_hash);
-
-        tx.execute(
-            "INSERT INTO records_new (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                new_sequence as i64,
-                rec.id.clone(),
-                rec.typ,
-                rec.entity_id,
-                rec.captured_at,
-                rec.payload,
-                previous_hash,
-                record_hash,
-            ],
-        )?;
-
-        // Update the original tables to match the new sequence/hashes.
-        if rec.typ == "observation_created" {
-            tx.execute(
-                "UPDATE observations SET local_sequence = ?1, previous_record_hash = ?2, record_hash = ?3 WHERE observation_id = ?4",
-                rusqlite::params![new_sequence as i64, previous_hash, record_hash, rec.id],
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE observation_actions SET local_sequence = ?1, previous_record_hash = ?2, record_hash = ?3 WHERE action_id = ?4",
-                rusqlite::params![new_sequence as i64, previous_hash, record_hash, rec.id],
-            )?;
-        }
-
-        previous_hash = record_hash;
+        previous_hash = write_record(tx, &rec, new_sequence, &store_id, &previous_hash)?;
         new_sequence += 1;
         count += 1;
     }
@@ -157,6 +67,138 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
 
     let _ = count;
     Ok(())
+}
+
+/// Park every legacy sequence at a unique negative value so the new positive
+/// global sequences can never collide with a still-unmigrated old row while the
+/// rewrite is in flight (the legacy tables carry a UNIQUE on local_sequence).
+fn park_sequences(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute_batch(
+        "
+        UPDATE observations SET local_sequence = -(1000000000 + local_sequence);
+        UPDATE observation_actions SET local_sequence = -(2000000000 + local_sequence);
+        ",
+    )?;
+    Ok(())
+}
+
+/// Every legacy observation and action, in the G33 deterministic order.
+fn collect_legacy_records(tx: &rusqlite::Transaction) -> anyhow::Result<Vec<OldRecord>> {
+    let mut old_records: Vec<OldRecord> = Vec::new();
+    collect_legacy_observations(tx, &mut old_records)?;
+    collect_legacy_actions(tx, &mut old_records)?;
+    sort_deterministic(&mut old_records);
+    Ok(old_records)
+}
+
+fn collect_legacy_observations(
+    tx: &rusqlite::Transaction,
+    out: &mut Vec<OldRecord>,
+) -> anyhow::Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT observation_id, captured_at, canonical_payload_json, local_sequence FROM observations")?;
+    let obs_iter = stmt.query_map([], |row| {
+        Ok(OldRecord {
+            id: row.get(0)?,
+            typ: "observation_created".to_string(),
+            entity_id: row.get(0)?,
+            captured_at: row.get(1)?,
+            payload: row.get(2)?,
+            seq: row.get(3)?,
+            class_order: 0,
+        })
+    })?;
+    for obs in obs_iter {
+        out.push(obs?);
+    }
+    Ok(())
+}
+
+fn collect_legacy_actions(
+    tx: &rusqlite::Transaction,
+    out: &mut Vec<OldRecord>,
+) -> anyhow::Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT action_id, observation_id, action_type, created_at, action_payload_json, local_sequence FROM observation_actions")?;
+    let act_iter = stmt.query_map([], |row| {
+        Ok(OldRecord {
+            id: row.get(0)?,
+            typ: format!("observation_{}", row.get::<_, String>(2)?),
+            entity_id: row.get(1)?,
+            captured_at: row.get(3)?,
+            payload: row.get(4)?,
+            seq: row.get(5)?,
+            class_order: 1,
+        })
+    })?;
+    for act in act_iter {
+        out.push(act?);
+    }
+    Ok(())
+}
+
+/// G33 deterministic ordering: captured_at, class order, original seq, id.
+fn sort_deterministic(old_records: &mut [OldRecord]) {
+    old_records.sort_by(|a, b| {
+        a.captured_at
+            .cmp(&b.captured_at)
+            .then_with(|| a.class_order.cmp(&b.class_order))
+            .then_with(|| a.seq.cmp(&b.seq))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// Rewrite one legacy record into `records_new` and re-stamp its origin table
+/// with the new sequence and hash chain. Returns the record hash, which becomes
+/// the next record's predecessor.
+fn write_record(
+    tx: &rusqlite::Transaction,
+    rec: &OldRecord,
+    new_sequence: u64,
+    store_id: &str,
+    previous_hash: &str,
+) -> anyhow::Result<String> {
+    let record_payload: crate::record::RecordPayload = serde_json::from_str(&rec.payload)
+        .map_err(|e| anyhow::anyhow!("invalid legacy payload for {}: {}", rec.id, e))?;
+    let canonical_record = crate::record::CanonicalRecordV1 {
+        local_sequence: new_sequence,
+        record_id: rec.id.clone(),
+        record_type: rec.typ.clone(),
+        entity_id: rec.entity_id.clone(),
+        captured_at: rec.captured_at.clone(),
+        payload: record_payload,
+    };
+    let record_hash = canonical_record.compute_hash(store_id, previous_hash);
+
+    tx.execute(
+        "INSERT INTO records_new (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            new_sequence as i64,
+            &rec.id,
+            &rec.typ,
+            &rec.entity_id,
+            &rec.captured_at,
+            &rec.payload,
+            previous_hash,
+            &record_hash,
+        ],
+    )?;
+
+    // Update the original tables to match the new sequence/hashes.
+    if rec.typ == "observation_created" {
+        tx.execute(
+            "UPDATE observations SET local_sequence = ?1, previous_record_hash = ?2, record_hash = ?3 WHERE observation_id = ?4",
+            rusqlite::params![new_sequence as i64, previous_hash, &record_hash, &rec.id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE observation_actions SET local_sequence = ?1, previous_record_hash = ?2, record_hash = ?3 WHERE action_id = ?4",
+            rusqlite::params![new_sequence as i64, previous_hash, &record_hash, &rec.id],
+        )?;
+    }
+
+    Ok(record_hash)
 }
 
 /// v2 -> v3: make alias ambiguity representable. `repository_aliases` becomes a
