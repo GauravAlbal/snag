@@ -1,5 +1,5 @@
 use crate::schema::{apply_migrations, initialize_reader_connection, initialize_writer_connection};
-use crate::types::{Observation, generate_id};
+use crate::types::generate_id;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use rusqlite::Connection;
@@ -141,11 +141,6 @@ impl Store {
         };
 
         Ok(store_id)
-    }
-
-    pub fn insert_observation(&mut self, _obs: &Observation) -> Result<()> {
-        // ... to be implemented for the report logic ...
-        Ok(())
     }
 }
 
