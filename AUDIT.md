@@ -1,36 +1,72 @@
-# Snag v0 Certification Audit
+# Snag Audit — Post-Certification State
 
-## Current State & Identified Gaps
+## Certification Status
 
-### CLI & Input (G1, G2, G9)
-- **JSON Input (G1)**: `report --json` currently does not parse the incoming JSON or merge it with context. It needs full JSON schema validation.
-- **Prose Input (G2)**: `--stdin` currently only extracts the title. A simple deterministic text parser is needed to extract headings like `Expected:`, `Observed:`.
-- **List Filters (G9)**: `list` command currently ignores all filters.
+**CERTIFIED v0.1.0** — accepted through the moat acceptance loop and merged
+via PR #1 (merge commit `b8dda313700460ee6a55211e65a55eea378beb02`).
 
-### Core Data Model & Schema (G3, G4, G6, G18)
-- **Global Record Stream (G4)**: Observations and actions currently have split sequences. We need a schema migration to merge them into a single `records` table with a global sequence and hash chain.
-- **Idempotency (G3)**: Currently not wired up. Needs a lookup against `canonical_payload` equivalence.
-- **Affected Repositories (G6)**: Currently not parsed or persisted in `observation_repositories`.
-- **Read-Purity (G18)**: `Store::open()` currently always applies migrations. We need distinct `open_read_only`, `open_read_write`, `open_for_maintenance` modes.
+| Evidence | Value |
+|---|---|
+| Accepted revision | `0c54bf2` |
+| Merge commit | `b8dda31` |
+| PR | #1, merged |
+| Tests | 59/59 pass |
+| Moat | ACCEPTED |
+| Release tag | `v0.1.0` |
 
-### Context & Git (G5, G7, G8)
-- **Identity (G5)**: `identity.rs` is a stub. Requires full resolution of `git_common_dir`, remote aliases, checkouts, and worktrees.
-- **Context File (G7)**: `SNAG_CONTEXT_FILE` only reads `source`. Must read execution, repository, idempotency key, etc., following precedence rules.
-- **Git Boundaries (G8)**: Git context collection has no timeout and can hang.
+The authoritative requirement digest (G20–G37, T1–T12) is
+[.cert-reqs-digest.md](.cert-reqs-digest.md). The certified record kernel,
+export/rebuild protocol, recovery chain, multirepo identity, idempotency,
+migrations, and robustness matrix all shipped in PR #1.
 
-### Artifacts (G16)
-- File size limits exist (50MiB), but no total report limit.
-- Missing existence checking before blindly writing over objects.
-- Symlinks need to be explicitly rejected.
+## Post-Certification State
 
-### Backup, Restore, Export & Verify (G10-G15)
-- **Export (G10)**: Current export lacks correct `export_kind` header fields, actions inclusion, and partial chain predecessor validation.
-- **Backup (G11)**: Current backup writes a basic manifest but misses `objects-manifest.json` and strict validation.
-- **Verify (G12, G13)**: `verify --full` needs to recalculate hashes, match artifact lengths and digests, and validate metadata consistently.
-- **Restore & Rebuild (G14, G15)**: Neither `restore` nor `rebuild` exist. Both are required for certification.
+This file previously listed pre-certification gaps. Those gaps were closed by
+the v0 certification work; the list below is the **current** audit state.
 
-### Error Handling (G17)
-- `SnagError` exists but errors do not format into the required JSON envelope on failure when `--json` is active.
+### Closed by certification (v0)
+- **Canonical record kernel**: hash-chained, globally-sequenced records
+  (`previous_record_hash` binding); tamper tests cover every bound field.
+- **Export/rebuild protocol**: deterministic JSONL export consumed by
+  `snag rebuild --from-export`; byte-identical output for identical state.
+- **Recovery chain**: `backup` → `verify --backup` → `restore` (non-destructive,
+  forensic copy preserved) → `rebuild` from export.
+- **Multirepo identity**: real git common dir, worktree/checkout IDs, explicit
+  precedence, affected-repo resolution with typed failures.
+- **Idempotency**: stable semantic digest; same key + same digest replays,
+  same key + different digest conflicts.
+- **Migrations**: v1→v2 deterministic and collision-safe, transactional.
+- **Robustness**: crash injection (T6), 32-writer concurrency (T5), git
+  process-kill timeout, artifact constraints (symlink rejection, size caps).
+- **Read purity**: distinct reader/writer/maintenance connection modes; list,
+  show, context, export, verify, doctor proven non-mutating.
+- **Verification**: `verify --full` recomputes the entire chain; `verify
+  --quick` bounds the suffix with predecessor-hash equality.
+- **Testing**: 59 tests across cli, git_identity, migration, concurrency,
+  robustness suites; all gates green in clean sandbox.
 
-### Testing (G19)
-- Zero integration or behavioral tests exist. An extensive matrix of crash-injection, concurrency, multirepo, idempotency, and purity tests is needed.
+### Known non-goals / documented limits (v0.1)
+- No automatic runtime nudges (planned for Panopticon; agent confirmation is
+  the quality gate while the corpus is small).
+- No dashboard/UI (Panopticon v1 scope).
+- `snag` itself is capture-only: coalescing, taxonomy, and materiality live in
+  Panopticon, not here.
+
+### Maintenance posture
+- Snag source is **frozen** except for bugs discovered through its own use.
+  Feature work belongs to Panopticon / the next design program.
+- Every change ships through the moat acceptance loop (see
+  [CLAUDE.md](CLAUDE.md)); never weaken a gate.
+- CI runs the identical gate commands declared in `.moat.json`:
+  `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-targets --all-features --no-fail-fast`.
+
+## Operational Checklist
+
+Before declaring work done in this repo:
+
+1. `cargo fmt --check`
+2. `cargo clippy --all-targets --all-features -- -D warnings`
+3. `cargo test --all-targets --all-features --no-fail-fast`
+4. `snag verify` against the local store (if a store exists)
+5. Contract the change, submit through moat, land only on ACCEPTED.
