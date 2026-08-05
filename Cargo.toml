@@ -1,6 +1,6 @@
 [package]
 name = "snag"
-version = "0.2.0-dev"
+version = "0.1.1"
 edition = "2024"
 description = "Durable observation outbox for coding agents: capture out-of-scope bugs and friction with evidence, then keep going."
 license = "Apache-2.0"
