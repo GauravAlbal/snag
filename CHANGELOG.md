@@ -5,6 +5,10 @@ All notable changes to snag are documented here. Format follows
 [SemVer](https://semver.org/). See [docs/RELEASING.md](docs/RELEASING.md) for
 the release process.
 
+> **Version state on `main`:** development for v0.2.0; `snag --version` reports
+> `0.2.0-dev` on unreleased builds. The named release `v0.1.0` (MIT) is the
+> last released version; v0.2.0 and later are Apache-2.0.
+
 ## [Unreleased]
 
 ### Added
