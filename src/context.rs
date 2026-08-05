@@ -1,9 +1,10 @@
-use crate::types::{ContextInfo, ExecutionContext, RepositoryContext, SourceInfo};
-use crate::git::collect_git_context;
 use crate::cli::ReportArgs;
-use std::env;
-use std::path::PathBuf;
+use crate::error::SnagError;
+use crate::git::collect_git_context;
+use crate::types::{ContextInfo, ExecutionContext, RepositoryContext, SourceInfo};
 use anyhow::Result;
+use serde::Deserialize;
+use std::env;
 
 fn build_repo_context(args: &ReportArgs, git_ctx: &crate::git::GitContext) -> RepositoryContext {
     let mut repo_ctx = RepositoryContext {
@@ -32,7 +33,9 @@ fn build_exec_context(args: &ReportArgs, cwd: &std::path::Path) -> ExecutionCont
         session_id: env::var("ARQ_SESSION_ID").ok(),
         pearl_id: env::var("VX_PEARL_ID").ok(),
         attempt_id: env::var("VX_ATTEMPT_ID").ok(),
-        authority_sequence: env::var("VX_AUTHORITY_SEQUENCE").ok().and_then(|v| v.parse().ok()),
+        authority_sequence: env::var("VX_AUTHORITY_SEQUENCE")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         tool_name: None,
         tool_invocation_id: None,
         command_shape: None,
@@ -50,8 +53,19 @@ fn build_exec_context(args: &ReportArgs, cwd: &std::path::Path) -> ExecutionCont
     exec_ctx
 }
 
-pub fn gather_context(args: &ReportArgs) -> Result<(SourceInfo, ContextInfo)> {
-    let mut source = SourceInfo {
+/// Shape of the optional `SNAG_CONTEXT_FILE` document.
+#[derive(Deserialize)]
+struct ContextFile {
+    source: Option<SourceInfo>,
+    execution: Option<ExecutionContext>,
+    repository: Option<RepositoryContext>,
+    extra: Option<serde_json::Value>,
+    idempotency_key: Option<String>,
+}
+
+/// Baseline source identity taken from the environment.
+fn build_source() -> SourceInfo {
+    SourceInfo {
         kind: env::var("SNAG_SOURCE_KIND").unwrap_or_else(|_| "human_explicit".to_string()),
         system: None,
         reporter_id: env::var("SNAG_REPORTER_ID").ok(),
@@ -60,34 +74,144 @@ pub fn gather_context(args: &ReportArgs) -> Result<(SourceInfo, ContextInfo)> {
         model: None,
         detector_id: None,
         detector_version: None,
-    };
+    }
+}
 
-    let cwd = env::current_dir()?;
+/// Overlay repository fields present in the context file.
+fn merge_repo_context(repo_ctx: &mut RepositoryContext, repo: RepositoryContext) {
+    if let Some(rid) = repo.repository_id {
+        repo_ctx.repository_id = Some(rid);
+    }
+    if let Some(cid) = repo.checkout_id {
+        repo_ctx.checkout_id = Some(cid);
+    }
+    if let Some(wid) = repo.worktree_id {
+        repo_ctx.worktree_id = Some(wid);
+    }
+}
+
+/// Overlay execution fields present in the context file.
+fn merge_exec_context(exec_ctx: &mut ExecutionContext, exec: ExecutionContext) {
+    if let Some(wid) = exec.workspace_id {
+        exec_ctx.workspace_id = Some(wid);
+    }
+    if let Some(pid) = exec.program_id {
+        exec_ctx.program_id = Some(pid);
+    }
+    if let Some(sid) = exec.session_id {
+        exec_ctx.session_id = Some(sid);
+    }
+    if let Some(pid) = exec.pearl_id {
+        exec_ctx.pearl_id = Some(pid);
+    }
+    if let Some(aid) = exec.attempt_id {
+        exec_ctx.attempt_id = Some(aid);
+    }
+    if let Some(auth) = exec.authority_sequence {
+        exec_ctx.authority_sequence = Some(auth);
+    }
+    if let Some(tn) = exec.tool_name {
+        exec_ctx.tool_name = Some(tn);
+    }
+    if let Some(ti) = exec.tool_invocation_id {
+        exec_ctx.tool_invocation_id = Some(ti);
+    }
+    if let Some(cs) = exec.command_shape {
+        exec_ctx.command_shape = Some(cs);
+    }
+}
+
+/// Read and overlay the context file at `path`. The context file overrides the
+/// environment; explicit CLI arguments override the context file.
+fn merge_context_file(
+    path: &str,
+    source: &mut SourceInfo,
+    repo_ctx: &mut RepositoryContext,
+    exec_ctx: &mut ExecutionContext,
+    extra: &mut Option<serde_json::Value>,
+    idempotency_key: &mut Option<String>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        SnagError::ContextFileInvalid(format!("Could not read context file: {}", e))
+    })?;
+    let parsed: ContextFile = serde_json::from_str(&content)
+        .map_err(|e| SnagError::ContextFileInvalid(format!("Invalid context file JSON: {}", e)))?;
+
+    if let Some(src) = parsed.source {
+        // Context file overrides environment
+        *source = src;
+    }
+    if let Some(repo) = parsed.repository {
+        merge_repo_context(repo_ctx, repo);
+    }
+    if let Some(exec) = parsed.execution {
+        merge_exec_context(exec_ctx, exec);
+    }
+    if let Some(ext) = parsed.extra {
+        *extra = Some(ext);
+    }
+    if let Some(ik) = parsed.idempotency_key
+        && idempotency_key.is_none()
+    {
+        *idempotency_key = Some(ik);
+    }
+    Ok(())
+}
+
+/// Explicit CLI arguments take precedence over the context file.
+fn apply_overrides(
+    args: &ReportArgs,
+    repo_ctx: &mut RepositoryContext,
+    exec_ctx: &mut ExecutionContext,
+) {
+    if let Some(rid) = &args.repo_id {
+        repo_ctx.repository_id = Some(rid.clone());
+    }
+    if let Some(sid) = &args.session_id {
+        exec_ctx.session_id = Some(sid.clone());
+    }
+    if let Some(pid) = &args.pearl_id {
+        exec_ctx.pearl_id = Some(pid.clone());
+    }
+    if let Some(aid) = &args.attempt_id {
+        exec_ctx.attempt_id = Some(aid.clone());
+    }
+}
+
+pub fn gather_context(args: &ReportArgs) -> Result<(SourceInfo, ContextInfo, Option<String>)> {
+    let mut source = build_source();
+
+    let cwd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let git_ctx = collect_git_context(&cwd).unwrap_or_default();
 
-    let repo_ctx = build_repo_context(args, &git_ctx);
-    let exec_ctx = build_exec_context(args, &cwd);
+    let mut repo_ctx = build_repo_context(args, &git_ctx);
+    let mut exec_ctx = build_exec_context(args, &cwd);
+
+    let mut extra = None;
+    let mut idempotency_key = args.idempotency_key.clone();
 
     // Attempt to load context file if SNAG_CONTEXT_FILE is provided
     if let Ok(ctx_file) = env::var("SNAG_CONTEXT_FILE") {
-        if let Ok(content) = std::fs::read_to_string(ctx_file) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(src) = parsed.get("source") {
-                    if let Ok(s) = serde_json::from_value(src.clone()) {
-                        source = s;
-                    }
-                }
-            }
-        }
+        merge_context_file(
+            &ctx_file,
+            &mut source,
+            &mut repo_ctx,
+            &mut exec_ctx,
+            &mut extra,
+            &mut idempotency_key,
+        )?;
     }
+
+    // Explicit CLI arguments override context file
+    apply_overrides(args, &mut repo_ctx, &mut exec_ctx);
 
     let ctx_info = ContextInfo {
         repository: Some(repo_ctx),
         execution: Some(exec_ctx),
-        extra: None,
+        extra,
     };
 
-    Ok((source, ctx_info))
+    Ok((source, ctx_info, idempotency_key))
 }
 
 pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
@@ -109,14 +233,14 @@ pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
         attempt_id: None,
         affected_repos: vec![],
     };
-    
-    let (_, ctx) = gather_context(&dummy_args)?;
-    
+
+    let (_, ctx, _) = gather_context(&dummy_args)?;
+
     if args.format.as_deref() == Some("json") {
         println!("{}", serde_json::to_string_pretty(&ctx)?);
     } else {
         println!("{:#?}", ctx);
     }
-    
+
     Ok(())
 }

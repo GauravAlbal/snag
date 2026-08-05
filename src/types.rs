@@ -1,17 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use ulid::Ulid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Observation {
     pub schema_version: u32,
     pub observation_id: String,
     pub store_id: String,
     pub local_sequence: u64,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    
+
     pub created_at: String, // ISO8601 or similar
 
     pub source: SourceInfo,
@@ -19,12 +19,12 @@ pub struct Observation {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind_assertion: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_assertion: Option<String>,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_behavior: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,33 +37,35 @@ pub struct Observation {
     pub impact: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
-    
+
     pub sensitivity: Sensitivity,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub labels: Option<HashMap<String, String>>,
-    
+    pub labels: Option<BTreeMap<String, String>>,
+
     pub context: ContextInfo,
-    
+
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub artifacts: Vec<ArtifactReference>,
+
+    /// Resolved repository IDs (primary + affected) persisted by the reporter.
+    /// These live in the canonical payload so rebuild can reconstruct the
+    /// `observation_repositories` projection without external state.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub affected_repository_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Sensitivity {
+    #[default]
     Normal,
     Sensitive,
     Restricted,
 }
 
-impl Default for Sensitivity {
-    fn default() -> Self {
-        Sensitivity::Normal
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceInfo {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,7 +84,7 @@ pub struct SourceInfo {
     pub detector_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ContextInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository: Option<RepositoryContext>,
@@ -92,7 +94,7 @@ pub struct ContextInfo {
     pub extra: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RepositoryContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository_id: Option<String>,
@@ -114,7 +116,7 @@ pub struct RepositoryContext {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -138,7 +140,7 @@ pub struct ExecutionContext {
     pub command_shape: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArtifactReference {
     pub digest: String,
     pub byte_length: u64,

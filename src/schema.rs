@@ -1,20 +1,61 @@
 use rusqlite::{Connection, Result};
 
-pub fn init_connection(conn: &Connection) -> Result<()> {
+/// Writer connection: may mutate journal mode and schema. Called on r/w opens
+/// and on migration paths.
+pub fn initialize_writer_connection(conn: &Connection) -> Result<()> {
+    // Configure the busy timeout BEFORE any lock-taking statement so every
+    // concurrent writer waits instead of failing fast under contention.
     conn.execute_batch(
         "
-        PRAGMA journal_mode = WAL;
         PRAGMA synchronous = FULL;
         PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = 5000;
+        PRAGMA busy_timeout = 30000;
+        ",
+    )?;
+    // journal_mode=WAL is a persistent, one-time DB property. Only attempt to
+    // set it on a store that is not already WAL; forcing it on every open makes
+    // 32 concurrent first-opens hammer the same lock and surface SQLITE_BUSY.
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        // Best-effort: if a concurrent writer is mid-transition, the next open
+        // will already find it WAL (set by the process that created it).
+        let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
+    }
+    Ok(())
+}
+
+/// Reader connection: only connection-local options that are legal on a
+/// `SQLITE_OPEN_READ_ONLY` connection. Never attempts to mutate journal mode
+/// or schema (both would fail or write on a read-only database).
+pub fn initialize_reader_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 30000;
         ",
     )?;
     Ok(())
 }
 
-pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction()?;
-    
+/// Maintenance connection: read-write but without a forced migration/schema
+/// mutation unless an explicit maintenance action requests it.
+pub fn initialize_maintenance_connection(conn: &Connection) -> Result<()> {
+    initialize_writer_connection(conn)
+}
+
+/// Backwards-compatible alias kept for any remaining callers.
+pub fn init_connection(conn: &Connection) -> Result<()> {
+    initialize_writer_connection(conn)
+}
+
+pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
+    // Run under an EXCLUSIVE transaction so that when a fresh store is first
+    // opened by several processes concurrently, exactly one applies the
+    // migration chain; the others block and then observe the already-committed
+    // schema version instead of re-running (and conflicting over) the same
+    // migrations.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+
     // Create migrations table if not exists
     tx.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -23,7 +64,7 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
         )",
         [],
     )?;
-    
+
     let current_version: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         [],
@@ -158,7 +199,31 @@ pub fn apply_migrations(conn: &mut Connection) -> Result<()> {
 
             INSERT INTO schema_migrations (version, applied_at) 
             VALUES (1, datetime('now'));
-            "
+            ",
+        )?;
+    }
+
+    if current_version < 2 {
+        crate::migrations::migrate_v1_to_v2(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'))",
+            [],
+        )?;
+    }
+
+    if current_version < 3 {
+        crate::migrations::migrate_v2_to_v3(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, datetime('now'))",
+            [],
+        )?;
+    }
+
+    if current_version < 4 {
+        crate::migrations::migrate_v3_to_v4(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (4, datetime('now'))",
+            [],
         )?;
     }
 

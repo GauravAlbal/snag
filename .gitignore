@@ -3,3 +3,6 @@
 /.omp/
 /.pearls/
 /runs/
+
+# session working artifact
+.cert-reqs-digest.md

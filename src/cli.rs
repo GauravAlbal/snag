@@ -5,13 +5,25 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
     /// The title of the observation (fast path)
-    #[arg(required_unless_present = "command")]
     pub title: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
+impl Cli {
+    pub fn wants_json(&self) -> bool {
+        match &self.command {
+            Some(Command::Report(args)) => args.json,
+            Some(Command::List(args)) => args.format.as_deref() == Some("json"),
+            Some(Command::Context(args)) => args.format.as_deref() == Some("json"),
+            Some(Command::Export(args)) => args.format.as_deref() == Some("json"),
+            _ => false,
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Command {
     /// Durably records one observation
@@ -32,6 +44,10 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Adds a retraction action without deleting the original observation
     Retract(RetractArgs),
+    /// Restores the database from a backup
+    Restore(RestoreArgs),
+    /// Rebuilds the database from an export stream
+    Rebuild(RebuildArgs),
 }
 
 #[derive(Args)]
@@ -97,6 +113,12 @@ pub struct ListArgs {
     pub source: Option<String>,
 
     #[arg(long)]
+    pub kind: Option<String>,
+
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    #[arg(long)]
     pub format: Option<String>,
 }
 
@@ -147,4 +169,18 @@ pub struct DoctorArgs {}
 #[derive(Args)]
 pub struct RetractArgs {
     pub observation_id: String,
+}
+
+#[derive(Args)]
+pub struct RestoreArgs {
+    pub archive: PathBuf,
+}
+
+#[derive(Args)]
+pub struct RebuildArgs {
+    #[arg(long = "from-export")]
+    pub from_export: PathBuf,
+
+    #[arg(long)]
+    pub destination: PathBuf,
 }
