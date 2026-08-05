@@ -58,6 +58,27 @@ cursor into the database.
 snag export | python3 consumer.py --stream -
 ```
 
+## GitHub issues adapter (simple, deliberately)
+
+[`github-issues.py`](github-issues.py) files one issue per non-retracted
+observation via the GitHub REST API:
+
+```bash
+snag export --output observations.jsonl
+GITHUB_TOKEN=ghp_... python3 github-issues.py \
+  --stream observations.jsonl --repo owner/name --label snag
+python3 github-issues.py --stream observations.jsonl --repo owner/name --dry-run
+```
+
+**This is a deliberately simple one-observation-per-issue adapter, not the
+canonical architecture.** Snag's model preserves raw observations first and
+coalesces them into findings downstream; filing every observation directly is
+right for a small repo with modest volume and wrong for a high-volume fleet
+(issue inflation, duplicate symptoms, premature root-cause commitments). Use
+it to get visibility quickly on a small repo; do not build your pipeline on
+it. It does not look at existing issues — re-running without a checkpoint
+files duplicates.
+
 ## Writing your own
 
 The contract you must implement is small and stable:

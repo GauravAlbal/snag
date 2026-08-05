@@ -63,6 +63,14 @@ The context document is a versioned public contract — see
 
 ## Capture
 
+Initialize an agent-aware repo (installs the capture-and-move-on instruction
+block into `AGENTS.md`, idempotent, `--dry-run` to preview):
+
+```sh
+snag init
+snag init --agent claude-code --file CLAUDE.md
+```
+
 Fast path:
 
 ```sh

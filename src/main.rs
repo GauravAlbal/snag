@@ -9,6 +9,7 @@ pub mod failpoint;
 pub mod git;
 pub mod idempotency;
 pub mod identity;
+pub mod init;
 pub mod migrations;
 pub mod parser;
 pub mod rebuild;
@@ -46,6 +47,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Verify(args)) => verify::handle(args),
         Some(Command::Doctor(args)) => doctor::handle(args),
         Some(Command::Retract(args)) => report::retract(args),
+        Some(Command::Init(args)) => init::handle(args),
         Some(Command::Restore(args)) => restore::handle(args),
         Some(Command::Rebuild(args)) => rebuild::handle(args),
         None => {

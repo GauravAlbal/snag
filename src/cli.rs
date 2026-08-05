@@ -92,6 +92,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Adds a retraction action without deleting the original observation
     Retract(RetractArgs),
+    /// Installs the capture-and-move-on agent instructions into a repo
+    Init(InitArgs),
     /// Restores the database from a backup
     Restore(RestoreArgs),
     /// Rebuilds the database from an export stream
@@ -217,6 +219,21 @@ pub struct DoctorArgs {}
 #[derive(Args)]
 pub struct RetractArgs {
     pub observation_id: String,
+}
+
+#[derive(Args)]
+pub struct InitArgs {
+    /// Agent to tailor the setup note for (claude-code, codex, gemini-cli, opencode, generic)
+    #[arg(long)]
+    pub agent: Option<String>,
+
+    /// Target file to write (default: AGENTS.md)
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+
+    /// Print what would be written without modifying anything
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]

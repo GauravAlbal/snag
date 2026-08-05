@@ -65,6 +65,15 @@ agent encounters an out-of-scope issue
 → observations are reviewed or exported later
 ```
 
+**Snag is evidence capture, not issue capture.** Some agent tools send repository
+friction straight to a GitHub issue tracker. Snag preserves observations across
+repositories and concurrent agents first — so separate manifestations of the
+same underlying problem can be coalesced before anything becomes an owned
+issue. Filing issues is an explicit, downstream, opt-in step; a deliberately
+simple one-observation-per-issue adapter ships as an example
+([github-issues.py](examples/export-consumer/github-issues.py)), not as the
+canonical pipeline.
+
 Snag is deliberately boring. It does one job — durable local capture — and
 stays out of the way while you work.
 
@@ -131,6 +140,7 @@ artifacts), and `backups/` (point-in-time bundles).
 | Command | Purpose |
 |---|---|
 | `snag report "<title>"` | Durably record one observation (fast path; structured flags work without the subcommand) |
+| `snag init` | Install the capture-and-move-on agent instructions into the current repo (idempotent, `--agent`/`--file`/`--dry-run`) |
 | `snag report --json` | Record from a JSON document on stdin or a file (see [schemas/](schemas/observation-input-v1.schema.json)) |
 | `snag list` | List observations (`--repo --since --source --kind --limit --format json`) |
 | `snag show <id>` | Display the immutable payload, context, and artifacts |

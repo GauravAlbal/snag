@@ -876,6 +876,112 @@ fn test_closed_pipe_exits_cleanly() {
     );
 }
 
+/// `snag init` writes the capture-and-move-on instruction block to AGENTS.md
+/// in the current directory (creating it when absent).
+#[test]
+fn test_init_writes_instructions() {
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    ctx.cmd()
+        .current_dir(dir)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Configured"));
+    let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert!(
+        content.contains("record it with `snag`"),
+        "block must be installed"
+    );
+    assert!(content.contains("<!-- snag:instructions -->"));
+}
+
+/// `snag init` is idempotent: a second run reports already-configured and
+/// leaves the file byte-identical.
+#[test]
+fn test_init_idempotent() {
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    ctx.cmd().current_dir(dir).arg("init").assert().success();
+    let before = std::fs::read(dir.join("AGENTS.md")).unwrap();
+    ctx.cmd()
+        .current_dir(dir)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Already configured"));
+    let after = std::fs::read(dir.join("AGENTS.md")).unwrap();
+    assert_eq!(before, after, "second init must not modify the file");
+}
+
+/// `snag init --dry-run` prints the section without writing anything.
+#[test]
+fn test_init_dry_run_writes_nothing() {
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    ctx.cmd()
+        .current_dir(dir)
+        .arg("init")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would write"));
+    assert!(
+        !dir.join("AGENTS.md").exists(),
+        "dry-run must not create the file"
+    );
+}
+
+/// `snag init` preserves existing file content and appends the section.
+#[test]
+fn test_init_preserves_existing_file() {
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    std::fs::write(dir.join("AGENTS.md"), "# existing instructions\n").unwrap();
+    ctx.cmd().current_dir(dir).arg("init").assert().success();
+    let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert!(
+        content.starts_with("# existing instructions"),
+        "existing content must survive"
+    );
+    assert!(content.contains("record it with `snag`"));
+}
+
+/// `snag init --file <path>` targets a custom file.
+#[test]
+fn test_init_custom_file() {
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    ctx.cmd()
+        .current_dir(dir)
+        .arg("init")
+        .arg("--file")
+        .arg("CLAUDE.md")
+        .assert()
+        .success();
+    assert!(dir.join("CLAUDE.md").exists());
+    assert!(
+        !dir.join("AGENTS.md").exists(),
+        "default file must not be created"
+    );
+}
+
+/// `snag init --agent` adds the agent setup note for known agents.
+#[test]
+fn test_init_agent_note() {
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    ctx.cmd()
+        .current_dir(dir)
+        .arg("init")
+        .arg("--agent")
+        .arg("claude-code")
+        .assert()
+        .success();
+    let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert!(content.contains("SNAG_SOURCE_KIND=agent_report"));
+}
+
 /// `snag doctor` reports the exact store paths, effective context source, and
 /// version so users never have to infer where data lives.
 #[test]
