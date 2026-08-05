@@ -23,10 +23,11 @@ backup, independent backup verification), identity (real git common dir,
 process-kill timeout, explicit precedence, affected-repo resolution, alias
 ambiguity), input and idempotency (complete JSON intake, stable semantic
 idempotency), migration (deterministic, collision-safe, forensic copy),
-verification (full and quick), list behavior and read purity, plus the T1–T12
-test matrix (CLI/input, idempotency, global records, real multirepo git
-fixtures, 32-writer concurrency, crash injection, artifact adversarial tests,
-export/rebuild round-trips, migration fixtures, restore failure injection,
+verification (full and quick), list behavior and read purity, plus the
+certification test matrix (CLI/input, idempotency, global records, real
+multirepo git fixtures, 32-writer concurrency, crash injection, artifact
+adversarial tests, export/rebuild round-trips, migration fixtures, restore
+failure injection,
 read purity). The certified record kernel, export/rebuild protocol, recovery
 chain, multirepo identity, idempotency, migrations, and robustness matrix all
 shipped in PR #1.

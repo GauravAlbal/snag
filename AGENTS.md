@@ -41,7 +41,7 @@ cargo test --all-targets --all-features --no-fail-fast
 - **No hollow implementations.** No `todo!()`, `unimplemented!()`, bare
   `FIXME`/`HACK`, or placeholder branches in delivered work.
 - **Read purity.** `list`, `show`, `context`, `export`, `verify`, and `doctor`
-  must never mutate the store (G37). If you touch a read path, the
+  must never mutate the store. If you touch a read path, the
   `test_read_purity` suite must stay green.
 - **Stability.** The observation JSON, context JSON, and export stream are
   versioned public contracts (see [docs/STABILITY.md](docs/STABILITY.md)). The
