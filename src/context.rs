@@ -31,7 +31,9 @@ fn build_exec_context(args: &ReportArgs, cwd: &std::path::Path) -> ExecutionCont
         workspace_id: env::var("ARQ_WORKSPACE_ID").ok(),
         program_id: env::var("ARQ_PROGRAM_ID").ok(),
         session_id: env::var("ARQ_SESSION_ID").ok(),
-        pearl_id: env::var("VX_PEARL_ID").ok(),
+        // Legacy fleet wiring feeds the generic work-item field; the public
+        // surface is `task_id` (CLI `--task-id`, JSON `execution.task_id`).
+        task_id: env::var("VX_PEARL_ID").ok(),
         attempt_id: env::var("VX_ATTEMPT_ID").ok(),
         authority_sequence: env::var("VX_AUTHORITY_SEQUENCE")
             .ok()
@@ -44,8 +46,8 @@ fn build_exec_context(args: &ReportArgs, cwd: &std::path::Path) -> ExecutionCont
     if let Some(ref sid) = args.session_id {
         exec_ctx.session_id = Some(sid.clone());
     }
-    if let Some(ref pid) = args.pearl_id {
-        exec_ctx.pearl_id = Some(pid.clone());
+    if let Some(ref tid) = args.task_id {
+        exec_ctx.task_id = Some(tid.clone());
     }
     if let Some(ref aid) = args.attempt_id {
         exec_ctx.attempt_id = Some(aid.clone());
@@ -104,8 +106,8 @@ fn merge_exec_context(exec_ctx: &mut ExecutionContext, exec: ExecutionContext) {
     if let Some(sid) = exec.session_id {
         exec_ctx.session_id = Some(sid);
     }
-    if let Some(pid) = exec.pearl_id {
-        exec_ctx.pearl_id = Some(pid);
+    if let Some(tid) = exec.task_id {
+        exec_ctx.task_id = Some(tid);
     }
     if let Some(aid) = exec.attempt_id {
         exec_ctx.attempt_id = Some(aid);
@@ -179,8 +181,8 @@ fn apply_overrides(
     if let Some(sid) = &args.session_id {
         exec_ctx.session_id = Some(sid.clone());
     }
-    if let Some(pid) = &args.pearl_id {
-        exec_ctx.pearl_id = Some(pid.clone());
+    if let Some(tid) = &args.task_id {
+        exec_ctx.task_id = Some(tid.clone());
     }
     if let Some(aid) = &args.attempt_id {
         exec_ctx.attempt_id = Some(aid.clone());
@@ -238,7 +240,7 @@ pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
         idempotency_key: None,
         repo_id: None,
         session_id: None,
-        pearl_id: None,
+        task_id: None,
         attempt_id: None,
         affected_repos: vec![],
     };

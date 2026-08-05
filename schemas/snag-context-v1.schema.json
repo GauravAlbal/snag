@@ -26,7 +26,7 @@
       }
     },
     "execution": {
-      "description": "Execution context. workspace_id, program_id, pearl_id, attempt_id, and authority_sequence are legacy-compatible optional extensions used by wrapper orchestrators; they are not part of the primary public contract.",
+      "description": "Execution context. workspace_id, program_id, task_id, attempt_id, and authority_sequence are optional extension fields used by wrapper orchestrators; they are not part of the primary public contract.",
       "type": "object",
       "additionalProperties": true,
       "properties": {
@@ -34,7 +34,7 @@
         "workspace_id": { "type": ["string", "null"] },
         "program_id": { "type": ["string", "null"] },
         "session_id": { "type": ["string", "null"] },
-        "pearl_id": { "type": ["string", "null"] },
+        "task_id": { "type": ["string", "null"] },
         "attempt_id": { "type": ["string", "null"] },
         "authority_sequence": { "type": ["integer", "null"], "minimum": 0 },
         "tool_name": { "type": ["string", "null"] },

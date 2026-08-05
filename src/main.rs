@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
                     idempotency_key: cli.idempotency_key,
                     repo_id: cli.repo_id,
                     session_id: cli.session_id,
-                    pearl_id: cli.pearl_id,
+                    task_id: cli.task_id,
                     attempt_id: cli.attempt_id,
                     affected_repos: cli.affected_repos,
                 })

@@ -35,11 +35,11 @@ pub struct SemanticIdempotencyPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeMap<String, String>>,
     pub source: crate::types::SourceInfo,
-    /// Explicitly supplied execution identifiers (session/pearl/attempt/etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_session_id: Option<String>,
+    /// Explicitly supplied execution identifiers (session/task/attempt/etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_pearl_id: Option<String>,
+    pub execution_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_attempt_id: Option<String>,
     /// Resolved repository IDs (primary + affected).
@@ -58,7 +58,7 @@ pub fn observation_semantic_digest(obs: &Observation) -> String {
         .map(|e| {
             (
                 e.session_id.clone(),
-                e.pearl_id.clone(),
+                e.task_id.clone(),
                 e.attempt_id.clone(),
             )
         })
@@ -87,7 +87,7 @@ pub fn observation_semantic_digest(obs: &Observation) -> String {
         labels: obs.labels.clone(),
         source: obs.source.clone(),
         execution_session_id: exec.0,
-        execution_pearl_id: exec.1,
+        execution_task_id: exec.1,
         execution_attempt_id: exec.2,
         repository_ids: obs.affected_repository_ids.clone(),
         artifact_digests,

@@ -49,7 +49,7 @@ pub struct Cli {
     pub session_id: Option<String>,
 
     #[arg(long)]
-    pub pearl_id: Option<String>,
+    pub task_id: Option<String>,
 
     #[arg(long)]
     pub attempt_id: Option<String>,
@@ -142,7 +142,7 @@ pub struct ReportArgs {
     pub session_id: Option<String>,
 
     #[arg(long)]
-    pub pearl_id: Option<String>,
+    pub task_id: Option<String>,
 
     #[arg(long)]
     pub attempt_id: Option<String>,

@@ -126,8 +126,9 @@ pub struct ExecutionContext {
     pub program_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Generic work-item identifier supplied by a wrapper orchestrator.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pearl_id: Option<String>,
+    pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

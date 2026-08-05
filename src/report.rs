@@ -189,8 +189,8 @@ fn apply_overrides(
             if exec.session_id.is_some() {
                 cur.session_id = exec.session_id;
             }
-            if exec.pearl_id.is_some() {
-                cur.pearl_id = exec.pearl_id;
+            if exec.task_id.is_some() {
+                cur.task_id = exec.task_id;
             }
             if exec.attempt_id.is_some() {
                 cur.attempt_id = exec.attempt_id;

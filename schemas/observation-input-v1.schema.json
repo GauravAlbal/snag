@@ -67,7 +67,7 @@
             "workspace_id": { "type": ["string", "null"] },
             "program_id": { "type": ["string", "null"] },
             "session_id": { "type": ["string", "null"] },
-            "pearl_id": { "type": ["string", "null"] },
+            "task_id": { "type": ["string", "null"] },
             "attempt_id": { "type": ["string", "null"] },
             "authority_sequence": { "type": ["integer", "null"], "minimum": 0 },
             "tool_name": { "type": ["string", "null"] },

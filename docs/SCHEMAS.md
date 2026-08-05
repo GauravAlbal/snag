@@ -92,12 +92,13 @@ under `extra`.
 
 ## Legacy-compatible extension fields
 
-`execution.workspace_id`, `execution.program_id`, `execution.pearl_id`,
+`execution.workspace_id`, `execution.program_id`, `execution.task_id`,
 `execution.attempt_id`, and `execution.authority_sequence` are optional
 extension fields used by wrapper orchestrators. They are part of the schema
 for backward compatibility but are **not** the primary public contract —
 generic wrappers should prefer `session_id`, `tool_name`, `tool_invocation_id`,
-`command_shape`, and `extra`.
+`command_shape`, and `extra`. `task_id` is a generic work-item identifier: a
+wrapper that tracks the task an agent was executing may attach it here.
 
 ## Validating a context file
 
