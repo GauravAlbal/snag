@@ -88,8 +88,8 @@ threat model", never for silence.
 ## License and Developer Certificate of Origin
 
 Snag is licensed under the **Apache License 2.0** — see [LICENSE](LICENSE).
-"Snag" and the Snag logo are governed by the
-[trademark policy](TRADEMARKS.md).
+The name "Snag" is the OSS command and repository identifier; see the
+[naming and attribution policy](TRADEMARKS.md).
 
 Contributions are accepted under the **Developer Certificate of Origin 1.1**
 ([DCO](https://developercertificate.org/)): every commit must carry a

@@ -246,7 +246,8 @@ the [Contributor Covenant](CODE_OF_CONDUCT.md). Support: [SUPPORT.md](SUPPORT.md
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). "Snag" and the Snag logo are
-protected by [trademark policy](TRADEMARKS.md). Contributions are accepted
-under the Developer Certificate of Origin (signed-off commits, see
+Apache-2.0 — see [LICENSE](LICENSE). The name "Snag" is the OSS command and
+repository identifier; see [naming and attribution](TRADEMARKS.md) for how
+the name may be used. Contributions are accepted under the Developer
+Certificate of Origin (signed-off commits, see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
