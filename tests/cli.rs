@@ -1004,3 +1004,144 @@ fn test_doctor_reports_paths_and_version() {
         .stdout(predicate::str::contains("Context file:"))
         .stdout(predicate::str::contains("(not set)"));
 }
+
+/// repro_key: every report carries a deterministic localization label that
+/// survives idempotent replays (stable across same-key replays, distinct
+/// across distinct content) and is excluded from the semantic digest.
+#[test]
+fn repro_key_is_labeled_deterministic_and_distinct() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |title: &str, ik: Option<&str>| {
+        let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.arg("report")
+            .arg(title)
+            .arg("--kind")
+            .arg("bug")
+            .arg("--severity")
+            .arg("minor");
+        if let Some(k) = ik {
+            c.arg("--idempotency-key").arg(k);
+        }
+        c.output().unwrap()
+    };
+    let out1 = run("repro key test", Some("ik_rk"));
+    assert!(out1.status.success());
+    let text1 = String::from_utf8(out1.stdout).unwrap();
+    let key1 = text1
+        .lines()
+        .find_map(|l| l.strip_prefix("repro key: "))
+        .expect("repro key printed")
+        .to_string();
+    assert_eq!(key1.len(), 24);
+
+    // Idempotent replay: no duplicate, same key.
+    let out2 = run("repro key test", Some("ik_rk"));
+    assert!(
+        String::from_utf8(out2.stdout)
+            .unwrap()
+            .contains("already exists")
+    );
+    let conn = rusqlite::Connection::open(home.path().join("snag/snag.sqlite")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observations WHERE title = 'repro key test'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let stored: String = conn
+        .query_row("SELECT json_extract(labels_json, '$.repro_key') FROM observations WHERE title = 'repro key test'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, key1);
+
+    // Distinct content gets a distinct key.
+    let out3 = run("different repro content", None);
+    let key3 = String::from_utf8(out3.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("repro key: "))
+        .expect("repro key printed")
+        .to_string();
+    assert_ne!(key1, key3);
+}
+
+/// Severity microcopy: a high-severity assertion with a thin body prints the
+/// inflation nudge; a full-bodied report does not.
+#[test]
+fn thin_high_severity_report_nudges() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.arg("report");
+        for a in args {
+            c.arg(a);
+        }
+        c.output().unwrap()
+    };
+    let out = run(&["thin blocker", "--kind", "bug", "--severity", "blocker"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("severity is a prior"),
+        "nudge expected: {text}"
+    );
+
+    let out = run(&[
+        "full major",
+        "--kind",
+        "bug",
+        "--severity",
+        "major",
+        "--expected",
+        "x",
+        "--observed",
+        "y",
+    ]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !text.contains("severity is a prior"),
+        "no nudge for a full body: {text}"
+    );
+}
+
+/// Observation ids resolve by unique prefix (GitHub-style) across show and
+/// retract; ambiguity and misses are typed errors.
+#[test]
+fn prefix_observation_ids_resolve() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        for a in args {
+            c.arg(a);
+        }
+        c.output().unwrap()
+    };
+    let out = run(&["report", "prefix-a", "--kind", "bug", "--severity", "minor"]);
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("Recorded "))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("obs id")
+        .to_string();
+    run(&["report", "prefix-b", "--kind", "bug", "--severity", "minor"]);
+
+    // Unique prefix resolves for show.
+    let out = run(&["show", &id[..14]]);
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains(&id));
+
+    // Missing prefix is a typed not-found.
+    let out = run(&["show", "obs_zzz"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stderr).unwrap().contains("Not found"));
+
+    // Retract by prefix works.
+    let out = run(&["retract", &id[..14]]);
+    assert!(out.status.success());
+}

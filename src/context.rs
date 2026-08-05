@@ -83,6 +83,37 @@ fn build_source() -> SourceInfo {
 }
 
 /// Overlay repository fields present in the context file.
+/// Overlay a context-file source over the environment-derived base, field by
+/// field (only present fields replace). Matches the repository/execution
+/// merge semantics — a partial context file must not wipe fields the
+/// environment already established (e.g. `SNAG_SOURCE_KIND`).
+fn merge_source_context(base: &mut SourceInfo, src: SourceInfo) {
+    // `kind` is a required SourceInfo field: when the context file names a
+    // source object it always carries a kind, so it always overlays.
+    base.kind = src.kind;
+    if let Some(s) = src.system {
+        base.system = Some(s);
+    }
+    if let Some(r) = src.reporter_id {
+        base.reporter_id = Some(r);
+    }
+    if let Some(a) = src.agent_runtime {
+        base.agent_runtime = Some(a);
+    }
+    if let Some(a) = src.agent_name {
+        base.agent_name = Some(a);
+    }
+    if let Some(m) = src.model {
+        base.model = Some(m);
+    }
+    if let Some(d) = src.detector_id {
+        base.detector_id = Some(d);
+    }
+    if let Some(d) = src.detector_version {
+        base.detector_version = Some(d);
+    }
+}
+
 fn merge_repo_context(repo_ctx: &mut RepositoryContext, repo: RepositoryContext) {
     if let Some(rid) = repo.repository_id {
         repo_ctx.repository_id = Some(rid);
@@ -149,8 +180,11 @@ fn merge_context_file(
     }
 
     if let Some(src) = parsed.source {
-        // Context file overrides environment
-        *source = src;
+        // Context file overlays individual source fields (matching the
+        // repository/execution merge behavior) instead of replacing the whole
+        // struct: SNAG_SOURCE_KIND from the environment survives unless the
+        // context file names its own kind.
+        merge_source_context(source, src);
     }
     if let Some(repo) = parsed.repository {
         merge_repo_context(repo_ctx, repo);
@@ -256,4 +290,40 @@ pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_source_merges_field_by_field() {
+        // Environment-derived base: kind from SNAG_SOURCE_KIND.
+        let mut base = SourceInfo {
+            kind: "agent_explicit".to_string(),
+            system: None,
+            reporter_id: Some("env_reporter".to_string()),
+            agent_runtime: None,
+            agent_name: None,
+            model: None,
+            detector_id: None,
+            detector_version: None,
+        };
+        // A partial context-file source: only kind + agent_runtime present.
+        let partial = SourceInfo {
+            kind: "agent_report".to_string(),
+            system: None,
+            reporter_id: None,
+            agent_runtime: Some("omp".to_string()),
+            agent_name: None,
+            model: None,
+            detector_id: None,
+            detector_version: None,
+        };
+        merge_source_context(&mut base, partial);
+        assert_eq!(base.kind, "agent_report");
+        assert_eq!(base.reporter_id.as_deref(), Some("env_reporter"));
+        assert_eq!(base.agent_runtime.as_deref(), Some("omp"));
+        assert_eq!(base.system, None);
+    }
 }
