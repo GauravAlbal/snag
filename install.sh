@@ -63,11 +63,13 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS:$ARCH" in
   Darwin:arm64) TRIPLE="aarch64-apple-darwin" ;;
-  Darwin:x86_64) TRIPLE="x86_64-apple-darwin" ;;
+  Darwin:x86_64)
+    err "macOS x86_64 binaries are not published (Apple Silicon or --from-source required)"
+    exit 2 ;;
   Linux:x86_64) TRIPLE="x86_64-unknown-linux-gnu" ;;
   Linux:aarch64|Linux:arm64) TRIPLE="aarch64-unknown-linux-gnu" ;;
   *)
-    err "unsupported platform: $OS $ARCH (supported: macOS arm64/x86_64, Linux x86_64/aarch64)"
+    err "unsupported platform: $OS $ARCH (supported: macOS arm64, Linux x86_64/aarch64)"
     exit 2 ;;
 esac
 

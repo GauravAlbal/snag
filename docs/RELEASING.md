@@ -43,7 +43,7 @@ git push origin master --tags
 
 Pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which:
 
-1. Builds release binaries for macOS (arm64, x86_64) and Linux (x86_64,
+1. Builds release binaries for macOS (arm64) and Linux (x86_64,
    aarch64).
 2. Captures `snag --version` output for each build.
 3. Generates `SHA256SUMS.txt` over all artifacts, a `source-sha.txt` with the

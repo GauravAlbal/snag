@@ -37,8 +37,8 @@ install?
 cargo install --git https://github.com/GauravAlbal/snag
 ```
 
-Release binaries are published for macOS (arm64, x86_64) and Linux (x86_64,
-aarch64), each with a SHA256SUMS.txt and the source SHA of the build.
+Release binaries are published for macOS (arm64) and Linux (x86_64, aarch64),
+each with a SHA256SUMS.txt and the source SHA of the build.
 
 ## Thirty-second example
 

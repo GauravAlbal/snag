@@ -22,7 +22,7 @@ the release process.
   (stdlib-only Python: header validation, sequence contiguity, checkpointing).
 - **One-line installer** (`install.sh`): downloads the platform release binary
   from GitHub Releases and verifies its SHA-256 checksum.
-- **CI matrix** over macOS arm64/x86_64 and Linux x86_64/aarch64, plus
+- **CI matrix** over macOS arm64 and Linux x86_64/aarch64, plus
   `cargo deny` and `cargo audit` dependency gates.
 - **Release workflow**: four-platform binaries, SHA-256 checksums, source-SHA
   provenance, version output, best-effort CycloneDX SBOM.
