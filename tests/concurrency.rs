@@ -53,12 +53,18 @@ fn test_32_concurrent_writers() {
         c.arg("report")
             .arg(format!("concurrent-{}", i))
             .env("XDG_DATA_HOME", ctx.home_dir.path())
-            .env("HOME", ctx.home_dir.path());
+            .env("HOME", ctx.home_dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         children.push(c.spawn().unwrap());
     }
-    for mut c in children {
-        let status = c.wait().unwrap();
-        assert!(status.success(), "a concurrent writer failed");
+    for c in children {
+        let out = c.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "a concurrent writer failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     assert_eq!(

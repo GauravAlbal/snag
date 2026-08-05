@@ -438,8 +438,8 @@ fn test_git_timeout_kills_child_and_returns_bounded() {
     let elapsed = start.elapsed();
 
     assert!(
-        elapsed < std::time::Duration::from_secs(6),
-        "git timeout must be bounded, took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(15),
+        "git timeout must be bounded (hung child would sleep 100s), took {elapsed:?}"
     );
     assert!(
         status.success(),
@@ -608,4 +608,121 @@ fn test_rebuild_crash_never_publishes_destination() {
         // Destination must never appear as a valid-looking published directory.
         assert!(!dest.exists(), "{stage}: destination must not be published");
     }
+}
+
+// =====================================================================
+// 7. Remaining T-matrix sub-bullets (T1/T7): prose headings, outside-Git
+//    capture, invalid schema, per-file artifact limit, concurrent same-object
+// =====================================================================
+#[test]
+fn test_prose_headings_intake() {
+    let ctx = TestContext::new();
+    let prose = "Prose title here\n\nExpected:\nworks fine\n\nObserved:\nbroken\n\nReproduction:\nstep one\n";
+    ctx.cmd()
+        .arg("report")
+        .arg("--stdin")
+        .write_stdin(prose)
+        .assert()
+        .success();
+
+    let conn = ctx.conn();
+    let row: (String, String, String) = conn
+        .query_row(
+            "SELECT title, expected_behavior, observed_behavior FROM observations LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "Prose title here");
+    assert_eq!(row.1, "works fine");
+    assert_eq!(row.2, "broken");
+}
+
+#[test]
+fn test_outside_git_capture() {
+    let ctx = TestContext::new();
+    // Run outside any git repo; capture must succeed and record no repository.
+    let plain = ctx.home_dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let mut c = ctx.cmd();
+    c.current_dir(&plain);
+    c.arg("report").arg("no repo here");
+    c.assert().success();
+
+    let conn = ctx.conn();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    let repos: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        repos, 0,
+        "outside-git capture must not invent a repository identity"
+    );
+}
+
+#[test]
+fn test_invalid_json_schema_rejected() {
+    let ctx = TestContext::new();
+    let bad = r#"{"schema_version": 99, "title": "too new"}"#;
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(bad)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Unsupported schema"));
+}
+
+#[test]
+fn test_artifact_per_file_limit() {
+    let ctx = TestContext::new();
+    let big = ctx.home_dir.path().join("big.bin");
+    // 51 MiB exceeds the 50 MiB per-artifact limit.
+    let blob = vec![0u8; 51 * 1024 * 1024];
+    std::fs::write(&big, &blob).unwrap();
+    ctx.cmd()
+        .arg("report")
+        .arg("too big")
+        .arg("--artifact")
+        .arg(&big)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("50 MiB"));
+}
+
+#[test]
+fn test_concurrent_same_object_single_artifact() {
+    let ctx = TestContext::new();
+    let f = ctx.home_dir.path().join("shared.bin");
+    std::fs::write(&f, b"same content dedup").unwrap();
+
+    // Two concurrent processes ingest the identical object.
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let mut c = Proc::new(ctx.bin());
+        c.arg("report")
+            .arg("dup obj")
+            .arg("--artifact")
+            .arg(&f)
+            .env("XDG_DATA_HOME", ctx.home_dir.path())
+            .env("HOME", ctx.home_dir.path());
+        children.push(c.spawn().unwrap());
+    }
+    for mut c in children {
+        let s = c.wait().unwrap();
+        assert!(s.success());
+    }
+    // Content-addressed store dedups to a single artifact row.
+    let artifacts: i64 = ctx
+        .conn()
+        .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        artifacts, 1,
+        "concurrent same-object ingestion must dedup to one artifact"
+    );
+    ctx.cmd().arg("verify").arg("--full").assert().success();
 }

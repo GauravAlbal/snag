@@ -34,7 +34,9 @@ pub struct RepositoryResolution {
 /// does not exist it is created (documented rule: the caller explicitly names
 /// the repository, so the identity is created and linked).
 fn ensure_explicit_repo(store: &mut Store, id: &str, now: &str) -> anyhow::Result<String> {
-    let tx = store.conn.transaction()?;
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let exists: i64 = tx.query_row(
         "SELECT COUNT(*) FROM repositories WHERE repository_id = ?1",
         params![id],
@@ -80,7 +82,10 @@ fn ensure_checkout_for(
     now: &str,
 ) -> Option<String> {
     let git_common_dir = git_ctx.git_common_dir.clone()?;
-    let conn = store.conn.transaction().ok()?;
+    let conn = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .ok()?;
     let existing: Option<String> = conn
         .query_row(
             "SELECT checkout_id FROM checkouts WHERE git_common_dir = ?1",
@@ -114,7 +119,10 @@ fn ensure_worktree_for(
 ) -> Option<String> {
     let checkout_id = checkout_id?;
     let root = git_ctx.repository_root.clone()?;
-    let conn = store.conn.transaction().ok()?;
+    let conn = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .ok()?;
     if let Ok(Some(wt)) = conn
         .query_row(
             "SELECT worktree_id FROM worktrees WHERE worktree_path = ?1",
@@ -163,7 +171,9 @@ pub fn resolve_repository(
     } else if let Some(dir) = &git_ctx.git_common_dir {
         // 4. Known checkout binding.
         let existing: Option<String> = {
-            let tx = store.conn.transaction()?;
+            let tx = store
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.query_row(
                 "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
                 params![dir],
@@ -179,7 +189,9 @@ pub fn resolve_repository(
                 Some(rid) => rid,
                 None => {
                     // 6. New identity.
-                    let tx = store.conn.transaction()?;
+                    let tx = store
+                        .conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     let rid = generate_id("repo");
                     tx.execute(
                         "INSERT INTO repositories (repository_id, created_at) VALUES (?1, ?2)",
@@ -221,7 +233,9 @@ pub fn resolve_repository(
 /// (G30: multiple matches must not silently choose the first).
 fn unique_alias_match(store: &mut Store, aliases: &[String]) -> anyhow::Result<Option<String>> {
     let mut candidates: Vec<String> = Vec::new();
-    let tx = store.conn.transaction()?;
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for alias in aliases {
         let norm = normalize_remote_alias(alias);
         let mut stmt = tx.prepare(
@@ -296,7 +310,9 @@ pub fn resolve_affected_repository(
     }
 
     // Repository ID form.
-    let tx = store.conn.transaction()?;
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let exists: i64 = tx.query_row(
         "SELECT COUNT(*) FROM repositories WHERE repository_id = ?1",
         params![value],

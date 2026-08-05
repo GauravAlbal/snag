@@ -3,14 +3,24 @@ use rusqlite::{Connection, Result};
 /// Writer connection: may mutate journal mode and schema. Called on r/w opens
 /// and on migration paths.
 pub fn initialize_writer_connection(conn: &Connection) -> Result<()> {
+    // Configure the busy timeout BEFORE any lock-taking statement so every
+    // concurrent writer waits instead of failing fast under contention.
     conn.execute_batch(
         "
-        PRAGMA journal_mode = WAL;
         PRAGMA synchronous = FULL;
         PRAGMA foreign_keys = ON;
         PRAGMA busy_timeout = 30000;
         ",
     )?;
+    // journal_mode=WAL is a persistent, one-time DB property. Only attempt to
+    // set it on a store that is not already WAL; forcing it on every open makes
+    // 32 concurrent first-opens hammer the same lock and surface SQLITE_BUSY.
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        // Best-effort: if a concurrent writer is mid-transition, the next open
+        // will already find it WAL (set by the process that created it).
+        let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
+    }
     Ok(())
 }
 
@@ -39,7 +49,12 @@ pub fn init_connection(conn: &Connection) -> Result<()> {
 }
 
 pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
-    let tx = conn.transaction()?;
+    // Run under an EXCLUSIVE transaction so that when a fresh store is first
+    // opened by several processes concurrently, exactly one applies the
+    // migration chain; the others block and then observe the already-committed
+    // schema version instead of re-running (and conflicting over) the same
+    // migrations.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
 
     // Create migrations table if not exists
     tx.execute(
