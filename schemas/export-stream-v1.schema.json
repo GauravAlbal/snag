@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/13banditos/snag/blob/master/schemas/export-stream-v1.schema.json",
+  "$id": "https://github.com/GauravAlbal/snag/blob/master/schemas/export-stream-v1.schema.json",
   "title": "Snag export stream, version 1",
   "description": "One JSONL line of a `snag export` stream. The first line is an export header; every subsequent line is a record envelope. Downstream systems must consume this stream — never open snag.sqlite directly. The stream is deterministic: identical store state and bounds produce byte-identical output.",
   "type": "object",

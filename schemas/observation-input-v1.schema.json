@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/13banditos/snag/blob/master/schemas/observation-input-v1.schema.json",
+  "$id": "https://github.com/GauravAlbal/snag/blob/master/schemas/observation-input-v1.schema.json",
   "title": "Snag observation input, version 1",
   "description": "A JSON observation document accepted by `snag report --json` (from stdin or a file path). Unknown top-level fields are ignored by the reader (documented compatibility rule), so wrappers may attach their own keys. Only schema_version and title are required; everything else is optional.",
   "type": "object",

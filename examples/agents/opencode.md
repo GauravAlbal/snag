@@ -6,7 +6,7 @@ with evidence so findings survive the session.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/13banditos/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
 ```
 
 ## Instruction block

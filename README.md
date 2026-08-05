@@ -26,7 +26,7 @@ instruction block plus an optional context file, nothing more.
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/13banditos/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
 ```
 
 The installer downloads the platform binary from the latest GitHub release,
@@ -34,7 +34,7 @@ verifies its SHA-256 checksum, and puts `snag` on your PATH. Prefer a manual
 install?
 
 ```bash
-cargo install --git https://github.com/13banditos/snag
+cargo install --git https://github.com/GauravAlbal/snag
 ```
 
 Release binaries are published for macOS (arm64, x86_64) and Linux (x86_64,

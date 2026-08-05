@@ -25,9 +25,9 @@ cargo test --all-targets --all-features --no-fail-fast
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/13banditos/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/master/install.sh | bash
 # or
-cargo install --git https://github.com/13banditos/snag
+cargo install --git https://github.com/GauravAlbal/snag
 # or build from this checkout
 cargo install --path .
 ```

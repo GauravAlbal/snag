@@ -72,5 +72,5 @@ Certified v0.1.0 — 59-test surface, three hard gates, tag `v0.1.0`.
 - **Testing**: 59 tests across cli, git_identity, migration, concurrency,
   robustness suites; GitHub Actions CI.
 
-[Unreleased]: https://github.com/13banditos/snag/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/13banditos/snag/releases/tag/v0.1.0
+[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/GauravAlbal/snag/releases/tag/v0.1.0
