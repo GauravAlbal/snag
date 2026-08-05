@@ -35,17 +35,42 @@ impl Store {
         
         let tx = conn.transaction()?;
         tx.commit()?;
+
+        // G33: preserve a forensic copy before any v1->v2 migration so the old
+        // database remains recoverable if the migration fails.
+        let pre_migration_version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap_or(0);
+        if pre_migration_version < 2 {
+            let forensics = data_dir.join("forensics");
+            fs::create_dir_all(&forensics)?;
+            let ts = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339).unwrap()
+                .replace(':', "");
+            let copy = forensics.join(format!("pre-v2-migration-{}.sqlite", ts));
+            let _ = fs::copy(&db_path, &copy);
+        }
         
         apply_migrations(&mut conn)?;
 
         let store_id = Self::ensure_store_id(&conn)?;
 
-        Ok(Self {
+        let store = Self {
             conn,
             store_id,
             data_dir: data_dir.clone(),
-            db_path,
-        })
+            db_path: db_path.clone(),
+        };
+
+        // G33: verify the full resulting store immediately after a migration.
+        if pre_migration_version < 2 {
+            let mut s = store;
+            crate::verify::full_verify(&mut s)
+                .context("migration produced an invalid store; original preserved in forensics/")?;
+            return Ok(s);
+        }
+
+        Ok(store)
     }
 
     pub fn open_read_write() -> Result<Self> {
