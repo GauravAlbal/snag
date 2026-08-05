@@ -812,6 +812,7 @@ dependencies = [
  "clap",
  "directories",
  "flate2",
+ "libc",
  "predicates",
  "rusqlite",
  "serde",
