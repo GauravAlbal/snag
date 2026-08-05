@@ -68,6 +68,11 @@ impl Cli {
             Some(Command::List(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Context(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Export(args)) => args.format.as_deref() == Some("json"),
+            Some(Command::Review(cmd)) => match cmd {
+                ReviewCommand::Next(args) => args.format.as_deref() == Some("agent"),
+                ReviewCommand::List(args) => args.format.as_deref() == Some("json"),
+                _ => false,
+            },
             Some(_) => false,
             None => self.json,
         }
@@ -101,6 +106,9 @@ pub enum Command {
     Restore(RestoreArgs),
     /// Rebuilds the database from an export stream
     Rebuild(RebuildArgs),
+    /// Remediation queue: retrieval, claim leases, adjudication, lineage
+    #[command(subcommand)]
+    Review(ReviewCommand),
 }
 
 #[derive(Args)]
@@ -254,4 +262,131 @@ pub struct RebuildArgs {
 
     #[arg(long)]
     pub destination: PathBuf,
+}
+
+/// `snag review …` — the remediation interface. All mutations are append-only
+/// records in the global stream; claims are leases, not ownership.
+#[derive(Subcommand)]
+pub enum ReviewCommand {
+    /// Pull the next unhandled observation matching the filters
+    Next(ReviewNextArgs),
+    /// Acquire a claim lease on an observation
+    Claim(ReviewClaimArgs),
+    /// Release an active claim lease
+    Release(ReviewReleaseArgs),
+    /// Extend an active claim lease
+    Heartbeat(ReviewHeartbeatArgs),
+    /// List observations with their review state
+    List(ReviewListArgs),
+}
+
+#[derive(Args)]
+pub struct ReviewNextArgs {
+    /// Restrict to a repository (id, alias, or `current`)
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Restrict to an asserted kind
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Restrict to an asserted severity
+    #[arg(long)]
+    pub severity: Option<String>,
+
+    /// Only observations with no review activity yet
+    #[arg(long)]
+    pub unreviewed: bool,
+
+    /// Include observations deferred by a prior disposition
+    #[arg(long)]
+    pub include_deferred: bool,
+
+    /// Output format: `agent` (versioned JSON packet) or `text` (default)
+    #[arg(long)]
+    pub format: Option<String>,
+
+    /// Claim the returned observation atomically (fold-in: with --task,
+    /// link the claim to owned work in the same step)
+    #[arg(long)]
+    pub claim: bool,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewClaimArgs {
+    pub observation_id: String,
+
+    /// Lease duration (e.g. 30m, 2h); default from SNAG_REVIEW_LEASE or 30m
+    #[arg(long)]
+    pub lease: Option<String>,
+
+    /// Link the claim to an owned work item (the "fixing in <task>" marker)
+    #[arg(long)]
+    pub task: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewReleaseArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewHeartbeatArgs {
+    pub observation_id: String,
+
+    /// Lease duration for the extension (e.g. 30m); default SNAG_REVIEW_LEASE
+    /// or 30m
+    #[arg(long)]
+    pub lease: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewListArgs {
+    /// Only observations claimed by this reviewer/session
+    #[arg(long)]
+    pub claimed_by: Option<String>,
+
+    /// Only observations with this disposition
+    #[arg(long)]
+    pub disposition: Option<String>,
+
+    /// Only observations in this derived state
+    #[arg(long)]
+    pub status: Option<String>,
+
+    #[arg(long)]
+    pub handled: bool,
+
+    #[arg(long)]
+    pub unhandled: bool,
+
+    #[arg(long)]
+    pub format: Option<String>,
 }

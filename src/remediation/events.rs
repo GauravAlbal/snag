@@ -7,6 +7,9 @@
 //! key. The canonical record kernel hashes the full envelope, so remediation
 //! events are covered by the same tamper-evidence as observations.
 
+use crate::record::{CanonicalRecordV1, RecordPayload};
+use crate::types::generate_id;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -434,6 +437,126 @@ pub fn payload_created_at(payload: &crate::record::RecordPayload) -> Option<&str
         },
         _ => None,
     }
+}
+
+/// Outcome of appending (or replaying) one remediation event.
+#[derive(Debug, Clone)]
+pub struct AppendedEvent {
+    pub record_id: String,
+    pub local_sequence: i64,
+    pub record_hash: String,
+    /// True when the event was a same-key/same-payload replay (no new row).
+    pub replayed: bool,
+}
+
+/// Append one remediation event to the global record stream inside `tx`.
+///
+/// Idempotency: when the payload carries an `idempotency_key`, a prior record
+/// of the same type with the same key is looked up by JSON extraction. An
+/// identical payload replays (returns the existing record, no new row); a
+/// different payload is a typed conflict.
+///
+/// Failpoints: `remediation_after_record_alloc` fires after the sequence and
+/// predecessor are allocated; `remediation_after_event_insert` after the
+/// records row lands (crash injection tests prove both observable outcomes:
+/// zero events or one complete event).
+pub fn append_event(
+    tx: &rusqlite::Transaction,
+    store_id: &str,
+    record_type: &str,
+    entity_id: &str,
+    payload: RecordPayload,
+) -> anyhow::Result<AppendedEvent> {
+    let idem = payload_idempotency_key(&payload);
+    if let Some(ik) = idem {
+        let mut stmt = tx.prepare(
+            "SELECT record_id, local_sequence, record_hash, canonical_payload_json
+             FROM records
+             WHERE record_type = ?1 AND json_extract(canonical_payload_json, '$.idempotency_key') = ?2
+             ORDER BY local_sequence ASC LIMIT 1",
+        )?;
+        let existing = stmt
+            .query_row(rusqlite::params![record_type, ik], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()?;
+        if let Some((old_id, old_seq, old_hash, old_payload_json)) = existing {
+            let old_payload: RecordPayload = serde_json::from_str(&old_payload_json)?;
+            if old_payload == payload {
+                return Ok(AppendedEvent {
+                    record_id: old_id,
+                    local_sequence: old_seq,
+                    record_hash: old_hash,
+                    replayed: true,
+                });
+            }
+            anyhow::bail!(crate::error::SnagError::IdempotencyConflict(format!(
+                "idempotency key {ik} already used with a different remediation payload"
+            )));
+        }
+    }
+
+    let local_sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM records",
+        [],
+        |row| row.get(0),
+    )?;
+    let previous_record_hash: String = tx
+        .query_row(
+            "SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        });
+    crate::failpoint::failpoint("remediation_after_record_alloc");
+
+    let record_id = generate_id("rec");
+    // The record's captured_at is the payload's created_at (the command
+    // stamps both at the same instant), so the canonical kernel and the
+    // payload never disagree about the event time.
+    let captured_at = payload_created_at(&payload)
+        .map(str::to_string)
+        .unwrap_or_else(crate::remediation::identity::utc_now);
+    let canonical_record = CanonicalRecordV1 {
+        local_sequence: local_sequence as u64,
+        record_id: record_id.clone(),
+        record_type: record_type.to_string(),
+        entity_id: entity_id.to_string(),
+        captured_at: captured_at.clone(),
+        payload,
+    };
+    let payload_json = serde_json::to_string(&canonical_record.payload)?;
+    let record_hash = canonical_record.compute_hash(store_id, &previous_record_hash);
+
+    tx.execute(
+        "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            local_sequence,
+            &record_id,
+            record_type,
+            entity_id,
+            &captured_at,
+            &payload_json,
+            &previous_record_hash,
+            &record_hash,
+        ],
+    )?;
+    crate::failpoint::failpoint("remediation_after_event_insert");
+
+    Ok(AppendedEvent {
+        record_id,
+        local_sequence,
+        record_hash,
+        replayed: false,
+    })
 }
 
 #[cfg(test)]
