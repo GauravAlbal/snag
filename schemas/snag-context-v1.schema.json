@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/13banditos/snag/blob/master/schemas/snag-context-v1.schema.json",
+  "title": "Snag context file (SNAG_CONTEXT_FILE), version 1",
+  "description": "Optional session context attached to a `snag report`, read from the file named by the SNAG_CONTEXT_FILE environment variable. Every field is optional except schema_version. Unknown top-level keys are ignored by the reader (documented compatibility rule); a schema_version other than 1 is rejected with a typed error.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "source": {
+      "description": "Who or what produced the observation. Overrides the environment-derived source.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "kind": { "type": "string" },
+        "system": { "type": ["string", "null"] },
+        "reporter_id": { "type": ["string", "null"] },
+        "agent_runtime": { "type": ["string", "null"] },
+        "agent_name": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "detector_id": { "type": ["string", "null"] },
+        "detector_version": { "type": ["string", "null"] }
+      }
+    },
+    "execution": {
+      "description": "Execution context. workspace_id, program_id, pearl_id, attempt_id, and authority_sequence are legacy-compatible optional extensions used by wrapper orchestrators; they are not part of the primary public contract.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "cwd": { "type": ["string", "null"] },
+        "workspace_id": { "type": ["string", "null"] },
+        "program_id": { "type": ["string", "null"] },
+        "session_id": { "type": ["string", "null"] },
+        "pearl_id": { "type": ["string", "null"] },
+        "attempt_id": { "type": ["string", "null"] },
+        "authority_sequence": { "type": ["integer", "null"], "minimum": 0 },
+        "tool_name": { "type": ["string", "null"] },
+        "tool_invocation_id": { "type": ["string", "null"] },
+        "command_shape": { "type": ["string", "null"] }
+      }
+    },
+    "repository": {
+      "description": "Repository identity overrides. Values present here replace the corresponding auto-detected git identity.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "repository_id": { "type": ["string", "null"] },
+        "checkout_id": { "type": ["string", "null"] },
+        "worktree_id": { "type": ["string", "null"] },
+        "repository_root": { "type": ["string", "null"] },
+        "git_common_dir": { "type": ["string", "null"] },
+        "git_head": { "type": ["string", "null"] },
+        "git_branch": { "type": ["string", "null"] },
+        "git_remote_aliases": { "type": "array", "items": { "type": "string" } },
+        "relative_cwd": { "type": ["string", "null"] }
+      }
+    },
+    "extra": {
+      "description": "Free-form wrapper data persisted verbatim on the observation. Prefer this over inventing top-level keys.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "idempotency_key": { "type": ["string", "null"] }
+  }
+}

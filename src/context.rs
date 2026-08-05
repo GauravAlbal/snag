@@ -56,6 +56,9 @@ fn build_exec_context(args: &ReportArgs, cwd: &std::path::Path) -> ExecutionCont
 /// Shape of the optional `SNAG_CONTEXT_FILE` document.
 #[derive(Deserialize)]
 struct ContextFile {
+    /// Protocol version of the context document. Must be 1 (or absent for
+    /// backward-compatible writers); a future major version is rejected.
+    schema_version: Option<u32>,
     source: Option<SourceInfo>,
     execution: Option<ExecutionContext>,
     repository: Option<RepositoryContext>,
@@ -136,6 +139,12 @@ fn merge_context_file(
     })?;
     let parsed: ContextFile = serde_json::from_str(&content)
         .map_err(|e| SnagError::ContextFileInvalid(format!("Invalid context file JSON: {}", e)))?;
+
+    if let Some(sv) = parsed.schema_version
+        && sv != 1
+    {
+        return Err(SnagError::UnsupportedSchema(sv.to_string()).into());
+    }
 
     if let Some(src) = parsed.source {
         // Context file overrides environment
@@ -237,7 +246,9 @@ pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
     let (_, ctx, _) = gather_context(&dummy_args)?;
 
     if args.format.as_deref() == Some("json") {
-        println!("{}", serde_json::to_string_pretty(&ctx)?);
+        // Versioned envelope: consumers must key on `schema_version`.
+        let envelope = serde_json::json!({ "schema_version": 1, "context": ctx });
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
         println!("{:#?}", ctx);
     }

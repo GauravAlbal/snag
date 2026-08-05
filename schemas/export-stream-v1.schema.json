@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/13banditos/snag/blob/master/schemas/export-stream-v1.schema.json",
+  "title": "Snag export stream, version 1",
+  "description": "One JSONL line of a `snag export` stream. The first line is an export header; every subsequent line is a record envelope. Downstream systems must consume this stream — never open snag.sqlite directly. The stream is deterministic: identical store state and bounds produce byte-identical output.",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "Export header (first line)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "export_kind",
+        "export_schema_version",
+        "minimum_reader_version",
+        "store_id",
+        "first_sequence",
+        "through_sequence",
+        "previous_checkpoint_hash",
+        "head_record_hash",
+        "record_count"
+      ],
+      "properties": {
+        "export_kind": { "const": "export_header" },
+        "export_schema_version": { "const": 1 },
+        "minimum_reader_version": { "const": 1 },
+        "store_id": { "type": "string" },
+        "first_sequence": { "type": "integer", "minimum": 0 },
+        "through_sequence": { "type": "integer", "minimum": 0 },
+        "previous_checkpoint_hash": { "type": "string", "pattern": "^(blake3:[0-9a-f]{64}|0{64})$" },
+        "head_record_hash": { "type": "string", "pattern": "^(blake3:[0-9a-f]{64}|0{64})$" },
+        "record_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    {
+      "title": "Record envelope (subsequent lines)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "export_kind",
+        "record_schema_version",
+        "local_sequence",
+        "record_id",
+        "record_type",
+        "entity_id",
+        "captured_at",
+        "canonical_payload",
+        "previous_record_hash",
+        "record_hash"
+      ],
+      "properties": {
+        "export_kind": { "const": "record" },
+        "record_schema_version": { "const": 1 },
+        "local_sequence": { "type": "integer", "minimum": 1 },
+        "record_id": { "type": "string" },
+        "record_type": { "enum": ["observation_created", "observation_retracted"] },
+        "entity_id": { "type": "string" },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "canonical_payload": {
+          "description": "The canonical record payload. For observation_created records this is the observation document (see observation-input-v1.schema.json plus store-assigned fields observation_id, store_id, local_sequence, created_at, sensitivity, context, artifacts, affected_repository_ids).",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "previous_record_hash": { "type": "string", "pattern": "^(blake3:[0-9a-f]{64}|0{64})$" },
+        "record_hash": { "type": "string", "pattern": "^(blake3:[0-9a-f]{64}|0{64})$" }
+      }
+    }
+  ]
+}
