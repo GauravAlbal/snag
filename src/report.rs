@@ -818,8 +818,49 @@ pub fn list(args: crate::cli::ListArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn show(args: crate::cli::ShowArgs) -> anyhow::Result<()> {
+/// Resolve a possibly-abbreviated observation id: an exact match wins; a
+/// unique prefix of the full id (`obs_01kz8…` abbreviated) resolves;
+/// ambiguity and misses are typed errors. Keeps the CLI usable when agents
+/// copy/truncate ids mid-session (GitHub-style short ids).
+fn resolve_observation_id(conn: &rusqlite::Connection, input: &str) -> anyhow::Result<String> {
+    use rusqlite::OptionalExtension;
+    let exact: Option<String> = conn
+        .query_row(
+            "SELECT observation_id FROM observations WHERE observation_id = ?1",
+            rusqlite::params![input],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = exact {
+        return Ok(id);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT observation_id FROM observations WHERE observation_id LIKE ?1 ORDER BY observation_id",
+    )?;
+    let rows: Vec<String> = {
+        let matches = stmt.query_map(rusqlite::params![format!("{input}%")], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut v = Vec::new();
+        for r in matches {
+            v.push(r?);
+        }
+        v
+    };
+    match rows.len() {
+        0 => anyhow::bail!(crate::error::SnagError::NotFound(format!(
+            "observation matching '{input}'"
+        ))),
+        1 => Ok(rows[0].clone()),
+        n => anyhow::bail!(crate::error::SnagError::Validation(format!(
+            "observation id '{input}' is ambiguous: matches {n} observations"
+        ))),
+    }
+}
+
+pub fn show(mut args: crate::cli::ShowArgs) -> anyhow::Result<()> {
     let store = Store::open_read_only()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let payload: String = store.conn.query_row(
         "SELECT canonical_payload_json FROM records WHERE record_id = ?1 AND record_type = 'observation_created'",
         rusqlite::params![&args.observation_id],
@@ -830,8 +871,9 @@ pub fn show(args: crate::cli::ShowArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn retract(args: crate::cli::RetractArgs) -> anyhow::Result<()> {
+pub fn retract(mut args: crate::cli::RetractArgs) -> anyhow::Result<()> {
     let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

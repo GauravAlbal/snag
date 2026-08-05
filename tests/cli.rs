@@ -1107,3 +1107,41 @@ fn thin_high_severity_report_nudges() {
         "no nudge for a full body: {text}"
     );
 }
+
+/// Observation ids resolve by unique prefix (GitHub-style) across show and
+/// retract; ambiguity and misses are typed errors.
+#[test]
+fn prefix_observation_ids_resolve() {
+    let home = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        for a in args {
+            c.arg(a);
+        }
+        c.output().unwrap()
+    };
+    let out = run(&["report", "prefix-a", "--kind", "bug", "--severity", "minor"]);
+    let id = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("Recorded "))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("obs id")
+        .to_string();
+    run(&["report", "prefix-b", "--kind", "bug", "--severity", "minor"]);
+
+    // Unique prefix resolves for show.
+    let out = run(&["show", &id[..14]]);
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains(&id));
+
+    // Missing prefix is a typed not-found.
+    let out = run(&["show", "obs_zzz"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stderr).unwrap().contains("Not found"));
+
+    // Retract by prefix works.
+    let out = run(&["retract", &id[..14]]);
+    assert!(out.status.success());
+}
