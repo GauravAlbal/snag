@@ -1,6 +1,13 @@
+use crate::types::{ContextInfo, Sensitivity, SourceInfo};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+/// Complete JSON observation input (schema_version 1).
+///
+/// Unknown fields are ignored by serde by default; `deny_unknown_fields` is
+/// intentionally NOT used so forward/extra fields follow a documented
+/// compatibility rule (ignore unknown keys) rather than hard-failing on older
+/// writers. All supported fields are wired into persistence by report.rs.
 #[derive(Debug, Default, Deserialize)]
 pub struct JsonInput {
     pub schema_version: Option<u32>,
@@ -13,12 +20,50 @@ pub struct JsonInput {
     pub reproduction: Option<String>,
     pub workaround: Option<String>,
     pub impact: Option<String>,
-    pub confidence: Option<String>,
+    /// Numeric confidence (0..=1).
+    pub confidence: Option<f64>,
     pub sensitivity: Option<String>,
-    pub labels: Option<Vec<String>>,
-    // We will parse extra context/sources carefully inside report.rs
+    pub labels: Option<BTreeMap<String, String>>,
+    pub source: Option<SourceInfo>,
+    pub context: Option<ContextInfo>,
     pub idempotency_key: Option<String>,
+    /// Local file paths to ingest as artifacts.
+    pub artifacts: Option<Vec<String>>,
     pub affected_repositories: Option<Vec<String>>,
+}
+
+/// Parse a `labels` value that may be either an object (`{"k":"v"}`) or an
+/// array of strings (`["a","b"]`), normalizing to a key->value map.
+#[allow(dead_code)]
+pub fn labels_from_json(v: &serde_json::Value) -> Option<BTreeMap<String, String>> {
+    match v {
+        serde_json::Value::Object(map) => Some(
+            map.iter()
+                .map(|(k, val)| {
+                    let s = match val {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), s)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .enumerate()
+                .map(|(i, val)| (i.to_string(), val.as_str().unwrap_or("").to_string()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+pub fn sensitivity_from_str(s: Option<&str>) -> Sensitivity {
+    match s {
+        Some("restricted") => Sensitivity::Restricted,
+        Some("sensitive") => Sensitivity::Sensitive,
+        _ => Sensitivity::Normal,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -34,14 +79,14 @@ pub struct ProseInput {
 
 pub fn parse_prose(text: &str) -> ProseInput {
     let mut input = ProseInput::default();
-    
+
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return input;
     }
 
     let mut current_section = "Summary";
-    let mut sections: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut sections: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
 
     let mut first_line_found = false;
 
@@ -69,7 +114,10 @@ pub fn parse_prose(text: &str) -> ProseInput {
     }
 
     let join_section = |name: &str| -> Option<String> {
-        sections.get(name).map(|v| v.join("\n").trim().to_string()).filter(|s| !s.is_empty())
+        sections
+            .get(name)
+            .map(|v| v.join("\n").trim().to_string())
+            .filter(|s| !s.is_empty())
     };
 
     input.summary = join_section("Summary");
@@ -78,10 +126,6 @@ pub fn parse_prose(text: &str) -> ProseInput {
     input.repro = join_section("Reproduction");
     input.workaround = join_section("Workaround");
     input.impact = join_section("Impact");
-
-    // If there are no structured sections, all content goes to observed_behavior instead of summary if we prefer?
-    // The requirement says: "remaining text: summary or observed behavior;"
-    // We'll just map it to summary.
 
     input
 }

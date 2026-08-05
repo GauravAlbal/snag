@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod error;
 pub mod export;
 pub mod git;
+pub mod idempotency;
 pub mod identity;
 pub mod migrations;
 pub mod parser;

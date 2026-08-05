@@ -8,6 +8,7 @@ use crate::types::{Observation, ArtifactReference, Sensitivity, generate_id};
 use anyhow::Result;
 use serde_json::json;
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 pub fn handle(args: ReportArgs) -> Result<()> {
     // 1. Parse input
@@ -22,6 +23,16 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     let mut idempotency_key = args.idempotency_key.clone();
     let mut affected_repos = args.affected_repos.clone();
     let mut impact = None;
+    let mut confidence: Option<f64> = None;
+    let mut sensitivity: Option<String> = None;
+    let mut labels: Option<std::collections::BTreeMap<String, String>> = None;
+    let mut source_override: Option<crate::types::SourceInfo> = None;
+    let mut context_override: Option<crate::types::ContextInfo> = None;
+    let mut artifact_paths = args.artifacts.clone();
+
+    // CLI explicit kwargs take precedence over JSON/prose fields.
+    let cli_kind = args.kind.clone();
+    let cli_severity = args.severity.clone();
     
     if args.stdin {
         let mut buffer = String::new();
@@ -66,7 +77,19 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         if let Some(i) = json_input.impact { impact = Some(i); }
         if let Some(ik) = json_input.idempotency_key { idempotency_key = Some(ik); }
         if let Some(ar) = json_input.affected_repositories { affected_repos = ar; }
+        if let Some(c) = json_input.confidence { confidence = Some(c); }
+        if let Some(s) = json_input.sensitivity { sensitivity = Some(s); }
+        if let Some(l) = json_input.labels { labels = Some(l); }
+        if let Some(src) = json_input.source { source_override = Some(src); }
+        if let Some(ctxt) = json_input.context { context_override = Some(ctxt); }
+        if let Some(arts) = json_input.artifacts {
+            artifact_paths.extend(arts.into_iter().map(PathBuf::from));
+        }
     }
+
+    // CLI explicit flags override JSON fields.
+    if cli_kind.is_some() { kind = cli_kind; }
+    if cli_severity.is_some() { severity = cli_severity; }
     
     let title = title.unwrap_or_default();
     if title.is_empty() {
@@ -74,9 +97,28 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     }
 
     // 2. Gather Context
-    let (source, mut context, gathered_idempotency_key) = gather_context(&args)?;
+    let (mut source, mut context, gathered_idempotency_key) = gather_context(&args)?;
     if idempotency_key.is_none() {
         idempotency_key = gathered_idempotency_key;
+    }
+    if let Some(src) = source_override {
+        source = src;
+    }
+    if let Some(ctxt) = context_override {
+        // Merge explicit context into the gathered one, preserving the
+        // auto-detected repository identity unless the input replaces it.
+        if let Some(exec) = ctxt.execution {
+            if let Some(cur) = context.execution.as_mut() {
+                if exec.workspace_id.is_some() { cur.workspace_id = exec.workspace_id; }
+                if exec.program_id.is_some() { cur.program_id = exec.program_id; }
+                if exec.session_id.is_some() { cur.session_id = exec.session_id; }
+                if exec.pearl_id.is_some() { cur.pearl_id = exec.pearl_id; }
+                if exec.attempt_id.is_some() { cur.attempt_id = exec.attempt_id; }
+            }
+        }
+        if ctxt.extra.is_some() {
+            context.extra = ctxt.extra;
+        }
     }
 
     // 3. Artifact Storage setup
@@ -85,7 +127,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     
     let mut artifacts = Vec::new();
     let mut total_artifact_bytes = 0_u64;
-    for artifact_path in &args.artifacts {
+    for artifact_path in &artifact_paths {
         let (digest, size) = artifact_storage.ingest_file(artifact_path)?;
         total_artifact_bytes += size;
         if total_artifact_bytes > 250 * 1024 * 1024 {
@@ -176,9 +218,9 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         reproduction: repro,
         workaround,
         impact,
-        confidence: None,
-        sensitivity: Sensitivity::Normal,
-        labels: None,
+        confidence,
+        sensitivity: crate::parser::sensitivity_from_str(sensitivity.as_deref()),
+        labels,
         context,
         artifacts: artifacts.clone(),
         affected_repository_ids: affected_repos.clone(),
@@ -196,62 +238,54 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     };
     let canonical_payload = serde_json::to_string(&canonical_record.payload)?;
 
+    // G32: stable semantic idempotency digest over the observation (excludes
+    // generated ids, sequence, timestamp, record hash, branch/HEAD, and other
+    // ambient fields that may legitimately change on retry).
+    let semantic_digest = crate::idempotency::observation_semantic_digest(&obs);
+
     if let Some(ik) = &idempotency_key {
-        let existing: rusqlite::Result<(String, String, i64, String)> = tx.query_row(
-            "SELECT o.observation_id, r.canonical_payload_json, r.local_sequence, r.record_hash
+        let existing: rusqlite::Result<(String, i64, String, Option<String>)> = tx.query_row(
+            "SELECT o.observation_id, o.local_sequence, o.record_hash, o.semantic_digest
              FROM observations o
-             JOIN records r ON o.observation_id = r.record_id
-             WHERE o.idempotency_key = ?1 AND r.record_type = 'observation_created'",
+             WHERE o.idempotency_key = ?1 AND o.semantic_digest IS NOT NULL
+             LIMIT 1",
             rusqlite::params![ik],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         );
-        if let Ok((old_id, old_payload, old_seq, old_hash)) = existing {
-            // Compare semantic equality
-            let mut old_val: serde_json::Value = serde_json::from_str(&old_payload)?;
-            let mut new_val: serde_json::Value = serde_json::from_str(&canonical_payload)?;
-            
-            let strip = |v: &mut serde_json::Value| {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.remove("observation_id");
-                    obj.remove("store_id");
-                    obj.remove("local_sequence");
-                    obj.remove("created_at");
-                    if let Some(arts) = obj.get_mut("artifacts").and_then(|a| a.as_array_mut()) {
-                        for art in arts {
-                            if let Some(a_obj) = art.as_object_mut() {
-                                a_obj.remove("created_at");
-                            }
-                        }
+        if let Ok((old_id, old_seq, old_hash, old_digest)) = existing {
+            match old_digest {
+                Some(d) if d == semantic_digest => {
+                    // Same key + same semantic digest -> return original.
+                    if args.json {
+                        let result = json!({
+                            "schema_version": 1,
+                            "observation_id": old_id,
+                            "store_id": store.store_id,
+                            "local_sequence": old_seq,
+                            "record_hash": old_hash,
+                            "created": false,
+                            "idempotent_replay": true,
+                            "sync_state": "local",
+                            "context": {
+                                "repository": obs.context.repository.is_some(),
+                                "execution": obs.context.execution.is_some(),
+                            },
+                            "artifacts": obs.artifacts.len(),
+                            "warnings": []
+                        });
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        println!("Observation already exists: {}  [sequence {}]", old_id, old_seq);
                     }
+                    return Ok(());
                 }
-            };
-            strip(&mut old_val);
-            strip(&mut new_val);
-            
-            if old_val == new_val {
-                if args.json {
-                    let result = json!({
-                        "schema_version": 1,
-                        "observation_id": old_id,
-                        "store_id": store.store_id,
-                        "local_sequence": old_seq,
-                        "record_hash": old_hash,
-                        "created": false,
-                        "sync_state": "local",
-                        "context": {
-                            "repository": obs.context.repository.is_some(),
-                            "execution": obs.context.execution.is_some(),
-                        },
-                        "artifacts": obs.artifacts.len(),
-                        "warnings": []
-                    });
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                } else {
-                    println!("Observation already exists: {}  [sequence {}]", old_id, old_seq);
+                _ => {
+                    // Same key + different semantic digest -> typed conflict.
+                    return Err(SnagError::IdempotencyConflict(format!(
+                        "idempotency key {} already used with a different semantic payload",
+                        ik
+                    )).into());
                 }
-                return Ok(());
-            } else {
-                return Err(SnagError::Validation("Idempotency key collision with different payload".to_string()).into());
             }
         }
     }
@@ -275,11 +309,11 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     tx.execute(
         "INSERT INTO observations (
             observation_id, store_id, local_sequence, schema_version, captured_at, source_kind,
-            idempotency_key, title, kind_assertion, severity_assertion, expected_behavior,
-            observed_behavior, reproduction, workaround, sensitivity, context_json,
-            canonical_payload_json, previous_record_hash, record_hash
+            idempotency_key, title, summary, kind_assertion, severity_assertion, expected_behavior,
+            observed_behavior, reproduction, workaround, impact, confidence, sensitivity, context_json,
+            canonical_payload_json, previous_record_hash, record_hash, semantic_digest, labels_json
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
         )",
         rusqlite::params![
             &obs.observation_id,
@@ -290,17 +324,22 @@ pub fn handle(args: ReportArgs) -> Result<()> {
             &obs.source.kind,
             &obs.idempotency_key,
             &obs.title,
+            &obs.summary,
             &obs.kind_assertion,
             &obs.severity_assertion,
             &obs.expected_behavior,
             &obs.observed_behavior,
             &obs.reproduction,
             &obs.workaround,
-            "normal",
+            &obs.impact,
+            obs.confidence,
+            serde_json::from_str::<String>(&serde_json::to_string(&obs.sensitivity)?).unwrap_or_default(),
             serde_json::to_string(&obs.context)?,
             &canonical_payload,
             &previous_record_hash,
             &record_hash,
+            &semantic_digest,
+            serde_json::to_string(&obs.labels).unwrap_or_else(|_| "null".to_string()),
         ],
     )?;
 

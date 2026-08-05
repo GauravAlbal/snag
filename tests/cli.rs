@@ -147,7 +147,7 @@ fn test_idempotency_gap() {
         .success()
         .stdout(predicate::str::contains("Observation already exists"));
         
-    // 3. Different payload with same key -> fails
+    // 3. Different payload with same key -> fails with IDEMPOTENCY_CONFLICT
     ctx.cmd()
         .arg("report")
         .arg("Idempotency Test DIFFERENT")
@@ -155,7 +155,7 @@ fn test_idempotency_gap() {
         .arg("key_123")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Idempotency key collision"));
+        .stderr(predicate::str::contains("different semantic payload"));
 }
 
 
@@ -406,4 +406,69 @@ fn test_e2e_backup_restore_roundtrip() {
         std::fs::read(&obj).unwrap(),
         b"THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG\n"
     );
+}
+
+/// G31: JSON intake persists all supported fields, and JSON idempotency replay
+/// returns the original observation (G32).
+#[test]
+fn test_json_full_intake_and_replay() {
+    let ctx = TestContext::new();
+
+    let json_payload = r#"{
+        "schema_version": 1,
+        "title": "JSON Full Intake",
+        "summary": "a summary",
+        "kind_assertion": "reliability",
+        "severity_assertion": "major",
+        "expected_behavior": "expected works",
+        "observed_behavior": "observed fails",
+        "reproduction": "steps",
+        "workaround": "none",
+        "impact": "prod down",
+        "confidence": 0.85,
+        "sensitivity": "sensitive",
+        "labels": { "area": "core", "tier": "2" },
+        "idempotency_key": "json_key_1"
+    }"#;
+
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(json_payload)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"idempotent_replay\": true").not());
+
+    let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let row: (String, String, f64, String, String) = conn.query_row(
+        "SELECT title, kind_assertion, confidence, sensitivity, labels_json FROM observations WHERE idempotency_key='json_key_1'",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4).unwrap_or_default())),
+    ).unwrap();
+    let labels: serde_json::Value = serde_json::from_str(&row.4).unwrap();
+    assert_eq!(row.0, "JSON Full Intake");
+    assert_eq!(row.1, "reliability");
+    assert_eq!(row.2, 0.85);
+    assert_eq!(row.3, "sensitive");
+    assert_eq!(labels["area"], "core");
+
+    // Replay with identical JSON -> idempotent_replay=true, no new row.
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(json_payload)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"idempotent_replay\": true"));
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM observations WHERE idempotency_key='json_key_1'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+}
+
+/// G32: same key + different semantic payload -> typed IDEMPOTENCY_CONFLICT.
+#[test]
+fn test_idempotency_conflict_typed() {
+    let ctx = TestContext::new();
+    ctx.cmd().arg("report").arg("original").arg("--idempotency-key").arg("k2").assert().success();
+    ctx.cmd().arg("report").arg("different payload").arg("--idempotency-key").arg("k2").assert().failure()
+        .stderr(predicate::str::contains("different semantic payload"));
 }

@@ -146,3 +146,15 @@ pub fn migrate_v2_to_v3(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
     )?;
     Ok(())
 }
+
+/// v3 -> v4: store the stable semantic idempotency digest directly so the
+/// same-key/same-semantics replay returns the original observation and a
+/// same-key/different-semantics replay is a typed conflict.
+pub fn migrate_v3_to_v4(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute_batch(
+        "
+        ALTER TABLE observations ADD COLUMN semantic_digest TEXT;
+        ",
+    )?;
+    Ok(())
+}

@@ -120,8 +120,8 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
                         observation_id, store_id, local_sequence, schema_version, captured_at, source_kind,
                         idempotency_key, title, kind_assertion, severity_assertion, expected_behavior,
                         observed_behavior, reproduction, workaround, impact, confidence, sensitivity, context_json,
-                        canonical_payload_json, previous_record_hash, record_hash
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                        canonical_payload_json, previous_record_hash, record_hash, semantic_digest, labels_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                     rusqlite::params![
                         &obs.observation_id,
                         &obs.store_id,
@@ -139,11 +139,13 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
                         &obs.workaround,
                         &obs.impact,
                         obs.confidence,
-                        "normal",
+                        serde_json::from_str::<String>(&serde_json::to_string(&obs.sensitivity)?).unwrap_or_default(),
                         serde_json::to_string(&obs.context)?,
                         &canonical_payload_json,
                         &previous_record_hash,
                         &computed_hash,
+                        &crate::idempotency::observation_semantic_digest(&obs),
+                        serde_json::to_string(&obs.labels).unwrap_or_else(|_| "null".to_string()),
                     ],
                 )?;
                 

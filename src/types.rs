@@ -120,7 +120,7 @@ pub struct RepositoryContext {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
