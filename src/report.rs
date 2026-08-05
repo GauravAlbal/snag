@@ -74,7 +74,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     }
 
     // 2. Gather Context
-    let (source, context, gathered_idempotency_key) = gather_context(&args)?;
+    let (source, mut context, gathered_idempotency_key) = gather_context(&args)?;
     if idempotency_key.is_none() {
         idempotency_key = gathered_idempotency_key;
     }
@@ -102,19 +102,44 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         });
     }
 
-    // 3.5. Identity resolution
+    // 3.5. Identity resolution (G28/G29): resolve the primary repository with
+    // explicit-ID precedence and attach the structured result to context; resolve
+    // every --affected-repo value (id/path/alias/current) before the transaction.
+    let mut temp_git = crate::git::GitContext::default();
+    let mut primary_repo_id: Option<String> = None;
     if let Some(repo_ctx) = &context.repository {
-        let mut temp_git = crate::git::GitContext::default();
         temp_git.git_common_dir = repo_ctx.git_common_dir.clone();
         temp_git.git_remote_aliases = repo_ctx.git_remote_aliases.clone();
         temp_git.repository_root = repo_ctx.repository_root.clone();
-        
-        if let Ok(Some(repo_id)) = crate::identity::resolve_repository(&mut store, &temp_git) {
-            if !affected_repos.contains(&repo_id) {
-                affected_repos.push(repo_id);
+    }
+    if let Some(repo_ctx) = context.repository.as_mut() {
+        let res = crate::identity::resolve_repository(&mut store, &temp_git, repo_ctx.repository_id.as_deref())?;
+        if !res.repository_id.is_empty() {
+            repo_ctx.repository_id = Some(res.repository_id.clone());
+            repo_ctx.checkout_id = res.checkout_id;
+            repo_ctx.worktree_id = res.worktree_id;
+            primary_repo_id = Some(res.repository_id);
+            for w in &res.warnings {
+                eprintln!("snag: {}", w);
             }
         }
     }
+
+    // Resolve affected repositories before the transaction (typed failures).
+    let mut resolved_affected: Vec<String> = Vec::new();
+    for raw in &affected_repos {
+        let rid = crate::identity::resolve_affected_repository(&mut store, raw, &temp_git)?;
+        if !resolved_affected.contains(&rid) {
+            resolved_affected.push(rid);
+        }
+    }
+    let mut all_repo_ids = resolved_affected.clone();
+    if let Some(p) = &primary_repo_id {
+        if !all_repo_ids.contains(p) {
+            all_repo_ids.push(p.clone());
+        }
+    }
+    affected_repos = all_repo_ids;
 
     // 4. Begin Transaction and allocate
     let tx = store.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -298,10 +323,16 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         )?;
     }
 
-    // Insert observation_repositories (affected repos)
-    for repo_id in &affected_repos {
+    // Insert observation_repositories (primary + affected roles).
+    if let Some(p) = &primary_repo_id {
         tx.execute(
-            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'primary')",
+            rusqlite::params![&obs.observation_id, p],
+        )?;
+    }
+    for repo_id in &resolved_affected {
+        tx.execute(
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'affected')",
             rusqlite::params![&obs.observation_id, repo_id],
         )?;
     }

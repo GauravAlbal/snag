@@ -154,7 +154,7 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
                         rusqlite::params![repo_id, &captured_at],
                     )?;
                     tx.execute(
-                        "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id) VALUES (?1, ?2)",
+                        "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'affected')",
                         rusqlite::params![&obs.observation_id, repo_id],
                     )?;
                 }

@@ -111,3 +111,38 @@ pub fn migrate_v1_to_v2(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// v2 -> v3: make alias ambiguity representable. `repository_aliases` becomes a
+/// per-(alias, repository) mapping so one alias may legitimately map to several
+/// repository candidates. A `confirmed` flag records when a binding is known to
+/// be unique/correct; unresolved ambiguity must never silently pick the first.
+pub fn migrate_v2_to_v3(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE repository_aliases_new (
+            alias TEXT NOT NULL,
+            repository_id TEXT NOT NULL REFERENCES repositories(repository_id),
+            confirmed INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (alias, repository_id)
+        );
+        INSERT INTO repository_aliases_new (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+            SELECT alias, repository_id, 1, first_seen_at, last_seen_at FROM repository_aliases;
+        DROP TABLE repository_aliases;
+        ALTER TABLE repository_aliases_new RENAME TO repository_aliases;
+
+        CREATE TABLE observation_repositories_new (
+            observation_id TEXT NOT NULL REFERENCES observations(observation_id),
+            repository_id TEXT NOT NULL REFERENCES repositories(repository_id),
+            role TEXT NOT NULL DEFAULT 'affected',
+            PRIMARY KEY (observation_id, repository_id, role)
+        );
+        INSERT INTO observation_repositories_new (observation_id, repository_id, role)
+            SELECT observation_id, repository_id, 'affected' FROM observation_repositories;
+        DROP TABLE observation_repositories;
+        ALTER TABLE observation_repositories_new RENAME TO observation_repositories;
+        ",
+    )?;
+    Ok(())
+}

@@ -38,6 +38,12 @@ pub enum SnagError {
     #[error("Repository ambiguous: {0}")]
     RepositoryAmbiguous(String),
 
+    #[error("Repository not found: {0}")]
+    RepositoryNotFound(String),
+
+    #[error("Repository invalid: {0}")]
+    RepositoryInvalid(String),
+
     #[error("Artifact too large: {0}")]
     ArtifactTooLarge(String),
 
@@ -70,6 +76,8 @@ impl SnagError {
             Self::StoreCorrupt(_) => "STORE_CORRUPT",
             Self::ContextFileInvalid(_) => "CONTEXT_FILE_INVALID",
             Self::RepositoryAmbiguous(_) => "REPOSITORY_AMBIGUOUS",
+            Self::RepositoryNotFound(_) => "REPOSITORY_NOT_FOUND",
+            Self::RepositoryInvalid(_) => "REPOSITORY_INVALID",
             Self::ArtifactTooLarge(_) => "ARTIFACT_TOO_LARGE",
             Self::ArtifactInvalid(_) => "ARTIFACT_INVALID",
             Self::BackupInvalid(_) => "BACKUP_INVALID",
