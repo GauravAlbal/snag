@@ -59,6 +59,9 @@ pub enum SnagError {
     #[error("Export invalid: {0}")]
     ExportInvalid(String),
 
+    #[error("Claim conflict: {0}")]
+    ClaimConflict(String),
+
     #[error("Not found: {0}")]
     NotFound(String),
 
@@ -83,6 +86,7 @@ impl SnagError {
             Self::BackupInvalid(_) => "BACKUP_INVALID",
             Self::RestoreRefused(_) => "RESTORE_REFUSED",
             Self::ExportInvalid(_) => "EXPORT_INVALID",
+            Self::ClaimConflict(_) => "CLAIM_CONFLICT",
             Self::NotFound(_) => "NOT_FOUND",
             Self::Other(_) => "INTERNAL_ERROR",
         };

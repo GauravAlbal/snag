@@ -1,6 +1,7 @@
 use crate::cli::RebuildArgs;
 use crate::failpoint::failpoint;
-use crate::record::CanonicalRecordV1;
+use crate::record::{CanonicalRecordV1, RecordPayload};
+use crate::remediation::events::RemediationEvent;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -40,6 +41,15 @@ fn parse_and_validate_header(header_line: &str) -> Result<(String, u64, String, 
         .get("record_count")
         .and_then(|v| v.as_u64())
         .context("Missing record_count")?;
+    // The reader understands export protocol 1 with remediation records
+    // (minimum_reader_version 2); anything newer is rejected cleanly.
+    if let Some(min_v) = header
+        .get("minimum_reader_version")
+        .and_then(|v| v.as_i64())
+        && min_v > 2
+    {
+        anyhow::bail!("Unsupported minimum reader version: {min_v}");
+    }
     Ok((store_id, first_sequence, predecessor_hash, head_hash, count))
 }
 
@@ -253,8 +263,203 @@ fn verify_and_insert_record(
                 ],
             )?;
         }
+        // Remediation events reconstruct their normalized rows (the
+        // materialized `observation_review_state` projection is rebuilt by the
+        // reducer replay in `handle`).
+        RecordPayload::Remediation(ev) => {
+            reconstruct_remediation_event(tx, &record_id, &entity_id, local_sequence, ev)?;
+        }
     }
     Ok((current_expected_sequence + 1, computed_hash))
+}
+
+/// Reconstruct the normalized rows for one remediation event during rebuild.
+///
+/// Claims, dispositions, relationships, and remediation links map one-to-one
+/// onto their tables; state-only events (reviewed, marked handled, remediation
+/// reopened) contribute nothing here because the materialized review-state
+/// projection is rebuilt by the reducer replay in `handle`.
+fn reconstruct_remediation_event(
+    tx: &rusqlite::Transaction,
+    record_id: &str,
+    entity_id: &str,
+    local_sequence: u64,
+    ev: RemediationEvent,
+) -> Result<()> {
+    match ev {
+        RemediationEvent::Claimed(p) => {
+            tx.execute(
+                "INSERT INTO remediation_claims (
+                    claim_id, observation_id, claimed_by, claim_session_id, claimed_at,
+                    lease_expires_at, source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    &p.claim_id,
+                    entity_id,
+                    &p.claimed_by,
+                    &p.claim_session_id,
+                    &p.created_at,
+                    &p.lease_expires_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::ClaimHeartbeat(p) => {
+            tx.execute(
+                "UPDATE remediation_claims SET lease_expires_at = ?1
+                 WHERE claim_id = ?2 AND released_at IS NULL",
+                rusqlite::params![&p.lease_expires_at, &p.claim_id],
+            )?;
+        }
+        RemediationEvent::ClaimReleased(p) => {
+            tx.execute(
+                "UPDATE remediation_claims SET released_at = ?1, release_reason = ?2
+                 WHERE claim_id = ?3",
+                rusqlite::params![&p.released_at, &p.release_reason, &p.claim_id],
+            )?;
+        }
+        RemediationEvent::ClaimExpired(p) => {
+            tx.execute(
+                "UPDATE remediation_claims SET released_at = ?1, release_reason = 'lease expired'
+                 WHERE claim_id = ?2 AND released_at IS NULL",
+                rusqlite::params![&p.expired_at, &p.claim_id],
+            )?;
+        }
+        RemediationEvent::Reviewed(_) => {
+            // History/audit surface; the disposition row follows from the
+            // disposition-set event.
+        }
+        RemediationEvent::DispositionSet(p) => {
+            tx.execute(
+                "INSERT INTO observation_dispositions (
+                    disposition_id, observation_id, disposition, target_observation_id,
+                    rationale, evidence_json, reviewer, review_session_id, created_at,
+                    source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    &p.disposition_id,
+                    entity_id,
+                    &p.disposition,
+                    &p.target_observation_id,
+                    &p.rationale,
+                    &p.evidence_json,
+                    &p.reviewer,
+                    &p.review_session_id,
+                    &p.created_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::Reopened(_) => {
+            tx.execute(
+                "UPDATE observation_dispositions SET retracted_by_record_sequence = ?1
+                 WHERE observation_id = ?2 AND retracted_by_record_sequence IS NULL",
+                rusqlite::params![local_sequence as i64, &entity_id],
+            )?;
+        }
+        RemediationEvent::RelationshipAdded(p) => {
+            tx.execute(
+                "INSERT INTO observation_relationships (
+                    relationship_id, left_observation_id, right_observation_id, relation,
+                    rationale, evidence_json, reviewer, review_session_id, created_at,
+                    source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    &p.relationship_id,
+                    &p.left_observation_id,
+                    &p.right_observation_id,
+                    &p.relation,
+                    &p.rationale,
+                    &p.evidence_json,
+                    &p.reviewer,
+                    &p.review_session_id,
+                    &p.created_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::RelationshipRetracted(p) => {
+            tx.execute(
+                "UPDATE observation_relationships SET retracted_by_record_sequence = ?1
+                 WHERE relationship_id = ?2 AND retracted_by_record_sequence IS NULL",
+                rusqlite::params![local_sequence as i64, &p.relationship_id],
+            )?;
+        }
+        RemediationEvent::Promoted(p) => {
+            tx.execute(
+                "INSERT INTO remediation_links (
+                    link_id, observation_id, link_type, target_id, created_at,
+                    source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, 'finding', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    &record_id,
+                    entity_id,
+                    &p.finding_id,
+                    &p.created_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::TaskAttached(p) => {
+            tx.execute(
+                "INSERT INTO remediation_links (
+                    link_id, observation_id, link_type, target_id, created_at,
+                    source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, 'task', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    &record_id,
+                    entity_id,
+                    &p.task_id,
+                    &p.created_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::FixAttached(p) => {
+            tx.execute(
+                "INSERT INTO remediation_links (
+                    link_id, observation_id, link_type, target_id, repository_id, created_at,
+                    source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, 'commit', ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    &record_id,
+                    entity_id,
+                    &p.commit_sha,
+                    &p.repository_id,
+                    &p.created_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::VerificationAttached(p) => {
+            tx.execute(
+                "INSERT INTO remediation_links (
+                    link_id, observation_id, link_type, target_id, status, created_at,
+                    source_record_sequence, idempotency_key
+                ) VALUES (?1, ?2, 'verification', ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    &record_id,
+                    entity_id,
+                    &p.receipt_ref,
+                    &p.status,
+                    &p.created_at,
+                    local_sequence as i64,
+                    &p.idempotency_key,
+                ],
+            )?;
+        }
+        RemediationEvent::MarkedHandled(_) | RemediationEvent::RemediationReopened(_) => {
+            // State-only events; the reducer replay reconstructs the
+            // materialized projection.
+        }
+    }
+    Ok(())
 }
 
 /// Atomically finalize the rebuilt destination after dropping open connections.
@@ -330,6 +535,13 @@ pub fn handle(args: RebuildArgs) -> Result<()> {
     }
     if count > 0 && current_previous_hash != expected_head_hash {
         anyhow::bail!("Head hash mismatch");
+    }
+
+    // Reconstruct the materialized review-state projection purely from the
+    // replayed stream (the reducer is a pure function of the records).
+    let reduced = crate::remediation::reducer::replay_all(&tx)?;
+    for obs in reduced.values() {
+        crate::remediation::reducer::upsert_review_state(&tx, obs)?;
     }
     tx.commit()?;
 

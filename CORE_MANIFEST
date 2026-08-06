@@ -29,10 +29,12 @@ tests/schema_compat.rs
 
 # Files that stay lane-local (never synced, never scanned as shared).
 OVERLAY
-tests/remediation.rs
 
-# Files whose two-lane variants intentionally diverge (never synced).
+# Files whose two-lane variants intentionally diverge (never synced):
+# tests/remediation.rs carries the lane-local field-report scenario.
 KNOWN_DRIFT
+tests/remediation.rs
 src/migrations.rs
+src/store.rs
 src/schema.rs
 tests/migration.rs

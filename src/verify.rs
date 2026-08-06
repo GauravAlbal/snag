@@ -16,9 +16,11 @@ pub fn handle(args: VerifyArgs) -> Result<()> {
     if args.quick {
         println!("Running quick verification...");
         quick_verify(&mut store)?;
+        crate::remediation::verify::verify_remediation(&store.conn, true)?;
     } else {
         println!("Running full verification...");
         full_verify(&mut store)?;
+        crate::remediation::verify::verify_remediation(&store.conn, false)?;
     }
     Ok(())
 }

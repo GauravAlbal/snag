@@ -14,6 +14,7 @@ pub mod migrations;
 pub mod parser;
 pub mod rebuild;
 pub mod record;
+pub mod remediation;
 pub mod report;
 pub mod restore;
 pub mod schema;
@@ -50,6 +51,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Init(args)) => init::handle(args),
         Some(Command::Restore(args)) => restore::handle(args),
         Some(Command::Rebuild(args)) => rebuild::handle(args),
+        Some(Command::Review(args)) => remediation::handle_review(args),
         None => {
             // "snag <title>" fast path, equivalent to "snag report <title>"
             if let Some(title) = cli.title {

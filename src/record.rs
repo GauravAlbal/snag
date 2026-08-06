@@ -1,3 +1,4 @@
+use crate::remediation::events::RemediationEvent;
 use crate::types::Observation;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,12 @@ pub struct RetractionPayload {
 pub enum RecordPayload {
     Observation(Observation),
     Retraction(RetractionPayload),
+    /// Tagged remediation event envelope. The outer encoding is *untagged*;
+    /// several remediation payloads are structurally similar, so they must be
+    /// wrapped in the internally-tagged `RemediationEvent` to keep parsing
+    /// unambiguous. Existing `Observation`/`Retraction` payloads are
+    /// byte-compatible with this change.
+    Remediation(RemediationEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

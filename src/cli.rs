@@ -68,6 +68,11 @@ impl Cli {
             Some(Command::List(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Context(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Export(args)) => args.format.as_deref() == Some("json"),
+            Some(Command::Review(cmd)) => match cmd {
+                ReviewCommand::Next(args) => args.format.as_deref() == Some("agent"),
+                ReviewCommand::List(args) => args.format.as_deref() == Some("json"),
+                _ => false,
+            },
             Some(_) => false,
             None => self.json,
         }
@@ -101,6 +106,9 @@ pub enum Command {
     Restore(RestoreArgs),
     /// Rebuilds the database from an export stream
     Rebuild(RebuildArgs),
+    /// Remediation queue: retrieval, claim leases, adjudication, lineage
+    #[command(subcommand)]
+    Review(ReviewCommand),
 }
 
 #[derive(Args)]
@@ -254,4 +262,394 @@ pub struct RebuildArgs {
 
     #[arg(long)]
     pub destination: PathBuf,
+}
+
+/// `snag review …` — the remediation interface. All mutations are append-only
+/// records in the global stream; claims are leases, not ownership.
+#[derive(Subcommand)]
+pub enum ReviewCommand {
+    /// Pull the next unhandled observation matching the filters
+    Next(ReviewNextArgs),
+    /// Acquire a claim lease on an observation
+    ///
+    /// Claim only observations in your lane: check the repos and labels for
+    /// ownership before claiming. The lease expires — process death never
+    /// strands work.
+    Claim(ReviewClaimArgs),
+    /// Release an active claim lease
+    Release(ReviewReleaseArgs),
+    /// Extend an active claim lease
+    Heartbeat(ReviewHeartbeatArgs),
+    /// List observations with their review state
+    List(ReviewListArgs),
+    /// Adjudicate an observation with a disposition
+    ///
+    /// Negative dispositions are first-class outcomes. `confirmed` commits
+    /// your lane to the fix; observations owned by another lane should be
+    /// `deferred` with the owner lane in `--rationale`, then
+    /// `reopen-remediation` to keep them visible in the queue.
+    Disposition(ReviewDispositionArgs),
+    /// Reopen a previous disposition (append-only)
+    Reopen(ReviewReopenArgs),
+    /// Assert a relationship between two observations
+    Relate(ReviewRelateArgs),
+    /// Retract a relationship assertion (append-only)
+    Unrelate(ReviewUnrelateArgs),
+    /// Promote a confirmed observation to a finding
+    Promote(ReviewPromoteArgs),
+    /// Attach owned work (multiple task ids supported)
+    AttachTask(ReviewAttachTaskArgs),
+    /// Attach a candidate fixing commit
+    AttachFix(ReviewAttachFixArgs),
+    /// Attach verification evidence (accepted is the only verifying status)
+    AttachVerification(ReviewAttachVerificationArgs),
+    /// Declare an observation durably handled
+    MarkHandled(ReviewMarkHandledArgs),
+    /// Reopen a handled remediation (append-only)
+    ReopenRemediation(ReviewReopenRemediationArgs),
+    /// Inspect the full evidence packet for one observation
+    Show(ReviewShowArgs),
+    /// List the observation's remediation event history
+    History(ReviewHistoryArgs),
+    /// Validate a completion report against the recorded events
+    VerifyReport(ReviewVerifyReportArgs),
+}
+
+#[derive(Args)]
+pub struct ReviewNextArgs {
+    /// Restrict to a repository (id, alias, or `current`)
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Restrict to an asserted kind
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Restrict to an asserted severity
+    #[arg(
+        long,
+        help = "restrict to an asserted severity (blocker|major|medium|minor|low) — the reporter's prior; disposition re-ranks"
+    )]
+    pub severity: Option<String>,
+
+    /// Only observations with no review activity yet
+    #[arg(long)]
+    pub unreviewed: bool,
+
+    /// Include observations deferred by a prior disposition
+    #[arg(long)]
+    pub include_deferred: bool,
+
+    /// Output format: `agent` (versioned JSON packet) or `text` (default)
+    #[arg(long)]
+    pub format: Option<String>,
+
+    /// Claim the returned observation atomically (fold-in: with --task,
+    /// link the claim to owned work in the same step)
+    #[arg(long)]
+    pub claim: bool,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewClaimArgs {
+    pub observation_id: String,
+
+    /// Lease duration (e.g. 30m, 2h); default from SNAG_REVIEW_LEASE or 30m
+    #[arg(long)]
+    pub lease: Option<String>,
+
+    /// Link the claim to an owned work item (the "fixing in <task>" marker)
+    #[arg(long)]
+    pub task: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewReleaseArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewHeartbeatArgs {
+    pub observation_id: String,
+
+    /// Lease duration for the extension (e.g. 30m); default SNAG_REVIEW_LEASE
+    /// or 30m
+    #[arg(long)]
+    pub lease: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewListArgs {
+    /// Only observations claimed by this reviewer/session
+    #[arg(long)]
+    pub claimed_by: Option<String>,
+
+    /// Only observations with this disposition
+    #[arg(long)]
+    pub disposition: Option<String>,
+
+    /// Only observations in this derived state
+    #[arg(long)]
+    pub status: Option<String>,
+
+    #[arg(long)]
+    pub handled: bool,
+
+    #[arg(long)]
+    pub unhandled: bool,
+
+    #[arg(long)]
+    pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewDispositionArgs {
+    pub observation_id: String,
+
+    /// One of: confirmed, duplicate, expected-behavior, environmental,
+    /// insufficient-evidence, deferred, superseded
+    pub disposition: String,
+
+    /// Target observation (required for `duplicate`)
+    #[arg(long = "of")]
+    pub of: Option<String>,
+
+    /// Successor observation (required for `superseded`)
+    #[arg(long = "by")]
+    pub by: Option<String>,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub evidence: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewReopenArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewRelateArgs {
+    pub left: String,
+    pub right: String,
+
+    /// One of: same-finding, duplicate-of, upstream-cause,
+    /// downstream-symptom, related, supersedes
+    #[arg(long)]
+    pub relation: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub evidence: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewUnrelateArgs {
+    pub relationship_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewPromoteArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub finding_id: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAttachTaskArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub task_id: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAttachFixArgs {
+    pub observation_id: String,
+
+    /// The candidate fixing commit SHA
+    #[arg(long)]
+    pub commit: String,
+
+    #[arg(long)]
+    pub repo: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAttachVerificationArgs {
+    pub observation_id: String,
+
+    /// Verification receipt reference
+    #[arg(long)]
+    pub receipt: String,
+
+    /// accepted | rejected | abstained | invalid | unknown
+    #[arg(long)]
+    pub status: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewMarkHandledArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewReopenRemediationArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub rationale: Option<String>,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewShowArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewHistoryArgs {
+    pub observation_id: String,
+
+    #[arg(long)]
+    pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewVerifyReportArgs {
+    /// Path to the completion report (YAML or JSON)
+    pub report: std::path::PathBuf,
 }

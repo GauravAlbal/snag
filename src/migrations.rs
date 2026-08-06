@@ -247,3 +247,120 @@ pub fn migrate_v3_to_v4(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
     )?;
     Ok(())
 }
+
+/// v4 -> v5: remediation protocol substrate.
+///
+/// Adds the normalized remediation tables (claims, dispositions, relationships,
+/// remediation links) and the materialized `observation_review_state`
+/// projection. All four normalized tables are derived indexes over the global
+/// record stream; `observation_review_state` is populated by the reducer and
+/// backfilled here as `unreviewed` for every existing observation so existing
+/// stores begin with a consistent, queryable queue. No existing observation
+/// records or retractions are modified.
+pub fn migrate_v4_to_v5(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute_batch(
+        "
+        CREATE TABLE remediation_claims (
+            claim_id TEXT PRIMARY KEY,
+            observation_id TEXT NOT NULL REFERENCES observations(observation_id),
+            claimed_by TEXT NOT NULL,
+            claim_session_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL,
+            lease_expires_at TEXT NOT NULL,
+            released_at TEXT,
+            release_reason TEXT,
+            source_record_sequence INTEGER NOT NULL UNIQUE,
+            idempotency_key TEXT UNIQUE
+        );
+        CREATE INDEX idx_remediation_claims_observation ON remediation_claims(observation_id);
+        CREATE INDEX idx_remediation_claims_active
+            ON remediation_claims(observation_id, released_at, lease_expires_at);
+
+        CREATE TABLE observation_dispositions (
+            disposition_id TEXT PRIMARY KEY,
+            observation_id TEXT NOT NULL REFERENCES observations(observation_id),
+            disposition TEXT NOT NULL,
+            target_observation_id TEXT REFERENCES observations(observation_id),
+            rationale TEXT,
+            evidence_json TEXT,
+            reviewer TEXT NOT NULL,
+            review_session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            source_record_sequence INTEGER NOT NULL UNIQUE,
+            retracted_by_record_sequence INTEGER,
+            idempotency_key TEXT UNIQUE
+        );
+        CREATE INDEX idx_observation_dispositions_observation
+            ON observation_dispositions(observation_id, source_record_sequence);
+        CREATE INDEX idx_observation_dispositions_target
+            ON observation_dispositions(target_observation_id);
+
+        CREATE TABLE observation_relationships (
+            relationship_id TEXT PRIMARY KEY,
+            left_observation_id TEXT NOT NULL REFERENCES observations(observation_id),
+            right_observation_id TEXT NOT NULL REFERENCES observations(observation_id),
+            relation TEXT NOT NULL,
+            rationale TEXT,
+            evidence_json TEXT,
+            reviewer TEXT NOT NULL,
+            review_session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            source_record_sequence INTEGER NOT NULL UNIQUE,
+            retracted_by_record_sequence INTEGER,
+            idempotency_key TEXT UNIQUE
+        );
+        CREATE INDEX idx_observation_relationships_endpoints
+            ON observation_relationships(left_observation_id, right_observation_id);
+
+        CREATE TABLE remediation_links (
+            link_id TEXT PRIMARY KEY,
+            observation_id TEXT NOT NULL REFERENCES observations(observation_id),
+            link_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            repository_id TEXT,
+            status TEXT,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL,
+            source_record_sequence INTEGER NOT NULL UNIQUE,
+            retracted_by_record_sequence INTEGER,
+            idempotency_key TEXT UNIQUE
+        );
+        CREATE INDEX idx_remediation_links_observation
+            ON remediation_links(observation_id, link_type);
+
+        CREATE TABLE observation_review_state (
+            observation_id TEXT PRIMARY KEY REFERENCES observations(observation_id),
+            state TEXT NOT NULL,
+            disposition TEXT,
+            handled INTEGER NOT NULL DEFAULT 0,
+            active_claim_id TEXT,
+            active_claim_expires_at TEXT,
+            promoted_finding_id TEXT,
+            task_ids_json TEXT NOT NULL DEFAULT '[]',
+            commits_json TEXT NOT NULL DEFAULT '[]',
+            verification_receipts_json TEXT NOT NULL DEFAULT '[]',
+            latest_verification_status TEXT,
+            updated_through_sequence INTEGER NOT NULL
+        );
+
+        CREATE VIEW active_claims AS
+        SELECT claim_id, observation_id, claimed_by, claim_session_id, claimed_at, lease_expires_at
+        FROM remediation_claims
+        WHERE released_at IS NULL
+          AND lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
+        ",
+    )?;
+
+    // Every existing observation begins as `unreviewed` with an empty lineage
+    // so the queue and verify see a consistent projection immediately.
+    tx.execute(
+        "INSERT INTO observation_review_state (
+            observation_id, state, handled, task_ids_json, commits_json,
+            verification_receipts_json, updated_through_sequence
+        )
+        SELECT observation_id, 'unreviewed', 0, '[]', '[]', '[]', local_sequence
+        FROM observations",
+        [],
+    )?;
+    Ok(())
+}
