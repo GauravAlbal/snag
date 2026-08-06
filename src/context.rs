@@ -308,7 +308,7 @@ mod tests {
             detector_id: None,
             detector_version: None,
         };
-        // A partial context-file source: only kind + agent_runtime present.
+        // A partial context-file source: only kind + reporter_id present.
         let partial = SourceInfo {
             kind: "agent_report".to_string(),
             system: None,
@@ -320,9 +320,11 @@ mod tests {
             detector_version: None,
         };
         merge_source_context(&mut base, partial);
+        // Present fields overlay; absent fields keep the base.
         assert_eq!(base.kind, "agent_report");
         assert_eq!(base.reporter_id.as_deref(), Some("env_reporter"));
         assert_eq!(base.agent_runtime.as_deref(), Some("omp"));
+        // Unrelated base fields survive.
         assert_eq!(base.system, None);
     }
 }
