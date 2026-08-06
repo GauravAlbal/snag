@@ -4,12 +4,14 @@ use std::path::PathBuf;
 
 /// Canonical capture-and-move-on instruction block installed by `snag init`.
 /// Kept in one place so the binary, the examples, and the docs never drift.
-pub const INSTRUCTION_BLOCK: &str = r#"When you encounter a material bug, regression, misleading interface, recurring
-workaround, or tooling failure outside the current task, record it with `snag`
-while the evidence is fresh, then continue the assigned task.
+pub const INSTRUCTION_BLOCK: &str = r#"When you find a bug, broken command, misleading success message, recurring
+workaround, or tool failure outside the current task:
 
-Do not broaden the current task to fix the snag unless explicitly asked.
-Do not report ordinary implementation errors or your own transient mistakes.
+1. Record it with `snag` while the evidence is fresh.
+2. Continue the current task.
+
+Do not fix the unrelated problem unless the user explicitly asks you to.
+Do not report ordinary implementation mistakes that belong to the current task.
 "#;
 
 const MARKER_OPEN: &str = "<!-- snag:instructions -->";
