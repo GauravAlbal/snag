@@ -47,6 +47,15 @@ the release process.
 ## [Unreleased]
 
 ### Added
+- **`review list` lane filters + pagination**: `snag review list` now accepts
+  the full `next` filter surface — `--repo` (id, alias, or `current`),
+  `--kind`, `--severity`, `--unreviewed` — plus `--include-deferred` (deferred
+  marks handled=true in the reducer, so `--unhandled` alone hides punted
+  work an owner lane still owns) and explicit `--limit N` / `--offset N`
+  paging with an unbounded default, so `--repo my-lane --unhandled` is a
+  one-flag "my lane's open observations" query and text-parse consumers keep
+  the full dump. `--repo current` resolves from the cwd git context
+  (recording checkout bindings, same as `next`).
 - **Build provenance**: `snag --version` and the `snag doctor` header now
   report the source revision (`rev <sha>`), build date, and a `-dirty` marker
   for builds from an uncommitted tree; internal-lane builds add a flavor

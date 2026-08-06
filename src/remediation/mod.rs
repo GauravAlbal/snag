@@ -1565,20 +1565,39 @@ fn next(args: crate::cli::ReviewNextArgs) -> Result<()> {
     Ok(())
 }
 
-/// `snag review list [filters] [--format json]`
-fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
-    let store = Store::open_read_only()?;
-    let mut sql = String::from(
-        "SELECT o.observation_id, o.title, o.severity_assertion, o.kind_assertion,
-                COALESCE(rs.state, 'unreviewed') AS state,
-                rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id,
-                c.claim_session_id, c.claimed_by
-         FROM observations o
-         LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
-         LEFT JOIN remediation_claims c ON c.claim_id = rs.active_claim_id
-         WHERE 1=1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+/// Push the repository/kind/severity scope clauses for `review list`.
+/// Extracted so `list` stays under the airlock complexity floor.
+fn push_list_scope_clauses(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    repository_id: Option<&str>,
+    args: &crate::cli::ReviewListArgs,
+) {
+    if let Some(rid) = repository_id {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM observation_repositories or2 WHERE or2.observation_id = o.observation_id AND or2.repository_id = ?)",
+        );
+        params.push(Box::new(rid.to_string()));
+    }
+    if let Some(k) = &args.kind {
+        sql.push_str(" AND o.kind_assertion = ?");
+        params.push(Box::new(k.clone()));
+    }
+    if let Some(sev) = &args.severity {
+        sql.push_str(" AND o.severity_assertion = ?");
+        params.push(Box::new(sev.clone()));
+    }
+}
+
+/// Push the review-state clauses (unreviewed, claimed-by, disposition, status).
+fn push_list_state_clauses(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    args: &crate::cli::ReviewListArgs,
+) {
+    if args.unreviewed {
+        sql.push_str(" AND (rs.observation_id IS NULL OR rs.state = 'unreviewed')");
+    }
     if let Some(cb) = &args.claimed_by {
         sql.push_str(
             " AND rs.active_claim_id IS NOT NULL AND rs.active_claim_expires_at IS NOT NULL",
@@ -1594,13 +1613,53 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
         sql.push_str(" AND COALESCE(rs.state, 'unreviewed') = ?");
         params.push(Box::new(s.clone()));
     }
+}
+
+/// Push the handled/unhandled clauses; `--include-deferred` widens `--unhandled`
+/// because deferred marks handled=true in the reducer.
+fn push_list_handled_clauses(sql: &mut String, args: &crate::cli::ReviewListArgs) {
     if args.handled {
         sql.push_str(" AND COALESCE(rs.handled, 0) = 1");
     }
     if args.unhandled {
-        sql.push_str(" AND COALESCE(rs.handled, 0) = 0");
+        if args.include_deferred {
+            sql.push_str(" AND (COALESCE(rs.handled, 0) = 0 OR rs.state = 'deferred')");
+        } else {
+            sql.push_str(" AND COALESCE(rs.handled, 0) = 0");
+        }
     }
+}
+
+/// `snag review list [filters] [--limit N] [--offset N] [--format json]`
+fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
+    // --repo resolution may record checkout bindings for `current`, so a repo
+    // filter needs the write connection (same as `next`).
+    let mut store = if args.repo.is_some() {
+        Store::open_read_write()?
+    } else {
+        Store::open_read_only()?
+    };
+    let repository_id = resolve_repo_filter(&mut store, args.repo.as_deref())?;
+    let mut sql = String::from(
+        "SELECT o.observation_id, o.title, o.severity_assertion, o.kind_assertion,
+                COALESCE(rs.state, 'unreviewed') AS state,
+                rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id,
+                c.claim_session_id, c.claimed_by
+         FROM observations o
+         LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         LEFT JOIN remediation_claims c ON c.claim_id = rs.active_claim_id
+         WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    push_list_scope_clauses(&mut sql, &mut params, repository_id.as_deref(), &args);
+    push_list_state_clauses(&mut sql, &mut params, &args);
+    push_list_handled_clauses(&mut sql, &args);
     sql.push_str(" ORDER BY o.captured_at ASC, o.local_sequence ASC");
+    if args.limit > 0 {
+        sql.push_str(" LIMIT ? OFFSET ?");
+        params.push(Box::new(args.limit as i64));
+        params.push(Box::new(args.offset as i64));
+    }
 
     let mut stmt = store.conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();

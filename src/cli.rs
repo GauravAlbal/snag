@@ -449,6 +449,26 @@ pub struct ReviewHeartbeatArgs {
 
 #[derive(Args)]
 pub struct ReviewListArgs {
+    /// Restrict to a repository (id, alias, or `current`)
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Restrict to an asserted kind (bug|tooling|papercut|friction|usability|probe|feature) — the class of problem
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Restrict to an asserted severity (blocker|major|medium|minor|low) — the reporter's prior; disposition re-ranks
+    #[arg(long)]
+    pub severity: Option<String>,
+
+    /// Only observations with no review activity yet
+    #[arg(long)]
+    pub unreviewed: bool,
+
+    /// Include observations deferred by a prior disposition (with --unhandled; deferred marks handled=true in the reducer)
+    #[arg(long)]
+    pub include_deferred: bool,
+
     /// Only observations claimed by this reviewer/session
     #[arg(long)]
     pub claimed_by: Option<String>,
@@ -466,6 +486,14 @@ pub struct ReviewListArgs {
 
     #[arg(long)]
     pub unhandled: bool,
+
+    /// Maximum rows to print; 0 (default) = unbounded
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+
+    /// Rows to skip before printing (for paging with --limit)
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
 
     #[arg(long)]
     pub format: Option<String>,
