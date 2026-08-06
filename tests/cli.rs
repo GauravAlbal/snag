@@ -94,7 +94,7 @@ fn test_list_filters_gap() {
         .arg("report")
         .arg("List filter test")
         .arg("--kind")
-        .arg("security")
+        .arg("tooling")
         .assert()
         .success();
 
@@ -102,7 +102,7 @@ fn test_list_filters_gap() {
     ctx.cmd()
         .arg("list")
         .arg("--kind")
-        .arg("security")
+        .arg("tooling")
         .assert()
         .success()
         .stdout(predicate::str::contains("List filter test"));
@@ -132,7 +132,7 @@ fn test_json_intake_gap() {
     let json_payload = r#"{
         "schema_version": 1,
         "title": "JSON Intake Test",
-        "kind_assertion": "reliability"
+        "kind_assertion": "bug"
     }"#;
 
     ctx.cmd()
@@ -197,7 +197,7 @@ fn test_certification_mission() {
         .arg("report")
         .arg("System crashed during start")
         .arg("--kind")
-        .arg("reliability")
+        .arg("bug")
         .arg("--idempotency-key")
         .arg("cert_123")
         .assert()
@@ -506,7 +506,7 @@ fn test_json_full_intake_and_replay() {
         "schema_version": 1,
         "title": "JSON Full Intake",
         "summary": "a summary",
-        "kind_assertion": "reliability",
+        "kind_assertion": "tooling",
         "severity_assertion": "major",
         "expected_behavior": "expected works",
         "observed_behavior": "observed fails",
@@ -534,7 +534,7 @@ fn test_json_full_intake_and_replay() {
     ).unwrap();
     let labels: serde_json::Value = serde_json::from_str(&row.4).unwrap();
     assert_eq!(row.0, "JSON Full Intake");
-    assert_eq!(row.1, "reliability");
+    assert_eq!(row.1, "tooling");
     assert_eq!(row.2, 0.85);
     assert_eq!(row.3, "sensitive");
     assert_eq!(labels["area"], "core");
@@ -769,6 +769,85 @@ fn test_report_json_intake_from_file() {
         .stdout(predicate::str::contains("File intake test"));
 }
 
+/// Intake vocabulary check: report rejects unknown kind/severity values with
+/// the allowed set named (CLI flags, bare fast path, and JSON intake all
+/// merge through the same validation).
+#[test]
+fn test_report_rejects_unknown_kind_and_severity() {
+    let ctx = TestContext::new();
+
+    // Unknown severity on the report subcommand.
+    ctx.cmd()
+        .arg("report")
+        .arg("rogue severity")
+        .arg("--severity")
+        .arg("P2")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --severity 'P2'"))
+        .stderr(predicate::str::contains("blocker|major|medium|minor|low"));
+
+    // Unknown kind on the bare fast path.
+    ctx.cmd()
+        .arg("rogue kind")
+        .arg("--kind")
+        .arg("defect")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --kind 'defect'"))
+        .stderr(predicate::str::contains(
+            "bug|tooling|papercut|friction|usability|probe|feature",
+        ));
+
+    // JSON intake is validated too.
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(
+            r#"{"schema_version": 1, "title": "bad json kind", "kind_assertion": "runtime"}"#,
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --kind 'runtime'"));
+
+    // Nothing was persisted: the store was never created.
+    assert!(
+        !ctx.data_dir.join("snag.sqlite").exists(),
+        "a rejected report must not create the store"
+    );
+}
+
+/// O4: a JSON-intake read failure names the failure AND the remedy (the
+/// --json dual role: TITLE-as-file is intake, TITLE-as-text is JSON output).
+/// Only reachable when an existing file fails to read, so this exercises the
+/// permission-denied path.
+#[cfg(unix)]
+#[test]
+fn test_missing_json_intake_file_names_remedy() {
+    let ctx = TestContext::new();
+    let payload = ctx.home_dir.path().join("unreadable.json");
+    std::fs::write(&payload, r#"{"schema_version": 1, "title": "nope"}"#).unwrap();
+    let perms = std::fs::metadata(&payload).unwrap().permissions();
+    std::fs::set_permissions(
+        &payload,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .arg(&payload)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Could not read JSON file"))
+        .stderr(predicate::str::contains("--stdin for JSON intake"));
+    std::fs::set_permissions(&payload, perms).unwrap();
+    assert!(
+        !ctx.data_dir.join("snag.sqlite").exists(),
+        "a rejected report must not create the store"
+    );
+}
+
 /// Dogfood finding (fixed): the bare fast path `snag "<title>"` must accept
 /// the structured flags without requiring the `report` subcommand.
 #[test]
@@ -993,16 +1072,29 @@ fn test_doctor_reports_paths_and_version() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!(
-            "snag {} (doctor)",
-            env!("CARGO_PKG_VERSION")
-        )))
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")))
+        .stdout(predicate::str::contains("(doctor)"))
         .stdout(predicate::str::contains("Database:"))
         .stdout(predicate::str::contains(expected_db.display().to_string()))
         .stdout(predicate::str::contains("Objects:"))
         .stdout(predicate::str::contains("Backups:"))
         .stdout(predicate::str::contains("Context file:"))
         .stdout(predicate::str::contains("(not set)"));
+}
+
+/// Build provenance: --version reports the source revision and build date so
+/// a stale installed binary is distinguishable from a fresh build (and the
+/// `-dirty` marker reveals uncommitted-tree builds).
+#[test]
+fn test_version_prints_build_provenance() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")))
+        .stdout(predicate::str::contains("rev "))
+        .stdout(predicate::str::contains("built "));
 }
 
 /// repro_key: every report carries a deterministic localization label that

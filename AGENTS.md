@@ -58,8 +58,8 @@ Do not report ordinary implementation errors or your own transient mistakes.
 
 ```sh
 snag report "<specific symptom>" \
-  --kind <bug|papercut|friction|usability> \
-  --severity <minor|major|blocker> \
+  --kind <bug|tooling|papercut|friction|usability|probe|feature> \
+  --severity <blocker|major|medium|minor|low> \
   --observed "<what happened>" \
   --expected "<what should have happened>" \
   --repro "<minimal reproduction, when known>"

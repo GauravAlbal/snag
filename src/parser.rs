@@ -66,6 +66,40 @@ pub fn sensitivity_from_str(s: Option<&str>) -> Sensitivity {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Asserted kind/severity vocabulary (v0).
+// ---------------------------------------------------------------------------
+// Report intake rejects values outside these sets so the corpus never drifts
+// into ad-hoc kinds the queue ranking cannot rank. The list/review FILTERS
+// stay permissive on purpose: legacy rows may legitimately carry
+// pre-vocabulary values, and the filters are the only way to query them.
+
+pub const KIND_BUG: &str = "bug";
+pub const KIND_TOOLING: &str = "tooling";
+pub const KIND_PAPERCUT: &str = "papercut";
+pub const KIND_FRICTION: &str = "friction";
+pub const KIND_USABILITY: &str = "usability";
+pub const KIND_PROBE: &str = "probe";
+pub const KIND_FEATURE: &str = "feature";
+
+pub const KINDS: &[&str] = &[
+    KIND_BUG,
+    KIND_TOOLING,
+    KIND_PAPERCUT,
+    KIND_FRICTION,
+    KIND_USABILITY,
+    KIND_PROBE,
+    KIND_FEATURE,
+];
+
+pub const SEV_BLOCKER: &str = "blocker";
+pub const SEV_MAJOR: &str = "major";
+pub const SEV_MEDIUM: &str = "medium";
+pub const SEV_MINOR: &str = "minor";
+pub const SEV_LOW: &str = "low";
+
+pub const SEVERITIES: &[&str] = &[SEV_BLOCKER, SEV_MAJOR, SEV_MEDIUM, SEV_MINOR, SEV_LOW];
+
 #[derive(Debug, Default)]
 pub struct ProseInput {
     pub title: String,

@@ -1,10 +1,23 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Full build-provenance version string, e.g.
+/// `0.3.0-dev (rev 98e61c6-dirty, built 2026-08-06)` — the `, internal`
+/// flavor suffix appears only on internal-lane builds (see build.rs).
+pub const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (rev ",
+    env!("SNAG_BUILD_REV"),
+    ", built ",
+    env!("SNAG_BUILD_DATE"),
+    env!("SNAG_BUILD_FLAVOR_SUFFIX"),
+    ")",
+);
+
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = BUILD_VERSION, about, long_about = None)]
 pub struct Cli {
-    /// The title of the observation (fast path)
+    /// The title of the observation (fast path — equivalent to `snag report <title>` with the flags below)
     pub title: Option<String>,
 
     #[command(subcommand)]
@@ -12,6 +25,7 @@ pub struct Cli {
 
     // Fast-path structured flags (mirror ReportArgs so `snag "<title>"
     // --kind bug --severity minor` works without the `report` subcommand).
+    /// asserted kind (bug|tooling|papercut|friction|usability|probe|feature) — the class of problem
     #[arg(long)]
     pub kind: Option<String>,
 
@@ -21,42 +35,55 @@ pub struct Cli {
     )]
     pub severity: Option<String>,
 
+    /// what should have happened — the violated contract
     #[arg(long)]
     pub expected: Option<String>,
 
+    /// what actually happened — the observed evidence
     #[arg(long)]
     pub observed: Option<String>,
 
+    /// how the issue was worked around, if at all
     #[arg(long)]
     pub workaround: Option<String>,
 
+    /// minimal reproduction steps
     #[arg(long)]
     pub repro: Option<String>,
 
+    /// JSON output; when TITLE names an existing file (or '-'), it becomes JSON intake instead
     #[arg(long)]
     pub json: bool,
 
+    /// read the observation payload from stdin (with --json, stdin owns intake and --json only selects JSON output)
     #[arg(long)]
     pub stdin: bool,
 
+    /// attach one or more artifact files (repeatable)
     #[arg(long = "artifact")]
     pub artifacts: Vec<PathBuf>,
 
+    /// stable attempt-local key — same key + same payload replays the original observation; same key + different payload is a typed conflict
     #[arg(long)]
     pub idempotency_key: Option<String>,
 
+    /// override the detected repository identity
     #[arg(long)]
     pub repo_id: Option<String>,
 
+    /// session identifier recorded with the observation
     #[arg(long)]
     pub session_id: Option<String>,
 
+    /// task identifier recorded with the observation
     #[arg(long)]
     pub task_id: Option<String>,
 
+    /// attempt identifier recorded with the observation
     #[arg(long)]
     pub attempt_id: Option<String>,
 
+    /// additional affected repositories (repeatable)
     #[arg(long = "affected-repo")]
     pub affected_repos: Vec<String>,
 }
@@ -116,6 +143,7 @@ pub struct ReportArgs {
     #[arg(required_unless_present_any = ["json", "stdin"])]
     pub title: Option<String>,
 
+    /// asserted kind (bug|tooling|papercut|friction|usability|probe|feature) — the class of problem
     #[arg(long)]
     pub kind: Option<String>,
 
@@ -125,42 +153,55 @@ pub struct ReportArgs {
     )]
     pub severity: Option<String>,
 
+    /// what should have happened — the violated contract
     #[arg(long)]
     pub expected: Option<String>,
 
+    /// what actually happened — the observed evidence
     #[arg(long)]
     pub observed: Option<String>,
 
+    /// how the issue was worked around, if at all
     #[arg(long)]
     pub workaround: Option<String>,
 
+    /// minimal reproduction steps
     #[arg(long)]
     pub repro: Option<String>,
 
+    /// JSON output; when TITLE names an existing file (or '-'), it becomes JSON intake instead
     #[arg(long)]
     pub json: bool,
 
+    /// read the observation payload from stdin (with --json, stdin owns intake and --json only selects JSON output)
     #[arg(long)]
     pub stdin: bool,
 
+    /// attach one or more artifact files (repeatable)
     #[arg(long = "artifact")]
     pub artifacts: Vec<PathBuf>,
 
+    /// stable attempt-local key — same key + same payload replays the original observation; same key + different payload is a typed conflict
     #[arg(long)]
     pub idempotency_key: Option<String>,
 
+    /// override the detected repository identity
     #[arg(long)]
     pub repo_id: Option<String>,
 
+    /// session identifier recorded with the observation
     #[arg(long)]
     pub session_id: Option<String>,
 
+    /// task identifier recorded with the observation
     #[arg(long)]
     pub task_id: Option<String>,
 
+    /// attempt identifier recorded with the observation
     #[arg(long)]
     pub attempt_id: Option<String>,
 
+    /// additional affected repositories (repeatable)
     #[arg(long = "affected-repo")]
     pub affected_repos: Vec<String>,
 }
@@ -176,6 +217,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub source: Option<String>,
 
+    /// asserted kind (bug|tooling|papercut|friction|usability|probe|feature) — the class of problem
     #[arg(long)]
     pub kind: Option<String>,
 
@@ -321,7 +363,7 @@ pub struct ReviewNextArgs {
     #[arg(long)]
     pub repo: Option<String>,
 
-    /// Restrict to an asserted kind
+    /// Restrict to an asserted kind (bug|tooling|papercut|friction|usability|probe|feature) — the class of problem
     #[arg(long)]
     pub kind: Option<String>,
 

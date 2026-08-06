@@ -46,6 +46,29 @@ the release process.
 
 ## [Unreleased]
 
+### Added
+- **Build provenance**: `snag --version` and the `snag doctor` header now
+  report the source revision (`rev <sha>`), build date, and a `-dirty` marker
+  for builds from an uncommitted tree; internal-lane builds add a flavor
+  suffix. `snag doctor` compares the embedded revision against the repo HEAD
+  when run from a matching checkout and warns when the installed binary is
+  stale — so a fix sitting in the tree while the installed binary still runs
+  older code is one command away from diagnosable.
+
+### Changed
+- **Report flag documentation**: every `report`/fast-path flag now carries
+  help text, including the `--json` dual role (a TITLE that names an existing
+  file, or `-`, is JSON intake; otherwise `--json` selects JSON output) and
+  `--stdin` intake ownership.
+- **Intake vocabulary enforcement**: `--kind` and `--severity` are validated
+  at report intake against the canonical sets
+  (`bug|tooling|papercut|friction|usability|probe|feature` and
+  `blocker|major|medium|minor|low`); unknown values are rejected with the
+  allowed set named. The `list`/`review` filters stay permissive so legacy
+  drift values remain queryable.
+- **JSON intake error remedy**: a failed JSON-file read now names the escape
+  hatch (`--stdin` for stdin intake; a non-file title for JSON output) instead
+  of a bare read error.
 ## [0.2.0] - 2026-08-05
 
 ### Added

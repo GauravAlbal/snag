@@ -99,8 +99,12 @@ fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
                 .read_to_string(&mut buffer)
                 .map_err(|e| SnagError::Other(e.into()))?;
         } else {
-            buffer = std::fs::read_to_string(&path)
-                .map_err(|e| SnagError::Validation(format!("Could not read JSON file: {}", e)))?;
+            buffer = std::fs::read_to_string(&path).map_err(|e| {
+                SnagError::Validation(format!(
+                    "Could not read JSON file: {} — with --json, a TITLE that is not an existing file is JSON output; use --stdin for JSON intake on stdin, or a valid file path for file intake",
+                    e
+                ))
+            })?;
         }
         let json_input: JsonInput = serde_json::from_str(&buffer)
             .map_err(|e| SnagError::Validation(format!("Invalid JSON: {}", e)))?;
@@ -138,6 +142,32 @@ fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
     }
     if cli_severity.is_some() {
         severity = cli_severity;
+    }
+
+    // Intake vocabulary check: unknown kind/severity values are rejected here
+    // (CLI, JSON, and bare fast path all merge into these values) so the
+    // corpus never accumulates drift that the queue ranking silently ranks
+    // last. Filters stay permissive: legacy rows may carry pre-vocabulary
+    // values, and filters are the only way to query them.
+    if let Some(k) = &kind
+        && !crate::parser::KINDS.contains(&k.as_str())
+    {
+        return Err(SnagError::Validation(format!(
+            "invalid --kind '{}'; allowed: {}",
+            k,
+            crate::parser::KINDS.join("|")
+        ))
+        .into());
+    }
+    if let Some(s) = &severity
+        && !crate::parser::SEVERITIES.contains(&s.as_str())
+    {
+        return Err(SnagError::Validation(format!(
+            "invalid --severity '{}'; allowed: {}",
+            s,
+            crate::parser::SEVERITIES.join("|")
+        ))
+        .into());
     }
 
     let title = title.unwrap_or_default();
