@@ -2,10 +2,40 @@ use crate::cli::DoctorArgs;
 use crate::store::Store;
 use anyhow::Result;
 use std::fs;
+use std::process::Command;
 
 pub fn handle(_args: DoctorArgs) -> Result<()> {
-    println!("snag {} (doctor)", env!("CARGO_PKG_VERSION"));
+    println!("snag {} (doctor)", crate::cli::BUILD_VERSION);
     println!();
+
+    // Stale-binary guard: when the embedded source repository matches the
+    // repo doctor is run from, compare the embedded revision against HEAD and
+    // warn on drift. Dogfood findings: (a) a fix can sit committed in the tree
+    // while the installed binary still runs older code (rev mismatch); (b) a
+    // fix can sit UNcommitted in the tree with the installed binary built
+    // from a dirty workspace (the `-dirty` marker on the built rev).
+    let built_rev = env!("SNAG_BUILD_REV");
+    let built_repo = env!("SNAG_BUILD_REPO_URL");
+    if !built_repo.is_empty() && !built_rev.starts_with("unknown") {
+        let here = Command::new("git")
+            .args(["config", "--get", "remote.origin.url"])
+            .output();
+        let head = Command::new("git")
+            .args(["rev-parse", "--short=7", "HEAD"])
+            .output();
+        if let (Ok(url_out), Ok(head_out)) = (here, head) {
+            let url = String::from_utf8_lossy(&url_out.stdout).trim().to_string();
+            let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+            let clean_rev = built_rev.trim_end_matches("-dirty");
+            if url == built_repo && !head.is_empty() && clean_rev != head {
+                println!(
+                    "⚠️  Installed binary is STALE: built from rev {clean_rev}, repo HEAD is {head}"
+                );
+                println!("    rebuild and reinstall before trusting version-specific behavior.");
+                println!();
+            }
+        }
+    }
 
     // Effective context source.
     let ctx_file = std::env::var("SNAG_CONTEXT_FILE").ok();

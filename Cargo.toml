@@ -8,6 +8,7 @@ repository = "https://github.com/GauravAlbal/snag"
 readme = "README.md"
 keywords = ["observability", "agent", "reporting", "incident", "sqlite"]
 categories = ["command-line-utilities", "development-tools"]
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.104"
