@@ -313,7 +313,7 @@ mod tests {
             kind: "agent_report".to_string(),
             system: None,
             reporter_id: None,
-            agent_runtime: Some("omp".to_string()),
+            agent_runtime: Some("test_runtime".to_string()),
             agent_name: None,
             model: None,
             detector_id: None,
@@ -323,7 +323,7 @@ mod tests {
         // Present fields overlay; absent fields keep the base.
         assert_eq!(base.kind, "agent_report");
         assert_eq!(base.reporter_id.as_deref(), Some("env_reporter"));
-        assert_eq!(base.agent_runtime.as_deref(), Some("omp"));
+        assert_eq!(base.agent_runtime.as_deref(), Some("test_runtime"));
         // Unrelated base fields survive.
         assert_eq!(base.system, None);
     }
