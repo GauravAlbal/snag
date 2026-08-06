@@ -890,7 +890,7 @@ fn test_init_writes_instructions() {
         .stdout(predicate::str::contains("Configured"));
     let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
     assert!(
-        content.contains("record it with `snag`"),
+        content.contains("1. Record it with `snag` while the evidence is fresh."),
         "block must be installed"
     );
     assert!(content.contains("<!-- snag:instructions -->"));
@@ -944,7 +944,7 @@ fn test_init_preserves_existing_file() {
         content.starts_with("# existing instructions"),
         "existing content must survive"
     );
-    assert!(content.contains("record it with `snag`"));
+    assert!(content.contains("1. Record it with `snag` while the evidence is fresh."));
 }
 
 /// `snag init --file <path>` targets a custom file.
