@@ -59,6 +59,17 @@ the release process.
 - **Prefix observation ids**: `snag show` and `snag retract` resolve a unique
   prefix of an observation id (GitHub-style); ambiguity and misses are typed
   errors.
+- **Remediation protocol**: the normalized review surface lands in six
+  incremental units — the event schema v5 substrate (claims, dispositions,
+  relationships, remediation links + the materialized review-state
+  projection) with the v4→v5 migration; the review queue with transactional
+  claim leases; dispositions (verified-fixed, expected-behavior, negative)
+  and relationships (same-finding, duplicate-of, upstream-cause); lineage
+  (promotion, task/commit attachment, mark-handled, reopen); inspection
+  (`snag review show/history` with unique-prefix id resolution) and
+  remediation verification checks; persisted per-store review sessions and
+  `snag review verify-report` completion validation. Adds the `serde_yaml`
+  dependency.
 
 ### Changed
 - **Severity microcopy**: `--severity` help frames the assertion as a prior
