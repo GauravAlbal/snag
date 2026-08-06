@@ -5,8 +5,8 @@ All notable changes to snag are documented here. Format follows
 [SemVer](https://semver.org/). See [docs/RELEASING.md](docs/RELEASING.md) for
 the release process.
 
-> **Version state on `main`:** development for v0.2.0; `snag --version` reports
-> `0.2.0-dev` on unreleased builds. The current release is `v0.1.1`
+> **Version state on `main`:** development for v0.3.0; `snag --version` reports
+> `0.3.0-dev` on unreleased builds. The current release is `v0.2.0`
 > (Apache-2.0); the prior MIT release `v0.1.0` is retired (release and tag
 > removed). All versions from v0.1.1 onward are Apache-2.0.
 
@@ -45,6 +45,8 @@ the release process.
   `--tag v0.1.1` vs current main).
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-08-05
 
 ### Added
 - **Release workflow**: four-platform binaries, SHA-256 checksums, source-SHA
@@ -123,5 +125,6 @@ Certified v0.1.0 — 59-test surface, three hard gates, tag `v0.1.0`.
 - **Testing**: 59 tests across cli, git_identity, migration, concurrency,
   robustness suites; GitHub Actions CI.
 
-[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/GauravAlbal/snag/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/GauravAlbal/snag/releases/tag/v0.1.1
