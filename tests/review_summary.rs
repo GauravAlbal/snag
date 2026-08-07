@@ -339,3 +339,84 @@ fn t6_invalid_threshold_rejected() {
         .unwrap();
     assert!(!out.status.success(), "zero count rejected");
 }
+
+// ---------------------------------------------------------------------------
+// Capstone: rebuild -> summary grouping parity (end-to-end hermetic).
+// ---------------------------------------------------------------------------
+
+/// Snapshot the summary's per-lane open counts (repo_id -> open) from JSON.
+fn summary_open_by_lane(ctx: &TestContext) -> std::collections::BTreeMap<String, i64> {
+    let out = summary_cmd(ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "summary must run cleanly");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut map = std::collections::BTreeMap::new();
+    for repo in v["repos"].as_array().unwrap() {
+        let rid = repo["repo_id"].as_str().unwrap().to_string();
+        map.insert(rid, repo["open"].as_i64().unwrap());
+    }
+    map
+}
+
+#[test]
+fn t7_rebuild_preserves_summary_grouping() {
+    let ctx = TestContext::new();
+    report_in(&ctx, "c1", "repo_alpha", "major");
+    report_in(&ctx, "c2", "repo_alpha", "minor");
+    report_in(&ctx, "c3", "repo_beta", "medium");
+
+    // Snapshot grouping before the round trip.
+    let before = summary_open_by_lane(&ctx);
+    assert_eq!(before.len(), 2, "two primary lanes pre-rebuild");
+    assert_eq!(before["repo_alpha"], 2);
+    assert_eq!(before["repo_beta"], 1);
+
+    // Export -> rebuild -> verify -> summary again.
+    let export_path = ctx.home_dir.path().join("export.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export_path)
+        .assert()
+        .success();
+    let rebuilt = ctx.home_dir.path().join("rebuilt-cap");
+    let dest = rebuilt.join("snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export_path)
+        .arg("--destination")
+        .arg(&dest)
+        .assert()
+        .success();
+
+    // Point the summary at the rebuilt store via XDG_DATA_HOME.
+    let rebuilt_ctx_cmd = || {
+        let mut c = Command::cargo_bin("snag").unwrap();
+        c.env("XDG_DATA_HOME", &rebuilt)
+            .env("HOME", ctx.home_dir.path());
+        c
+    };
+    let out = rebuilt_ctx_cmd()
+        .arg("review")
+        .arg("summary")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "summary on rebuilt store");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut after = std::collections::BTreeMap::new();
+    for repo in v["repos"].as_array().unwrap() {
+        let rid = repo["repo_id"].as_str().unwrap().to_string();
+        after.insert(rid, repo["open"].as_i64().unwrap());
+    }
+
+    assert_eq!(
+        before, after,
+        "summary grouping must survive rebuild: before={before:?} after={after:?}"
+    );
+}
