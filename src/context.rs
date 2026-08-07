@@ -272,6 +272,7 @@ pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
         artifacts: vec![],
         idempotency_key: None,
         repo_id: None,
+        owner: None,
         session_id: None,
         task_id: None,
         attempt_id: None,

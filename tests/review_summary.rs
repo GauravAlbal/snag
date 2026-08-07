@@ -1,7 +1,7 @@
 //! `snag review summary` — per-repo open-observation materiality (Pearl 2 of
 //! the summary intent).
 //!
-//! Owner lane = observation_repositories.role='primary'. Threshold exit code:
+//! Owner lane = fix owner (role='owner') when set, else filing reporter (role='reporter'). Threshold exit code:
 //! exit 1 when ANY evaluated lane has >= count open ACTIONABLE obs at the
 //! given severity (actionable = open AND state NOT IN candidate_fix /
 //! remediation_in_progress); `--repo` narrows the evaluated set. Unowned obs
@@ -505,4 +505,65 @@ fn t8_long_lane_names_keep_columns_aligned() {
         );
     }
     assert!(data_rows >= 1, "at least one data row: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// t9: owner attribution — an obs filed from lane A with --owner lane B groups
+// under B (the fix owner), not A (the filing reporter).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t9_owner_groups_by_fix_owner_not_reporter() {
+    let ctx = TestContext::new();
+    // Filed from repo_alpha (reporter), fix owned by repo_beta.
+    ctx.cmd()
+        .arg("report")
+        .arg("owned-by-beta")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .arg("--repo-id")
+        .arg("repo_alpha")
+        .arg("--owner")
+        .arg("repo_beta")
+        .assert()
+        .success();
+    // A plain obs in repo_alpha with no owner groups under alpha (reporter).
+    report_in(&ctx, "alpha-plain", "repo_alpha", "minor");
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let repos = v["repos"].as_array().unwrap();
+
+    let beta = repos
+        .iter()
+        .find(|r| r["repo_id"] == "repo_beta")
+        .expect("owner lane repo_beta present");
+    assert_eq!(
+        beta["open"], 1,
+        "the owned obs groups under its fix owner: {v}"
+    );
+    assert_eq!(
+        beta["severity_counts"]["major"], 1,
+        "the major owned obs counts in beta"
+    );
+
+    let alpha = repos
+        .iter()
+        .find(|r| r["repo_id"] == "repo_alpha")
+        .expect("reporter lane repo_alpha present");
+    assert_eq!(
+        alpha["open"], 1,
+        "alpha holds only its own plain obs, not the owned one: {v}"
+    );
+    assert_eq!(
+        alpha["severity_counts"]["minor"], 1,
+        "alpha has the minor plain obs"
+    );
 }

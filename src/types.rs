@@ -48,11 +48,19 @@ pub struct Observation {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub artifacts: Vec<ArtifactReference>,
 
-    /// Resolved repository IDs (primary + affected) persisted by the reporter.
-    /// These live in the canonical payload so rebuild can reconstruct the
+    /// Affected repository IDs persisted by the reporter. These live in the
+    /// canonical payload so rebuild can reconstruct the
     /// `observation_repositories` projection without external state.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub affected_repository_ids: Vec<String>,
+
+    /// The fix-owner repository (from `snag report --owner`), when explicitly
+    /// named. Distinct from the reporter's filing context: the reporter is
+    /// where the observation was filed FROM; the owner is the lane that
+    /// should remediate it. Optional and skip-if-none so existing records'
+    /// canonical encoding is byte-identical (no hash-chain orphaning).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_repository_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

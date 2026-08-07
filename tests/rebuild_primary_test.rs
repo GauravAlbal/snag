@@ -1,6 +1,6 @@
-//! Rebuild primary-role preservation (Pearl 1 of the summary intent).
+//! Rebuild reporter-role preservation (Pearl 1 of the summary intent)).
 //!
-//! The owner-lane projection (`observation_repositories.role='primary'`) is
+//! The attribution projection (`observation_repositories.role='reporter'`) is
 //! written at filing from the resolved repository identity. `snag rebuild`
 //! must reconstruct it from the canonical payload's
 //! `context.repository.repository_id`; inserting only `affected_repository_ids`
@@ -35,7 +35,7 @@ impl TestContext {
     }
 }
 
-/// File an observation pinned to a repository (the primary/owner lane).
+/// File an observation pinned to a repository (the filing reporter).
 fn report_in(ctx: &TestContext, title: &str, repo_id: &str) -> String {
     ctx.cmd()
         .arg("report")
@@ -57,13 +57,13 @@ fn report_in(ctx: &TestContext, title: &str, repo_id: &str) -> String {
         .unwrap()
 }
 
-/// Snapshot the primary-role projection of a store: (observation, repository)
-/// pairs with role='primary'.
-fn primary_rows(db: &std::path::Path) -> Vec<(String, String)> {
+/// Snapshot the reporter-role projection of a store: (observation, repository)
+/// pairs with role='reporter'.
+fn reporter_rows(db: &std::path::Path) -> Vec<(String, String)> {
     let conn = Connection::open(db).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT observation_id, repository_id FROM observation_repositories WHERE role='primary' ORDER BY observation_id",
+            "SELECT observation_id, repository_id FROM observation_repositories WHERE role='reporter' ORDER BY observation_id",
         )
         .unwrap();
     let mut rows = stmt.query([]).unwrap();
@@ -81,11 +81,11 @@ fn t1_rebuild_preserves_primary_role() {
     report_in(&ctx, "primary-b", "repo_beta");
 
     // Snapshot the live projection before the round trip.
-    let live = primary_rows(&ctx.data_dir.join("snag.sqlite"));
+    let live = reporter_rows(&ctx.data_dir.join("snag.sqlite"));
     assert_eq!(
         live.len(),
         2,
-        "both obs must carry a primary role pre-rebuild"
+        "both obs must carry a reporter role pre-rebuild"
     );
 
     let export_path = ctx.home_dir.path().join("export.jsonl");
@@ -107,10 +107,81 @@ fn t1_rebuild_preserves_primary_role() {
         .assert()
         .success();
 
-    let after = primary_rows(&dest.join("snag.sqlite"));
+    let after = reporter_rows(&dest.join("snag.sqlite"));
     assert_eq!(
         live, after,
-        "primary role must survive rebuild: live={live:?} rebuilt={after:?}"
+        "reporter role must survive rebuild: live={live:?} rebuilt={after:?}"
+    );
+}
+
+/// Snapshot the owner-role projection: (observation, repository) pairs.
+fn owner_rows(db: &std::path::Path) -> Vec<(String, String)> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT observation_id, repository_id FROM observation_repositories WHERE role='owner' ORDER BY observation_id",
+        )
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    let mut v = Vec::new();
+    while let Some(r) = rows.next().unwrap() {
+        v.push((r.get(0).unwrap(), r.get(1).unwrap()));
+    }
+    v
+}
+
+#[test]
+fn t3_rebuild_preserves_owner_role() {
+    let ctx = TestContext::new();
+    // File from repo_alpha, owning the fix to repo_beta: reporter + owner
+    // are distinct actors and must both survive rebuild.
+    ctx.cmd()
+        .arg("report")
+        .arg("owner-obs")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .arg("--repo-id")
+        .arg("repo_alpha")
+        .arg("--owner")
+        .arg("repo_beta")
+        .assert()
+        .success();
+
+    let live_reporter = reporter_rows(&ctx.data_dir.join("snag.sqlite"));
+    let live_owner = owner_rows(&ctx.data_dir.join("snag.sqlite"));
+    assert_eq!(live_owner.len(), 1, "owner link recorded at filing");
+    assert_eq!(live_owner[0].1, "repo_beta");
+
+    let export_path = ctx.home_dir.path().join("export.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export_path)
+        .assert()
+        .success();
+
+    let rebuilt = ctx.home_dir.path().join("rebuilt3");
+    let dest = rebuilt.join("snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export_path)
+        .arg("--destination")
+        .arg(&dest)
+        .assert()
+        .success();
+
+    assert_eq!(
+        live_reporter,
+        reporter_rows(&dest.join("snag.sqlite")),
+        "reporter role survives rebuild with owner set"
+    );
+    assert_eq!(
+        live_owner,
+        owner_rows(&dest.join("snag.sqlite")),
+        "owner role survives rebuild: {live_owner:?}"
     );
 }
 
@@ -152,7 +223,7 @@ fn t2_rebuild_unowned_obs_stays_unowned() {
         .assert()
         .success();
 
-    let after = primary_rows(&dest.join("snag.sqlite"));
+    let after = reporter_rows(&dest.join("snag.sqlite"));
     assert!(
         after.is_empty(),
         "unowned obs must stay unowned through rebuild, got {after:?}"

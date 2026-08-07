@@ -71,6 +71,11 @@ pub struct Cli {
     #[arg(long)]
     pub repo_id: Option<String>,
 
+    /// the repo/lane that owns the fix (id, alias, or `current`) — distinct
+    /// from the filing context; summary and review list group by this when set
+    #[arg(long)]
+    pub owner: Option<String>,
+
     /// session identifier recorded with the observation
     #[arg(long)]
     pub session_id: Option<String>,
@@ -189,6 +194,11 @@ pub struct ReportArgs {
     /// override the detected repository identity
     #[arg(long)]
     pub repo_id: Option<String>,
+
+    /// the repo/lane that owns the fix (id, alias, or `current`) — distinct
+    /// from the filing context; summary and review list group by this when set
+    #[arg(long)]
+    pub owner: Option<String>,
 
     /// session identifier recorded with the observation
     #[arg(long)]

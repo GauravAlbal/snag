@@ -95,6 +95,7 @@ mod tests {
             context: crate::types::ContextInfo::default(),
             artifacts: vec![],
             affected_repository_ids: vec![],
+            owner_repository_id: None,
         }
     }
 

@@ -27,6 +27,7 @@ struct ReportInputs {
     labels: Option<std::collections::BTreeMap<String, String>>,
     idempotency_key: Option<String>,
     affected_repos: Vec<String>,
+    owner: Option<String>,
     source_override: Option<crate::types::SourceInfo>,
     context_override: Option<crate::types::ContextInfo>,
     artifact_paths: Vec<PathBuf>,
@@ -43,6 +44,7 @@ fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
     let mut severity = args.severity.clone();
     let mut idempotency_key = args.idempotency_key.clone();
     let mut affected_repos = args.affected_repos.clone();
+    let owner = args.owner.clone();
     let mut impact = None;
     let mut confidence: Option<f64> = None;
     let mut sensitivity: Option<String> = None;
@@ -189,6 +191,7 @@ fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
         labels,
         idempotency_key,
         affected_repos,
+        owner,
         source_override,
         context_override,
         artifact_paths,
@@ -264,13 +267,18 @@ fn ingest_artifacts(
     Ok(artifacts)
 }
 
-/// Resolve the primary repository (explicit-ID precedence) and every affected
-/// repository before the transaction. Returns (primary_repo_id, resolved_affected).
+/// Resolve the reporter repository (explicit-ID precedence), every affected
+/// repository, and the optional fix-owner repository before the transaction.
+/// Returns (reporter_repo_id, resolved_affected, resolved_owner).
 fn resolve_identity(
     store: &mut Store,
     context: &mut crate::types::ContextInfo,
     affected_repos: &[String],
-) -> Result<(Option<String>, Vec<String>)> {
+    owner: Option<&str>,
+) -> Result<(Option<String>, Vec<String>, Option<String>)> {
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let mut temp_git = crate::git::GitContext::default();
     let mut primary_repo_id: Option<String> = None;
     if let Some(repo_ctx) = &context.repository {
@@ -301,6 +309,22 @@ fn resolve_identity(
             resolved_affected.push(rid);
         }
     }
+    // The fix owner resolves through the same id/alias/current machinery;
+    // a bare unknown id is created (like `--repo-id`) so `--owner arq` works
+    // even before arq has any recorded aliases.
+    let resolved_owner = match owner {
+        Some(raw) if raw == "current" => Some(crate::identity::resolve_affected_repository(
+            store, raw, &temp_git,
+        )?),
+        Some(raw) => {
+            let rid = crate::identity::resolve_affected_repository(store, raw, &temp_git);
+            match rid {
+                Ok(rid) => Some(rid),
+                Err(_) => Some(crate::identity::ensure_explicit_repo(store, raw, &now)?),
+            }
+        }
+        None => None,
+    };
     let mut all_repo_ids = resolved_affected.clone();
     if let Some(p) = &primary_repo_id
         && !all_repo_ids.contains(p)
@@ -308,7 +332,7 @@ fn resolve_identity(
         all_repo_ids.push(p.clone());
     }
     let _ = all_repo_ids;
-    Ok((primary_repo_id, resolved_affected))
+    Ok((primary_repo_id, resolved_affected, resolved_owner))
 }
 
 /// Outcome of the idempotency check for a report attempt.
@@ -395,6 +419,7 @@ fn insert_created_observation(
     hash: &RecordHashBundle<'_>,
     primary_repo_id: Option<&str>,
     resolved_affected: &[String],
+    resolved_owner: Option<&str>,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO records (local_sequence, record_id, record_type, entity_id, captured_at, canonical_payload_json, previous_record_hash, record_hash)
@@ -469,8 +494,14 @@ fn insert_created_observation(
     }
     if let Some(p) = primary_repo_id {
         tx.execute(
-            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'primary')",
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'reporter')",
             rusqlite::params![&obs.observation_id, p],
+        )?;
+    }
+    if let Some(o) = resolved_owner {
+        tx.execute(
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'owner')",
+            rusqlite::params![&obs.observation_id, o],
         )?;
     }
     for repo_id in resolved_affected {
@@ -561,8 +592,12 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     let artifacts = ingest_artifacts(&artifact_storage, &inputs.artifact_paths)?;
 
     // 3.5. Identity resolution before the transaction.
-    let (primary_repo_id, resolved_affected) =
-        resolve_identity(&mut store, &mut context, &inputs.affected_repos)?;
+    let (primary_repo_id, resolved_affected, resolved_owner) = resolve_identity(
+        &mut store,
+        &mut context,
+        &inputs.affected_repos,
+        inputs.owner.as_deref(),
+    )?;
 
     // 4. Begin Transaction and allocate.
     crate::failpoint::failpoint("before_tx");
@@ -612,6 +647,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         context,
         artifacts: artifacts.clone(),
         affected_repository_ids: inputs.affected_repos,
+        owner_repository_id: resolved_owner.clone(),
     };
 
     // repro_key: a deterministic, store-scoped hash key that localizes this
@@ -672,6 +708,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         &hash,
         primary_repo_id.as_deref(),
         &resolved_affected,
+        resolved_owner.as_deref(),
     )?;
 
     tx.commit()?;

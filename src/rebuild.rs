@@ -97,11 +97,12 @@ fn reconstruct_observation(
         ],
     )?;
 
-    // The primary repository (the owner lane) is persisted in the canonical
-    // payload's context.repository.repository_id by the reporter
+    // The reporter repository (the filing context) is persisted in the
+    // canonical payload's context.repository.repository_id by the reporter
     // (report.rs resolve_identity). Rebuild must re-insert it with
-    // role='primary' — inserting only `affected_repository_ids` as
-    // 'affected' silently destroys owner attribution on every rebuild.
+    // role='reporter' — inserting only `affected_repository_ids` as
+    // 'affected' silently destroys filing-context attribution on every
+    // rebuild.
     if let Some(primary) = obs
         .context
         .repository
@@ -115,8 +116,26 @@ fn reconstruct_observation(
             rusqlite::params![&primary, &captured_at],
         )?;
         tx.execute(
-            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'primary')",
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'reporter')",
             rusqlite::params![&obs.observation_id, &primary],
+        )?;
+    }
+
+    // The fix owner (from `snag report --owner`) reconstructs from the
+    // canonical payload's optional owner_repository_id.
+    if let Some(owner) = obs
+        .owner_repository_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        tx.execute(
+            "INSERT OR REPLACE INTO repositories (repository_id, created_at)
+             VALUES (?1, COALESCE((SELECT created_at FROM repositories WHERE repository_id = ?1), ?2))",
+            rusqlite::params![owner, &captured_at],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'owner')",
+            rusqlite::params![&obs.observation_id, owner],
         )?;
     }
 

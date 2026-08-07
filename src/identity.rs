@@ -8,14 +8,20 @@ use rusqlite::{OptionalExtension, params};
 /// made from (primary) or a repository it is understood to affect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoRole {
-    Primary,
+    /// The filing context — the repo the reporter was in when the observation
+    /// was captured.
+    Reporter,
+    /// The lane that owns the fix (explicit `--owner`).
+    Owner,
+    /// Additional repos implicated by the observation.
     Affected,
 }
 
 impl RepoRole {
     pub fn as_str(&self) -> &'static str {
         match self {
-            RepoRole::Primary => "primary",
+            RepoRole::Reporter => "reporter",
+            RepoRole::Owner => "owner",
             RepoRole::Affected => "affected",
         }
     }
@@ -33,7 +39,11 @@ pub struct RepositoryResolution {
 /// Resolve an explicit repository ID. An explicit ID is honored: if the repo
 /// does not exist it is created (documented rule: the caller explicitly names
 /// the repository, so the identity is created and linked).
-fn ensure_explicit_repo(store: &mut Store, id: &str, now: &str) -> anyhow::Result<String> {
+pub(crate) fn ensure_explicit_repo(
+    store: &mut Store,
+    id: &str,
+    now: &str,
+) -> anyhow::Result<String> {
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

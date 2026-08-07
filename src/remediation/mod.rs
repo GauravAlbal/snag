@@ -1864,26 +1864,32 @@ fn parse_thresholds(raw: &[String]) -> Result<Vec<(String, i64)>> {
     Ok(thresholds)
 }
 
-/// Query per-repo lanes (role='primary'), open (not handled) obs only.
-/// Optional `repository_id` narrows to one lane.
+/// Query per-repo lanes (fix owner when set, else filing reporter), open (not
+/// handled) obs only. Optional `repository_id` narrows to one lane.
 fn query_repo_lanes(
     conn: &rusqlite::Connection,
     repository_id: Option<&str>,
 ) -> Result<Vec<LaneAggregate>> {
-    let mut sql = String::from("SELECT r.repository_id, ");
+    let mut sql = String::from(
+        "SELECT COALESCE(owner_r.repository_id, reporter_r.repository_id) AS lane_id, ",
+    );
     push_lane_aggregate_columns(&mut sql);
     sql.push_str(
         " FROM observations o
-         JOIN observation_repositories r ON r.observation_id = o.observation_id AND r.role = 'primary'
+         LEFT JOIN observation_repositories owner_r
+           ON owner_r.observation_id = o.observation_id AND owner_r.role = 'owner'
+         LEFT JOIN observation_repositories reporter_r
+           ON reporter_r.observation_id = o.observation_id AND reporter_r.role = 'reporter'
          LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
-         WHERE COALESCE(rs.handled, 0) = 0",
+         WHERE COALESCE(rs.handled, 0) = 0
+           AND (owner_r.repository_id IS NOT NULL OR reporter_r.repository_id IS NOT NULL)",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(rid) = repository_id {
-        sql.push_str(" AND r.repository_id = ?");
+        sql.push_str(" AND COALESCE(owner_r.repository_id, reporter_r.repository_id) = ?");
         params.push(Box::new(rid.to_string()));
     }
-    sql.push_str(" GROUP BY r.repository_id");
+    sql.push_str(" GROUP BY COALESCE(owner_r.repository_id, reporter_r.repository_id)");
 
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -1897,7 +1903,8 @@ fn query_repo_lanes(
     Ok(lanes)
 }
 
-/// Query the unowned bucket (open obs with no primary row); None when empty.
+/// Query the unowned bucket (open obs with neither a fix owner nor a filing
+/// reporter); None when empty.
 fn query_unowned_lane(conn: &rusqlite::Connection) -> Result<Option<LaneAggregate>> {
     let mut usql = String::from("SELECT NULL, ");
     push_lane_aggregate_columns(&mut usql);
@@ -1907,7 +1914,7 @@ fn query_unowned_lane(conn: &rusqlite::Connection) -> Result<Option<LaneAggregat
          WHERE COALESCE(rs.handled, 0) = 0
            AND NOT EXISTS (
                SELECT 1 FROM observation_repositories r
-               WHERE r.observation_id = o.observation_id AND r.role = 'primary'
+               WHERE r.observation_id = o.observation_id AND r.role IN ('owner', 'reporter')
            )",
     );
     let mut ustmt = conn.prepare(&usql)?;
@@ -2139,7 +2146,8 @@ fn render_summary_text(
 /// `snag review summary [--repo X] [--at-least severity=count]… [--limit N]
 /// [--format text|json]`
 ///
-/// Per-owner-lane (role='primary') open-observation materiality: a text table
+/// Per-lane (fix owner when set, else filing reporter) open-observation
+/// materiality: a text table
 /// ranked by materiality desc (severity mix, unreviewed, oldest, unowned
 /// bucket) or a `review_summary_v1` JSON envelope. With `--at-least`
 /// thresholds, exits 1 when ANY evaluated lane crosses one (actionable open
