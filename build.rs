@@ -38,6 +38,10 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // The flavor is an env input: without tracking it, a later build without
+    // SNAG_BUILD_FLAVOR would silently reuse the cached flavor (and vice
+    // versa), shipping an unmarked internal binary.
+    println!("cargo:rerun-if-env-changed=SNAG_BUILD_FLAVOR");
     if Path::new(".git/HEAD").exists() {
         println!("cargo:rerun-if-changed=.git/HEAD");
     }

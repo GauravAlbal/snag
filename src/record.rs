@@ -118,6 +118,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_encoding_is_pinned() {
+        // Pins the digest of the exact current canonical encoding. Any change
+        // to a payload field covered by the hash (a rename like pearl_id ->
+        // task_id, an added/removed field, or a bump of
+        // CANONICAL_ENCODING_VERSION) changes this digest and FAILS the test —
+        // the forced decision is the point: encoding changes must bump the
+        // version so pre-change records stay verifiable under their original
+        // schema (the pearl->task_id rename silently orphaned every pre-rename
+        // record's hash chain; this test is the class fix).
+        //
+        // Regenerate the expected value ONLY as part of a deliberate encoding
+        // version bump (see docs/STABILITY.md "Hash encoding").
+        let (rec, store) = base();
+        let digest = rec.compute_hash(&store, "prev");
+        assert_eq!(
+            digest,
+            "blake3:064d11bac917bee02539e6d1706cadf91bdb824c4bba4d903a42a10524d46e33",
+            "canonical encoding changed without a CANONICAL_ENCODING_VERSION bump"
+        );
+    }
+
+    #[test]
     fn hash_binds_payload_map_order_independently() {
         // BTreeMap guarantees determinism regardless of insertion order.
         let mut o1 = sample_obs();
