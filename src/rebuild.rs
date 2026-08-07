@@ -97,6 +97,29 @@ fn reconstruct_observation(
         ],
     )?;
 
+    // The primary repository (the owner lane) is persisted in the canonical
+    // payload's context.repository.repository_id by the reporter
+    // (report.rs resolve_identity). Rebuild must re-insert it with
+    // role='primary' — inserting only `affected_repository_ids` as
+    // 'affected' silently destroys owner attribution on every rebuild.
+    if let Some(primary) = obs
+        .context
+        .repository
+        .as_ref()
+        .and_then(|r| r.repository_id.clone())
+        .filter(|id| !id.is_empty())
+    {
+        tx.execute(
+            "INSERT OR REPLACE INTO repositories (repository_id, created_at)
+             VALUES (?1, COALESCE((SELECT created_at FROM repositories WHERE repository_id = ?1), ?2))",
+            rusqlite::params![&primary, &captured_at],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO observation_repositories (observation_id, repository_id, role) VALUES (?1, ?2, 'primary')",
+            rusqlite::params![&obs.observation_id, &primary],
+        )?;
+    }
+
     for repo_id in &obs.affected_repository_ids {
         tx.execute(
             "INSERT OR REPLACE INTO repositories (repository_id, created_at)
