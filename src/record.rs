@@ -133,8 +133,7 @@ mod tests {
         let (rec, store) = base();
         let digest = rec.compute_hash(&store, "prev");
         assert_eq!(
-            digest,
-            "blake3:064d11bac917bee02539e6d1706cadf91bdb824c4bba4d903a42a10524d46e33",
+            digest, "blake3:064d11bac917bee02539e6d1706cadf91bdb824c4bba4d903a42a10524d46e33",
             "canonical encoding changed without a CANONICAL_ENCODING_VERSION bump"
         );
     }
