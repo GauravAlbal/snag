@@ -420,3 +420,89 @@ fn t7_rebuild_preserves_summary_grouping() {
         "summary grouping must survive rebuild: before={before:?} after={after:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// t8: table alignment regression — a long lane name and a full RFC3339
+// timestamp must not break column alignment (the fixed-width renderer this
+// replaces silently misaligned when a cell exceeded its hardcoded width).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t8_long_lane_names_keep_columns_aligned() {
+    let ctx = TestContext::new();
+    // A lane whose display name (abbreviated opaque id) and full RFC3339
+    // timestamp are both longer than the old fixed widths (12 / 20). Filed
+    // from a non-git cwd so no git remotes attach aliases — the display
+    // falls back to the abbreviated id, exercising that path too.
+    let long_id = "repo_0123456789abcdefghijklmnopqrstuvwxyz";
+    let outside = tempfile::tempdir().unwrap();
+    ctx.cmd()
+        .current_dir(outside.path())
+        .arg("report")
+        .arg("long-lane")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .arg("--repo-id")
+        .arg(long_id)
+        .assert()
+        .success();
+
+    let out = summary_cmd(&ctx).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut lines = text.lines();
+
+    let header = lines.next().expect("header line");
+    // Locate each column's start from the header, then assert every data row
+    // has a value at exactly that offset (a misaligned renderer shifts).
+    let open_at = header.find("OPEN").expect("OPEN header");
+    let oldest_at = header.find("OLDEST").expect("OLDEST header");
+    let mat_at = header.find("MAT").expect("MAT header");
+
+    let mut data_rows = 0;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        data_rows += 1;
+        assert!(
+            line.len() > mat_at,
+            "row long enough for MAT column: {line}"
+        );
+        // The lane display is the abbreviated opaque id (no aliases were
+        // recorded from a non-git cwd); the unowned bucket is its own row.
+        if data_rows == 1 {
+            assert!(
+                line.trim_start().starts_with("repo_01"),
+                "abbreviated id display: {line}"
+            );
+        }
+        // OPEN column holds a digit at its header offset.
+        let open_cell = line[open_at..].trim_start();
+        assert!(
+            open_cell.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "OPEN aligned at {open_at}: {line}"
+        );
+        // OLDEST column starts a full RFC3339 timestamp (year first), or is
+        // the empty-unowned `-` placeholder — either way it must sit at the
+        // header offset.
+        let oldest_cell = line[oldest_at..].trim_start();
+        assert!(
+            oldest_cell.starts_with("2026-") || oldest_cell.starts_with("-"),
+            "OLDEST aligned at {oldest_at}: {line}"
+        );
+        // MAT column holds a decimal number.
+        let mat_cell = &line[mat_at..];
+        assert!(
+            mat_cell
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit()),
+            "MAT aligned at {mat_at}: {line}"
+        );
+    }
+    assert!(data_rows >= 1, "at least one data row: {text}");
+}

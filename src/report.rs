@@ -710,14 +710,7 @@ fn list_json(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
 }
 
 fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
-    println!(
-        "{:<20} | {:<6} | {:<24} | {:<26} | Retracted",
-        "ID", "Seq", "Date", "Title"
-    );
-    println!(
-        "{:-<20}-+-{:-<6}-+-{:-<24}-+-{:-<26}-+-{:-<10}",
-        "", "", "", "", ""
-    );
+    let mut data: Vec<Vec<String>> = Vec::new();
     while let Some(row) = rows.next()? {
         let observation_id: String = row.get(0)?;
         let local_sequence: i64 = row.get(1)?;
@@ -725,11 +718,25 @@ fn list_table(rows: &mut rusqlite::Rows) -> anyhow::Result<()> {
         let title: String = row.get(3)?;
         let retracted: bool = row.get(4)?;
         let mark = if retracted { "RETRACTED" } else { "" };
-        println!(
-            "{:<20} | {:<6} | {:<24} | {:<26} | {}",
-            observation_id, local_sequence, captured_at, title, mark
-        );
+        data.push(vec![
+            observation_id,
+            local_sequence.to_string(),
+            captured_at,
+            title,
+            mark.to_string(),
+        ]);
     }
+    crate::remediation::render_table(
+        &["ID", "Seq", "Date", "Title", "Retracted"],
+        &[
+            crate::remediation::TableAlign::Left,
+            crate::remediation::TableAlign::Right,
+            crate::remediation::TableAlign::Left,
+            crate::remediation::TableAlign::Left,
+            crate::remediation::TableAlign::Left,
+        ],
+        &data,
+    );
     Ok(())
 }
 

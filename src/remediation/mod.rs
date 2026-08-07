@@ -1345,14 +1345,21 @@ fn history(mut args: crate::cli::ReviewHistoryArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&events)?);
         return Ok(());
     }
+    if events.is_empty() {
+        println!("no remediation events for {}", args.observation_id);
+        return Ok(());
+    }
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(events.len());
     for ev in &events {
         let seq = ev["local_sequence"].as_i64().unwrap_or(0);
         let typ = ev["record_type"].as_str().unwrap_or("?");
-        println!("{}  {}", seq, typ);
+        rows.push(vec![seq.to_string(), typ.to_string()]);
     }
-    if events.is_empty() {
-        println!("no remediation events for {}", args.observation_id);
-    }
+    render_table(
+        &["SEQ", "RECORD"],
+        &[TableAlign::Right, TableAlign::Left],
+        &rows,
+    );
     Ok(())
 }
 
@@ -1793,18 +1800,6 @@ impl LaneAggregate {
     }
 }
 
-/// Most-confirmed display alias for a repository id; falls back to the id.
-/// Deterministic: ties break alphabetically.
-fn display_name(conn: &rusqlite::Connection, repo_id: &str) -> String {
-    conn.query_row(
-        "SELECT alias FROM repository_aliases WHERE repository_id = ?1
-         GROUP BY alias ORDER BY COUNT(*) DESC, alias ASC LIMIT 1",
-        rusqlite::params![repo_id],
-        |r| r.get::<_, String>(0),
-    )
-    .unwrap_or_else(|_| repo_id.to_string())
-}
-
 fn read_lane_row(
     row: &rusqlite::Row<'_>,
     repo_id: Option<String>,
@@ -2008,49 +2003,133 @@ fn verdict_label(crossed: bool, thresholds_empty: bool) -> String {
     }
 }
 
+/// Column alignment for [`render_table`].
+#[derive(Clone, Copy)]
+pub(crate) enum TableAlign {
+    Left,
+    Right,
+}
+
+/// Measured-width text table. Each column's width is the max of the header
+/// and every row cell (computed from the ACTUAL data, never hardcoded), and
+/// the header is generated through the same format machinery as the rows —
+/// so alignment can never drift from content. Cells are the caller's
+/// responsibility (already formatted strings); `align` is per column.
+///
+/// This is the single table renderer for the CLI: any future table routes
+/// through it instead of hand-padded `println!` format strings, which
+/// silently misalign the moment a cell exceeds a fixed width (e.g. a
+/// `13banditos/wedding-seating-chart` lane name or a full RFC3339
+/// timestamp).
+pub(crate) fn render_table(headers: &[&str], align: &[TableAlign], rows: &[Vec<String>]) {
+    debug_assert_eq!(headers.len(), align.len());
+    let col_count = headers.len();
+    let widths: Vec<usize> = (0..col_count)
+        .map(|c| {
+            headers[c]
+                .chars()
+                .count()
+                .max(
+                    rows.iter()
+                        .map(|r| r.get(c).map(|s| s.chars().count()).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0),
+                )
+                .max(1)
+        })
+        .collect();
+    let cell = |value: &str, w: usize, a: TableAlign| -> String {
+        match a {
+            TableAlign::Left => format!("{value:<w$}"),
+            TableAlign::Right => format!("{value:>w$}"),
+        }
+    };
+    let line = |values: &[String]| -> String {
+        values
+            .iter()
+            .enumerate()
+            .map(|(c, v)| cell(v, widths[c], align[c]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let header: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    println!("{}", line(&header));
+    for row in rows {
+        println!("{}", line(row));
+    }
+}
+
+/// Display name for a lane: the most-confirmed alias when one exists, else
+/// the opaque id abbreviated (repo_01kz…bpr0k) so the table stays narrow —
+/// the full id is always available in the JSON envelope.
+fn display_name(conn: &rusqlite::Connection, repo_id: &str) -> String {
+    let alias = conn
+        .query_row(
+            "SELECT alias FROM repository_aliases WHERE repository_id = ?1
+             GROUP BY alias ORDER BY COUNT(*) DESC, alias ASC LIMIT 1",
+            rusqlite::params![repo_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+    match alias {
+        Some(a) => a,
+        None if repo_id.len() > 16 => {
+            let head = &repo_id[..12];
+            let tail = &repo_id[repo_id.len() - 4..];
+            format!("{head}…{tail}")
+        }
+        None => repo_id.to_string(),
+    }
+}
+
 fn render_summary_text(
     lanes: &[LaneAggregate],
     unowned: &Option<LaneAggregate>,
     thresholds: &[(String, i64)],
     limit: usize,
 ) {
-    // Text table, ranked by materiality desc; `--limit` truncates rows.
-    println!("LANE          OPEN   B   M  MED  MIN   UNREV  OLDEST                 MAT  VERDICT");
-    for (shown, lane) in lanes.iter().enumerate() {
-        if limit > 0 && shown >= limit {
-            break;
-        }
-        let verdict = verdict_label(lane.crossed(thresholds), thresholds.is_empty());
-        println!(
-            "{:<12} {:>5} {:>3} {:>3} {:>4} {:>4} {:>7}  {:<20} {:>11.1}  {}",
-            lane.display,
-            lane.open_count,
-            lane.severity_counts[0],
-            lane.severity_counts[1],
-            lane.severity_counts[2],
-            lane.severity_counts[3],
-            lane.unreviewed,
-            lane.oldest_open.as_deref().unwrap_or("-"),
-            lane.materiality,
-            verdict,
-        );
+    // Text table, ranked by materiality desc; `--limit` truncates lanes but
+    // the unowned bucket always shows. Column widths are measured from the
+    // data, so any lane name / timestamp length aligns.
+    let visible: Vec<&LaneAggregate> = if limit > 0 {
+        lanes.iter().take(limit).collect()
+    } else {
+        lanes.iter().collect()
+    };
+    let mut rows: Vec<Vec<String>> =
+        Vec::with_capacity(visible.len() + usize::from(unowned.is_some()));
+    for lane in visible.iter().copied().chain(unowned.iter()) {
+        rows.push(vec![
+            lane.display.clone(),
+            lane.open_count.to_string(),
+            lane.severity_counts[0].to_string(),
+            lane.severity_counts[1].to_string(),
+            lane.severity_counts[2].to_string(),
+            lane.severity_counts[3].to_string(),
+            lane.unreviewed.to_string(),
+            lane.oldest_open.as_deref().unwrap_or("-").to_string(),
+            format!("{:.1}", lane.materiality),
+            verdict_label(lane.crossed(thresholds), thresholds.is_empty()),
+        ]);
     }
-    if let Some(u) = unowned {
-        let verdict = verdict_label(u.crossed(thresholds), thresholds.is_empty());
-        println!(
-            "{:<12} {:>5} {:>3} {:>3} {:>4} {:>4} {:>7}  {:<20} {:>11.1}  {}",
-            u.display,
-            u.open_count,
-            u.severity_counts[0],
-            u.severity_counts[1],
-            u.severity_counts[2],
-            u.severity_counts[3],
-            u.unreviewed,
-            u.oldest_open.as_deref().unwrap_or("-"),
-            u.materiality,
-            verdict,
-        );
-    }
+    render_table(
+        &[
+            "LANE", "OPEN", "B", "M", "MED", "MIN", "UNREV", "OLDEST", "MAT", "VERDICT",
+        ],
+        &[
+            TableAlign::Left,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Left,
+            TableAlign::Right,
+            TableAlign::Left,
+        ],
+        &rows,
+    );
 }
 
 /// `snag review summary [--repo X] [--at-least severity=count]… [--limit N]
