@@ -24,6 +24,8 @@ tests/cli.rs
 tests/concurrency.rs
 tests/git_identity.rs
 tests/migration.rs
+tests/rebuild_primary_test.rs
+tests/review_summary.rs
 tests/robustness.rs
 tests/schema_compat.rs
 
