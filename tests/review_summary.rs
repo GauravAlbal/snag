@@ -147,34 +147,42 @@ fn t2_threshold_exit_code() {
     report_in(&ctx, "b1", "repo_beta", "major");
 
     // Any lane with >=2 majors -> exit 1.
-    summary_cmd(&ctx)
+    let out = summary_cmd(&ctx)
         .arg("--at-least")
         .arg("major=2")
-        .assert()
-        .code(1);
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "any lane crossing trips 1");
 
     // Threshold above every lane -> exit 0.
-    summary_cmd(&ctx)
+    let out = summary_cmd(&ctx)
         .arg("--at-least")
         .arg("major=3")
-        .assert()
-        .code(0);
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "above every lane -> 0");
 
     // --repo alpha still crosses (alpha has 2); --repo beta does not.
-    summary_cmd(&ctx)
+    let out = summary_cmd(&ctx)
         .arg("--repo")
         .arg("repo_alpha")
         .arg("--at-least")
         .arg("major=2")
-        .assert()
-        .code(1);
-    summary_cmd(&ctx)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "alpha lane crosses");
+    let out = summary_cmd(&ctx)
         .arg("--repo")
         .arg("repo_beta")
         .arg("--at-least")
         .arg("major=2")
-        .assert()
-        .code(0);
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--repo beta narrows the evaluated set"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -292,11 +300,16 @@ fn t5_unowned_participates_in_threshold() {
 
     // The unowned bucket has 1 major -> major=1 trips exit 1 even though no
     // repo lane has any major.
-    summary_cmd(&ctx)
+    let out = summary_cmd(&ctx)
         .arg("--at-least")
         .arg("major=1")
-        .assert()
-        .code(1);
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "unowned major must trip the threshold"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -307,19 +320,22 @@ fn t5_unowned_participates_in_threshold() {
 fn t6_invalid_threshold_rejected() {
     let ctx = TestContext::new();
     report_in(&ctx, "a1", "repo_alpha", "major");
-    summary_cmd(&ctx)
+    let out = summary_cmd(&ctx)
         .arg("--at-least")
         .arg("catastrophic=1")
-        .assert()
-        .failure();
-    summary_cmd(&ctx)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unknown severity rejected");
+    let out = summary_cmd(&ctx)
         .arg("--at-least")
         .arg("major")
-        .assert()
-        .failure();
-    summary_cmd(&ctx)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "missing =count rejected");
+    let out = summary_cmd(&ctx)
         .arg("--at-least")
         .arg("major=0")
-        .assert()
-        .failure();
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "zero count rejected");
 }
