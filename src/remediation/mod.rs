@@ -2023,9 +2023,8 @@ pub(crate) enum TableAlign {
 ///
 /// This is the single table renderer for the CLI: any future table routes
 /// through it instead of hand-padded `println!` format strings, which
-/// silently misalign the moment a cell exceeds a fixed width (e.g. a
-/// `13banditos/wedding-seating-chart` lane name or a full RFC3339
-/// timestamp).
+/// silently misalign the moment a cell exceeds a fixed width (e.g. a long
+/// lane name or a full RFC3339 timestamp).
 pub(crate) fn render_table(headers: &[&str], align: &[TableAlign], rows: &[Vec<String>]) {
     debug_assert_eq!(headers.len(), align.len());
     let col_count = headers.len();

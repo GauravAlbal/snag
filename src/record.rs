@@ -120,12 +120,12 @@ mod tests {
     #[test]
     fn canonical_encoding_is_pinned() {
         // Pins the digest of the exact current canonical encoding. Any change
-        // to a payload field covered by the hash (a rename like pearl_id ->
-        // task_id, an added/removed field, or a bump of
+        // to a payload field covered by the hash (a field rename, an
+        // added/removed field, or a bump of
         // CANONICAL_ENCODING_VERSION) changes this digest and FAILS the test —
         // the forced decision is the point: encoding changes must bump the
         // version so pre-change records stay verifiable under their original
-        // schema (the pearl->task_id rename silently orphaned every pre-rename
+        // schema (a past field rename silently orphaned every pre-rename
         // record's hash chain; this test is the class fix).
         //
         // Regenerate the expected value ONLY as part of a deliberate encoding
