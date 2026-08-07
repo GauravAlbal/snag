@@ -684,6 +684,7 @@ fn test_read_purity() {
     };
 
     ctx.cmd().arg("list").assert().success();
+    ctx.cmd().arg("review").arg("summary").assert().success();
     ctx.cmd().arg("show").arg("x").assert().failure(); // not found, but must not mutate
     let _ = ctx
         .cmd()
