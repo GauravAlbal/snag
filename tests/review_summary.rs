@@ -455,8 +455,10 @@ fn t8_long_lane_names_keep_columns_aligned() {
     let mut lines = text.lines();
 
     let header = lines.next().expect("header line");
-    // Locate each column's start from the header, then assert every data row
-    // has a value at exactly that offset (a misaligned renderer shifts).
+    // Locate each column's start from the header as CHAR offsets (Rust pads
+    // by chars; the abbreviated-id display contains the 3-byte ellipsis, so
+    // byte offsets would drift — char offsets are exact). The header is pure
+    // ASCII, so byte find == char index there.
     let open_at = header.find("OPEN").expect("OPEN header");
     let oldest_at = header.find("OLDEST").expect("OLDEST header");
     let mat_at = header.find("MAT").expect("MAT header");
@@ -467,41 +469,39 @@ fn t8_long_lane_names_keep_columns_aligned() {
             continue;
         }
         data_rows += 1;
+        let chars: Vec<char> = line.chars().collect();
         assert!(
-            line.len() > mat_at,
+            chars.len() > mat_at,
             "row long enough for MAT column: {line}"
         );
         // The lane display is the abbreviated opaque id (no aliases were
-        // recorded from a non-git cwd); the unowned bucket is its own row.
-        if data_rows == 1 {
-            assert!(
-                line.trim_start().starts_with("repo_01"),
-                "abbreviated id display: {line}"
-            );
-        }
-        // OPEN column holds a digit at its header offset.
-        let open_cell = line[open_at..].trim_start();
+        // recorded from a non-git cwd).
         assert!(
-            open_cell.chars().next().is_some_and(|c| c.is_ascii_digit()),
-            "OPEN aligned at {open_at}: {line}"
+            line.trim_start().starts_with("repo_01"),
+            "abbreviated id display: {line}"
         );
-        // OLDEST column starts a full RFC3339 timestamp (year first), or is
-        // the empty-unowned `-` placeholder — either way it must sit at the
-        // header offset.
-        let oldest_cell = line[oldest_at..].trim_start();
+        // Numeric columns are right-aligned, so the first non-space char
+        // at/after the header offset is the value; a misaligned renderer
+        // would land on a space or the wrong column's content.
+        let first_non_space = |from: usize| -> Option<char> {
+            chars
+                .get(from..)
+                .and_then(|s| s.iter().copied().find(|c| *c != ' '))
+        };
+        // OPEN column: a digit.
         assert!(
-            oldest_cell.starts_with("2026-") || oldest_cell.starts_with("-"),
-            "OLDEST aligned at {oldest_at}: {line}"
+            first_non_space(open_at).is_some_and(|c| c.is_ascii_digit()),
+            "OPEN aligned at char {open_at}: {line}"
         );
-        // MAT column holds a decimal number.
-        let mat_cell = &line[mat_at..];
+        // OLDEST column: a timestamp year digit or the empty `-` placeholder.
         assert!(
-            mat_cell
-                .trim_start()
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit()),
-            "MAT aligned at {mat_at}: {line}"
+            first_non_space(oldest_at).is_some_and(|c| c == '2' || c == '-'),
+            "OLDEST aligned at char {oldest_at}: {line}"
+        );
+        // MAT column: a decimal digit.
+        assert!(
+            first_non_space(mat_at).is_some_and(|c| c.is_ascii_digit()),
+            "MAT aligned at char {mat_at}: {line}"
         );
     }
     assert!(data_rows >= 1, "at least one data row: {text}");

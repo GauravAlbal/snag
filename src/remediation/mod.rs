@@ -1912,11 +1912,16 @@ fn query_unowned_lane(conn: &rusqlite::Connection) -> Result<Option<LaneAggregat
     );
     let mut ustmt = conn.prepare(&usql)?;
     let mut urows = ustmt.query([])?;
+    // The aggregate without GROUP BY always yields one row (COALESCE'd
+    // zeros) even when no unowned obs exist — treat open_count == 0 as
+    // "no bucket" so an empty store never renders a phantom (unowned) row.
     if let Some(urow) = urows.next()? {
-        Ok(Some(read_lane_row(urow, None, "(unowned)".to_string())?))
-    } else {
-        Ok(None)
+        let lane = read_lane_row(urow, None, "(unowned)".to_string())?;
+        if lane.open_count > 0 {
+            return Ok(Some(lane));
+        }
     }
+    Ok(None)
 }
 
 /// Exit code: 1 when ANY evaluated lane (or the unowned bucket) crosses a
