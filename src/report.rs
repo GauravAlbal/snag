@@ -310,8 +310,8 @@ fn resolve_identity(
         }
     }
     // The fix owner resolves through the same id/alias/current machinery;
-    // a bare unknown id is created (like `--repo-id`) so `--owner arq` works
-    // even before arq has any recorded aliases.
+    // a bare unknown id is created (like `--repo-id`) so an owner lane
+    // works even before it has any recorded aliases.
     let resolved_owner = match owner {
         Some(raw) if raw == "current" => Some(crate::identity::resolve_affected_repository(
             store, raw, &temp_git,

@@ -235,10 +235,10 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
         )?;
     }
 
-    // v6 is a lane-local migration in the internal lane (pearl_id chain
-    // repair). The shared store may already carry it; the public chain has no
-    // v6 of its own, so a store at v6 simply proceeds — record it as applied
-    // only when absent.
+    // v6 is a lane-local migration in the internal lane (legacy payload
+    // chain repair). The shared store may already carry it; the public chain
+    // has no v6 of its own, so a store at v6 simply proceeds — record it as
+    // applied only when absent.
     if current_version < 6 {
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (6, datetime('now'))",
