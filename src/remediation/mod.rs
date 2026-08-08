@@ -2074,10 +2074,14 @@ pub(crate) fn render_table(headers: &[&str], align: &[TableAlign], rows: &[Vec<S
 /// the opaque id abbreviated (repo_01kz…bpr0k) so the table stays narrow —
 /// the full id is always available in the JSON envelope.
 fn display_name(conn: &rusqlite::Connection, repo_id: &str) -> String {
+    // Most-recently-seen alias wins: record_aliases bumps last_seen_at on
+    // re-seen aliases, so a fleet rename (owner org change) makes the new
+    // org's alias the live display after the first post-rename filing — the
+    // old handle (e.g. a pre-rename org) stops winning the tie.
     let alias = conn
         .query_row(
             "SELECT alias FROM repository_aliases WHERE repository_id = ?1
-             GROUP BY alias ORDER BY COUNT(*) DESC, alias ASC LIMIT 1",
+             ORDER BY last_seen_at DESC, alias DESC LIMIT 1",
             rusqlite::params![repo_id],
             |r| r.get::<_, String>(0),
         )

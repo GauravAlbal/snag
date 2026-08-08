@@ -75,9 +75,18 @@ fn record_aliases(store: &mut Store, aliases: &[String], repo_id: &str, now: &st
     };
     for alias in aliases {
         let norm = normalize_remote_alias(alias);
+        // Bump last_seen_at when the (alias, repo) pair already exists — the
+        // PK is composite, so a same-alias-different-repo row is a distinct
+        // row, not a conflict. Re-seen aliases bump last_seen_at so the
+        // display heuristic (most-recently-seen) tracks the live remote: a
+        // fleet rename makes the new org's alias win after the first
+        // post-rename filing.
         let _ = tx.execute(
-            "INSERT OR IGNORE INTO repository_aliases (alias, repository_id, confirmed, first_seen_at, last_seen_at)
-             VALUES (?1, ?2, 1, ?3, ?3)",
+            "INSERT INTO repository_aliases (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, 1, ?3, ?3)
+             ON CONFLICT(alias, repository_id) DO UPDATE SET
+                confirmed = 1,
+                last_seen_at = excluded.last_seen_at",
             params![norm, repo_id, now],
         );
     }
