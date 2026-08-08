@@ -44,6 +44,7 @@ pub struct SemanticIdempotencyPayload {
     pub execution_attempt_id: Option<String>,
     /// Resolved repository IDs (primary + affected).
     pub repository_ids: Vec<String>,
+    pub owner_repository_id: Option<String>,
     /// Artifact content digests (and byte lengths) — stable content identity.
     pub artifact_digests: Vec<(String, u64)>,
 }
@@ -98,6 +99,7 @@ pub fn observation_semantic_digest(obs: &Observation) -> String {
         execution_task_id: exec.1,
         execution_attempt_id: exec.2,
         repository_ids: obs.affected_repository_ids.clone(),
+        owner_repository_id: obs.owner_repository_id.clone(),
         artifact_digests,
     };
 
@@ -146,6 +148,7 @@ mod tests {
             context: ContextInfo::default(),
             artifacts: vec![],
             affected_repository_ids: vec![],
+            owner_repository_id: None,
         }
     }
 

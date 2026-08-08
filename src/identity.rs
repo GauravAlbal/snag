@@ -8,14 +8,20 @@ use rusqlite::{OptionalExtension, params};
 /// made from (primary) or a repository it is understood to affect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoRole {
-    Primary,
+    /// The filing context — the repo the reporter was in when the observation
+    /// was captured.
+    Reporter,
+    /// The lane that owns the fix (explicit `--owner`).
+    Owner,
+    /// Additional repos implicated by the observation.
     Affected,
 }
 
 impl RepoRole {
     pub fn as_str(&self) -> &'static str {
         match self {
-            RepoRole::Primary => "primary",
+            RepoRole::Reporter => "reporter",
+            RepoRole::Owner => "owner",
             RepoRole::Affected => "affected",
         }
     }
@@ -33,7 +39,11 @@ pub struct RepositoryResolution {
 /// Resolve an explicit repository ID. An explicit ID is honored: if the repo
 /// does not exist it is created (documented rule: the caller explicitly names
 /// the repository, so the identity is created and linked).
-fn ensure_explicit_repo(store: &mut Store, id: &str, now: &str) -> anyhow::Result<String> {
+pub(crate) fn ensure_explicit_repo(
+    store: &mut Store,
+    id: &str,
+    now: &str,
+) -> anyhow::Result<String> {
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -65,9 +75,18 @@ fn record_aliases(store: &mut Store, aliases: &[String], repo_id: &str, now: &st
     };
     for alias in aliases {
         let norm = normalize_remote_alias(alias);
+        // Bump last_seen_at when the (alias, repo) pair already exists — the
+        // PK is composite, so a same-alias-different-repo row is a distinct
+        // row, not a conflict. Re-seen aliases bump last_seen_at so the
+        // display heuristic (most-recently-seen) tracks the live remote: a
+        // fleet rename makes the new org's alias win after the first
+        // post-rename filing.
         let _ = tx.execute(
-            "INSERT OR IGNORE INTO repository_aliases (alias, repository_id, confirmed, first_seen_at, last_seen_at)
-             VALUES (?1, ?2, 1, ?3, ?3)",
+            "INSERT INTO repository_aliases (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, 1, ?3, ?3)
+             ON CONFLICT(alias, repository_id) DO UPDATE SET
+                confirmed = 1,
+                last_seen_at = excluded.last_seen_at",
             params![norm, repo_id, now],
         );
     }

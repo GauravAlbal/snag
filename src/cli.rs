@@ -71,6 +71,11 @@ pub struct Cli {
     #[arg(long)]
     pub repo_id: Option<String>,
 
+    /// the repo/lane that owns the fix (id, alias, or `current`) — distinct
+    /// from the filing context; summary and review list group by this when set
+    #[arg(long)]
+    pub owner: Option<String>,
+
     /// session identifier recorded with the observation
     #[arg(long)]
     pub session_id: Option<String>,
@@ -98,6 +103,7 @@ impl Cli {
             Some(Command::Review(cmd)) => match cmd {
                 ReviewCommand::Next(args) => args.format.as_deref() == Some("agent"),
                 ReviewCommand::List(args) => args.format.as_deref() == Some("json"),
+                ReviewCommand::Summary(args) => args.format.as_deref() == Some("json"),
                 _ => false,
             },
             Some(_) => false,
@@ -188,6 +194,11 @@ pub struct ReportArgs {
     /// override the detected repository identity
     #[arg(long)]
     pub repo_id: Option<String>,
+
+    /// the repo/lane that owns the fix (id, alias, or `current`) — distinct
+    /// from the filing context; summary and review list group by this when set
+    #[arg(long)]
+    pub owner: Option<String>,
 
     /// session identifier recorded with the observation
     #[arg(long)]
@@ -324,6 +335,8 @@ pub enum ReviewCommand {
     Heartbeat(ReviewHeartbeatArgs),
     /// List observations with their review state
     List(ReviewListArgs),
+    /// Per-repo open-observation materiality summary (dispatch aid)
+    Summary(ReviewSummaryArgs),
     /// Adjudicate an observation with a disposition
     ///
     /// Negative dispositions are first-class outcomes. `confirmed` commits
@@ -449,6 +462,26 @@ pub struct ReviewHeartbeatArgs {
 
 #[derive(Args)]
 pub struct ReviewListArgs {
+    /// Restrict to a repository (id, alias, or `current`)
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Restrict to an asserted kind (bug|tooling|papercut|friction|usability|probe|feature) — the class of problem
+    #[arg(long)]
+    pub kind: Option<String>,
+
+    /// Restrict to an asserted severity (blocker|major|medium|minor|low) — the reporter's prior; disposition re-ranks
+    #[arg(long)]
+    pub severity: Option<String>,
+
+    /// Only observations with no review activity yet
+    #[arg(long)]
+    pub unreviewed: bool,
+
+    /// Include observations deferred by a prior disposition (with --unhandled; deferred marks handled=true in the reducer)
+    #[arg(long)]
+    pub include_deferred: bool,
+
     /// Only observations claimed by this reviewer/session
     #[arg(long)]
     pub claimed_by: Option<String>,
@@ -467,6 +500,36 @@ pub struct ReviewListArgs {
     #[arg(long)]
     pub unhandled: bool,
 
+    /// Maximum rows to print; 0 (default) = unbounded
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+
+    /// Rows to skip before printing (for paging with --limit)
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
+
+    #[arg(long)]
+    pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewSummaryArgs {
+    /// Restrict to a repository (id, alias, or `current`); narrows the
+    /// threshold evaluation to this lane (other lanes cannot flip the exit code)
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Dispatch threshold: exit 1 when any evaluated lane has at least COUNT
+    /// open actionable observations at SEVERITY (repeatable; e.g. major=3)
+    #[arg(long = "at-least", value_name = "severity=count")]
+    pub at_least: Vec<String>,
+
+    /// Maximum lanes to print; 0 (default) = unbounded. The exit code always
+    /// evaluates every lane regardless of this limit.
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+
+    /// Output format: text (default) or json (review_summary_v1 envelope)
     #[arg(long)]
     pub format: Option<String>,
 }

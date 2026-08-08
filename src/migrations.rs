@@ -364,3 +364,18 @@ pub fn migrate_v4_to_v5(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
     )?;
     Ok(())
 }
+
+/// v6 -> v7: rename the ambiguous `role='primary'` attribution to
+/// `role='reporter'` (the filing context — where the reporter was). The fix
+/// owner is a separate actor (`role='owner'`, from `snag report --owner`);
+/// `primary` conflated the two. Values-only rename: the column stays, no
+/// structural change. `affected` is unchanged. Numbered v7 because v6 is a
+/// lane-local migration in the internal lane (pearl_id chain repair) that
+/// the shared store may already carry.
+pub fn migrate_v6_to_v7(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE observation_repositories SET role = 'reporter' WHERE role = 'primary'",
+        [],
+    )?;
+    Ok(())
+}

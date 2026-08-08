@@ -35,6 +35,7 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::Release(args) => release(args),
         ReviewCommand::Heartbeat(args) => heartbeat(args),
         ReviewCommand::List(args) => list(args),
+        ReviewCommand::Summary(args) => summary(args),
         ReviewCommand::Disposition(args) => disposition(args),
         ReviewCommand::Reopen(args) => reopen(args),
         ReviewCommand::Relate(args) => relate(args),
@@ -1344,14 +1345,21 @@ fn history(mut args: crate::cli::ReviewHistoryArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&events)?);
         return Ok(());
     }
+    if events.is_empty() {
+        println!("no remediation events for {}", args.observation_id);
+        return Ok(());
+    }
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(events.len());
     for ev in &events {
         let seq = ev["local_sequence"].as_i64().unwrap_or(0);
         let typ = ev["record_type"].as_str().unwrap_or("?");
-        println!("{}  {}", seq, typ);
+        rows.push(vec![seq.to_string(), typ.to_string()]);
     }
-    if events.is_empty() {
-        println!("no remediation events for {}", args.observation_id);
-    }
+    render_table(
+        &["SEQ", "RECORD"],
+        &[TableAlign::Right, TableAlign::Left],
+        &rows,
+    );
     Ok(())
 }
 
@@ -1565,20 +1573,39 @@ fn next(args: crate::cli::ReviewNextArgs) -> Result<()> {
     Ok(())
 }
 
-/// `snag review list [filters] [--format json]`
-fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
-    let store = Store::open_read_only()?;
-    let mut sql = String::from(
-        "SELECT o.observation_id, o.title, o.severity_assertion, o.kind_assertion,
-                COALESCE(rs.state, 'unreviewed') AS state,
-                rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id,
-                c.claim_session_id, c.claimed_by
-         FROM observations o
-         LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
-         LEFT JOIN remediation_claims c ON c.claim_id = rs.active_claim_id
-         WHERE 1=1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+/// Push the repository/kind/severity scope clauses for `review list`.
+/// Extracted so `list` stays under the airlock complexity floor.
+fn push_list_scope_clauses(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    repository_id: Option<&str>,
+    args: &crate::cli::ReviewListArgs,
+) {
+    if let Some(rid) = repository_id {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM observation_repositories or2 WHERE or2.observation_id = o.observation_id AND or2.repository_id = ?)",
+        );
+        params.push(Box::new(rid.to_string()));
+    }
+    if let Some(k) = &args.kind {
+        sql.push_str(" AND o.kind_assertion = ?");
+        params.push(Box::new(k.clone()));
+    }
+    if let Some(sev) = &args.severity {
+        sql.push_str(" AND o.severity_assertion = ?");
+        params.push(Box::new(sev.clone()));
+    }
+}
+
+/// Push the review-state clauses (unreviewed, claimed-by, disposition, status).
+fn push_list_state_clauses(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    args: &crate::cli::ReviewListArgs,
+) {
+    if args.unreviewed {
+        sql.push_str(" AND (rs.observation_id IS NULL OR rs.state = 'unreviewed')");
+    }
     if let Some(cb) = &args.claimed_by {
         sql.push_str(
             " AND rs.active_claim_id IS NOT NULL AND rs.active_claim_expires_at IS NOT NULL",
@@ -1594,13 +1621,53 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
         sql.push_str(" AND COALESCE(rs.state, 'unreviewed') = ?");
         params.push(Box::new(s.clone()));
     }
+}
+
+/// Push the handled/unhandled clauses; `--include-deferred` widens `--unhandled`
+/// because deferred marks handled=true in the reducer.
+fn push_list_handled_clauses(sql: &mut String, args: &crate::cli::ReviewListArgs) {
     if args.handled {
         sql.push_str(" AND COALESCE(rs.handled, 0) = 1");
     }
     if args.unhandled {
-        sql.push_str(" AND COALESCE(rs.handled, 0) = 0");
+        if args.include_deferred {
+            sql.push_str(" AND (COALESCE(rs.handled, 0) = 0 OR rs.state = 'deferred')");
+        } else {
+            sql.push_str(" AND COALESCE(rs.handled, 0) = 0");
+        }
     }
+}
+
+/// `snag review list [filters] [--limit N] [--offset N] [--format json]`
+fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
+    // --repo resolution may record checkout bindings for `current`, so a repo
+    // filter needs the write connection (same as `next`).
+    let mut store = if args.repo.is_some() {
+        Store::open_read_write()?
+    } else {
+        Store::open_read_only()?
+    };
+    let repository_id = resolve_repo_filter(&mut store, args.repo.as_deref())?;
+    let mut sql = String::from(
+        "SELECT o.observation_id, o.title, o.severity_assertion, o.kind_assertion,
+                COALESCE(rs.state, 'unreviewed') AS state,
+                rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id,
+                c.claim_session_id, c.claimed_by
+         FROM observations o
+         LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         LEFT JOIN remediation_claims c ON c.claim_id = rs.active_claim_id
+         WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    push_list_scope_clauses(&mut sql, &mut params, repository_id.as_deref(), &args);
+    push_list_state_clauses(&mut sql, &mut params, &args);
+    push_list_handled_clauses(&mut sql, &args);
     sql.push_str(" ORDER BY o.captured_at ASC, o.local_sequence ASC");
+    if args.limit > 0 {
+        sql.push_str(" LIMIT ? OFFSET ?");
+        params.push(Box::new(args.limit as i64));
+        params.push(Box::new(args.offset as i64));
+    }
 
     let mut stmt = store.conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -1648,6 +1715,481 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
     }
     if args.format.as_deref() == Some("json") {
         println!("{}", serde_json::to_string_pretty(&out)?);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Summary (per-repo open-observation materiality for dispatch).
+// ---------------------------------------------------------------------------
+
+/// Severity weights for the display materiality column (blocker=4, major=3,
+/// medium=2, minor=1, low=0.5). Display only — the exit code is driven by the
+/// explicit `--at-least` thresholds, never by this score.
+const MATERIALITY_WEIGHTS: &[(&str, f64)] = &[
+    (crate::parser::SEV_BLOCKER, 4.0),
+    (crate::parser::SEV_MAJOR, 3.0),
+    (crate::parser::SEV_MEDIUM, 2.0),
+    (crate::parser::SEV_MINOR, 1.0),
+    (crate::parser::SEV_LOW, 0.5),
+];
+
+/// In-flight states excluded from threshold counts: someone already attached a
+/// commit or a task, so dispatching a fresh agent on that obs is wasteful.
+/// (Still shown in `open`.)
+const INFLIGHT_STATES: &[&str] = &[
+    crate::remediation::reducer::STATE_CANDIDATE_FIX,
+    crate::remediation::reducer::STATE_REMEDIATION_IN_PROGRESS,
+];
+
+/// Append the per-lane aggregate SELECT columns (open severity counts,
+/// actionable severity counts, unreviewed, oldest). Shared verbatim by the
+/// per-repo and unowned queries so the two lanes stay definitionally identical.
+fn push_lane_aggregate_columns(sql: &mut String) {
+    let inflight = INFLIGHT_STATES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(
+        &format!(
+            "COALESCE(COUNT(*), 0) AS open_count,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'blocker' THEN 1 ELSE 0 END), 0) AS sev_blocker,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'major' THEN 1 ELSE 0 END), 0) AS sev_major,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'medium' THEN 1 ELSE 0 END), 0) AS sev_medium,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'minor' THEN 1 ELSE 0 END), 0) AS sev_minor,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'low' THEN 1 ELSE 0 END), 0) AS sev_low,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'blocker' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_blocker,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'major' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_major,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'medium' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_medium,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'minor' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_minor,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'low' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_low,
+         COALESCE(SUM(CASE WHEN COALESCE(rs.state, 'unreviewed') = 'unreviewed' THEN 1 ELSE 0 END), 0) AS unreviewed,
+         MIN(o.captured_at) AS oldest_open",
+        )
+    );
+}
+
+/// One lane's aggregate: `repo_id` is None for the unowned bucket.
+struct LaneAggregate {
+    repo_id: Option<String>,
+    display: String,
+    open_count: i64,
+    /// Open severity counts, indexed by SEVERITIES order.
+    severity_counts: [i64; 5],
+    /// Actionable severity counts (open, not in-flight), SEVERITIES order.
+    actionable_counts: [i64; 5],
+    unreviewed: i64,
+    oldest_open: Option<String>,
+    materiality: f64,
+}
+
+impl LaneAggregate {
+    fn severity_index(sev: &str) -> usize {
+        crate::parser::SEVERITIES
+            .iter()
+            .position(|s| *s == sev)
+            .unwrap_or(4)
+    }
+
+    fn crossed(&self, thresholds: &[(String, i64)]) -> bool {
+        thresholds.iter().any(|(sev, count)| {
+            let idx = Self::severity_index(sev);
+            self.actionable_counts[idx] >= *count
+        })
+    }
+}
+
+fn read_lane_row(
+    row: &rusqlite::Row<'_>,
+    repo_id: Option<String>,
+    display: String,
+) -> rusqlite::Result<LaneAggregate> {
+    let sev: [i64; 5] = [
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ];
+    let act: [i64; 5] = [
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+    ];
+    let materiality = MATERIALITY_WEIGHTS
+        .iter()
+        .zip(act.iter())
+        .map(|((_, w), n)| w * (*n as f64))
+        .sum();
+    Ok(LaneAggregate {
+        repo_id,
+        display,
+        open_count: row.get(1)?,
+        severity_counts: sev,
+        actionable_counts: act,
+        unreviewed: row.get(12)?,
+        oldest_open: row.get(13)?,
+        materiality,
+    })
+}
+
+/// Parse `--at-least severity=count` values into validated thresholds.
+fn parse_thresholds(raw: &[String]) -> Result<Vec<(String, i64)>> {
+    let mut thresholds = Vec::new();
+    for item in raw {
+        let (sev, cnt) = item.split_once('=').ok_or_else(|| {
+            SnagError::Validation(format!(
+                "--at-least expects <severity>=<count>, got '{item}'"
+            ))
+        })?;
+        if !crate::parser::SEVERITIES.contains(&sev) {
+            anyhow::bail!(SnagError::Validation(format!(
+                "unknown severity '{sev}'; allowed: {}",
+                crate::parser::SEVERITIES.join(", ")
+            )));
+        }
+        let count: i64 = cnt.parse().map_err(|_| {
+            SnagError::Validation(format!("--at-least count '{cnt}' is not an integer"))
+        })?;
+        if count <= 0 {
+            anyhow::bail!(SnagError::Validation(
+                "--at-least count must be >= 1".to_string()
+            ));
+        }
+        thresholds.push((sev.to_string(), count));
+    }
+    Ok(thresholds)
+}
+
+/// Query per-repo lanes (fix owner when set, else filing reporter), open (not
+/// handled) obs only. Optional `repository_id` narrows to one lane.
+fn query_repo_lanes(
+    conn: &rusqlite::Connection,
+    repository_id: Option<&str>,
+) -> Result<Vec<LaneAggregate>> {
+    let mut sql = String::from(
+        "SELECT COALESCE(owner_r.repository_id, reporter_r.repository_id) AS lane_id, ",
+    );
+    push_lane_aggregate_columns(&mut sql);
+    sql.push_str(
+        " FROM observations o
+         LEFT JOIN observation_repositories owner_r
+           ON owner_r.observation_id = o.observation_id AND owner_r.role = 'owner'
+         LEFT JOIN observation_repositories reporter_r
+           ON reporter_r.observation_id = o.observation_id AND reporter_r.role = 'reporter'
+         LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         WHERE COALESCE(rs.handled, 0) = 0
+           AND (owner_r.repository_id IS NOT NULL OR reporter_r.repository_id IS NOT NULL)",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(rid) = repository_id {
+        sql.push_str(" AND COALESCE(owner_r.repository_id, reporter_r.repository_id) = ?");
+        params.push(Box::new(rid.to_string()));
+    }
+    sql.push_str(" GROUP BY COALESCE(owner_r.repository_id, reporter_r.repository_id)");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let lanes = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let rid: String = row.get(0)?;
+            let display = display_name(conn, &rid);
+            read_lane_row(row, Some(rid), display)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(lanes)
+}
+
+/// Query the unowned bucket (open obs with neither a fix owner nor a filing
+/// reporter); None when empty.
+fn query_unowned_lane(conn: &rusqlite::Connection) -> Result<Option<LaneAggregate>> {
+    let mut usql = String::from("SELECT NULL, ");
+    push_lane_aggregate_columns(&mut usql);
+    usql.push_str(
+        " FROM observations o
+         LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         WHERE COALESCE(rs.handled, 0) = 0
+           AND NOT EXISTS (
+               SELECT 1 FROM observation_repositories r
+               WHERE r.observation_id = o.observation_id AND r.role IN ('owner', 'reporter')
+           )",
+    );
+    let mut ustmt = conn.prepare(&usql)?;
+    let mut urows = ustmt.query([])?;
+    // The aggregate without GROUP BY always yields one row (COALESCE'd
+    // zeros) even when no unowned obs exist — treat open_count == 0 as
+    // "no bucket" so an empty store never renders a phantom (unowned) row.
+    if let Some(urow) = urows.next()? {
+        let lane = read_lane_row(urow, None, "(unowned)".to_string())?;
+        if lane.open_count > 0 {
+            return Ok(Some(lane));
+        }
+    }
+    Ok(None)
+}
+
+/// Exit code: 1 when ANY evaluated lane (or the unowned bucket) crosses a
+/// threshold, else 0. `--limit` truncates DISPLAY only — every lane is still
+/// evaluated.
+fn summary_exit_code(
+    lanes: &[LaneAggregate],
+    unowned: &Option<LaneAggregate>,
+    thresholds: &[(String, i64)],
+) -> i32 {
+    if lanes
+        .iter()
+        .chain(unowned.iter())
+        .any(|l| l.crossed(thresholds))
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// Severity-count map in SEVERITIES order, as a JSON object.
+fn severity_counts_json(counts: &[i64; 5]) -> serde_json::Value {
+    serde_json::json!({
+        "blocker": counts[0],
+        "major": counts[1],
+        "medium": counts[2],
+        "minor": counts[3],
+        "low": counts[4],
+    })
+}
+
+fn render_summary_json(
+    lanes: &[LaneAggregate],
+    unowned: &Option<LaneAggregate>,
+    thresholds: &[(String, i64)],
+    exit_code: i32,
+) -> Result<()> {
+    let repos_json: Vec<serde_json::Value> = lanes
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "repo_id": l.repo_id,
+                "display": l.display,
+                "open": l.open_count,
+                "severity_counts": severity_counts_json(&l.severity_counts),
+                "unreviewed": l.unreviewed,
+                "oldest_open": l.oldest_open,
+                "materiality": l.materiality,
+                "crossed": l.crossed(thresholds),
+            })
+        })
+        .collect();
+    let mut envelope = serde_json::json!({
+        "schema": "review_summary_v1",
+        "thresholds": thresholds
+            .iter()
+            .map(|(s, c)| serde_json::json!({ "severity": s, "count": c }))
+            .collect::<Vec<_>>(),
+        "exit_code": exit_code,
+        "repos": repos_json,
+    });
+    if let Some(u) = unowned {
+        envelope["unowned"] = serde_json::json!({
+            "open": u.open_count,
+            "severity_counts": severity_counts_json(&u.severity_counts),
+            "unreviewed": u.unreviewed,
+            "oldest_open": u.oldest_open,
+            "materiality": u.materiality,
+            "crossed": u.crossed(thresholds),
+        });
+    }
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
+}
+
+fn verdict_label(crossed: bool, thresholds_empty: bool) -> String {
+    if thresholds_empty {
+        "-".to_string()
+    } else if crossed {
+        "DISPATCH".to_string()
+    } else {
+        "watch".to_string()
+    }
+}
+
+/// Column alignment for [`render_table`].
+#[derive(Clone, Copy)]
+pub(crate) enum TableAlign {
+    Left,
+    Right,
+}
+
+/// Measured-width text table. Each column's width is the max of the header
+/// and every row cell (computed from the ACTUAL data, never hardcoded), and
+/// the header is generated through the same format machinery as the rows —
+/// so alignment can never drift from content. Cells are the caller's
+/// responsibility (already formatted strings); `align` is per column.
+///
+/// This is the single table renderer for the CLI: any future table routes
+/// through it instead of hand-padded `println!` format strings, which
+/// silently misalign the moment a cell exceeds a fixed width (e.g. a long
+/// lane name or a full RFC3339 timestamp).
+pub(crate) fn render_table(headers: &[&str], align: &[TableAlign], rows: &[Vec<String>]) {
+    debug_assert_eq!(headers.len(), align.len());
+    let col_count = headers.len();
+    let widths: Vec<usize> = (0..col_count)
+        .map(|c| {
+            headers[c]
+                .chars()
+                .count()
+                .max(
+                    rows.iter()
+                        .map(|r| r.get(c).map(|s| s.chars().count()).unwrap_or(0))
+                        .max()
+                        .unwrap_or(0),
+                )
+                .max(1)
+        })
+        .collect();
+    let cell = |value: &str, w: usize, a: TableAlign| -> String {
+        match a {
+            TableAlign::Left => format!("{value:<w$}"),
+            TableAlign::Right => format!("{value:>w$}"),
+        }
+    };
+    let line = |values: &[String]| -> String {
+        values
+            .iter()
+            .enumerate()
+            .map(|(c, v)| cell(v, widths[c], align[c]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let header: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    println!("{}", line(&header));
+    for row in rows {
+        println!("{}", line(row));
+    }
+}
+
+/// Display name for a lane: the most-confirmed alias when one exists, else
+/// the opaque id abbreviated (repo_01kz…bpr0k) so the table stays narrow —
+/// the full id is always available in the JSON envelope.
+fn display_name(conn: &rusqlite::Connection, repo_id: &str) -> String {
+    // Most-recently-seen alias wins: record_aliases bumps last_seen_at on
+    // re-seen aliases, so a fleet rename (owner org change) makes the new
+    // org's alias the live display after the first post-rename filing — the
+    // old handle (e.g. a pre-rename org) stops winning the tie.
+    let alias = conn
+        .query_row(
+            "SELECT alias FROM repository_aliases WHERE repository_id = ?1
+             ORDER BY last_seen_at DESC, alias DESC LIMIT 1",
+            rusqlite::params![repo_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+    match alias {
+        Some(a) => a,
+        None if repo_id.len() > 16 => {
+            let head = &repo_id[..12];
+            let tail = &repo_id[repo_id.len() - 4..];
+            format!("{head}…{tail}")
+        }
+        None => repo_id.to_string(),
+    }
+}
+
+fn render_summary_text(
+    lanes: &[LaneAggregate],
+    unowned: &Option<LaneAggregate>,
+    thresholds: &[(String, i64)],
+    limit: usize,
+) {
+    // Text table, ranked by materiality desc; `--limit` truncates lanes but
+    // the unowned bucket always shows. Column widths are measured from the
+    // data, so any lane name / timestamp length aligns.
+    let visible: Vec<&LaneAggregate> = if limit > 0 {
+        lanes.iter().take(limit).collect()
+    } else {
+        lanes.iter().collect()
+    };
+    let mut rows: Vec<Vec<String>> =
+        Vec::with_capacity(visible.len() + usize::from(unowned.is_some()));
+    for lane in visible.iter().copied().chain(unowned.iter()) {
+        rows.push(vec![
+            lane.display.clone(),
+            lane.open_count.to_string(),
+            lane.severity_counts[0].to_string(),
+            lane.severity_counts[1].to_string(),
+            lane.severity_counts[2].to_string(),
+            lane.severity_counts[3].to_string(),
+            lane.unreviewed.to_string(),
+            lane.oldest_open.as_deref().unwrap_or("-").to_string(),
+            format!("{:.1}", lane.materiality),
+            verdict_label(lane.crossed(thresholds), thresholds.is_empty()),
+        ]);
+    }
+    render_table(
+        &[
+            "LANE", "OPEN", "B", "M", "MED", "MIN", "UNREV", "OLDEST", "MAT", "VERDICT",
+        ],
+        &[
+            TableAlign::Left,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Left,
+            TableAlign::Right,
+            TableAlign::Left,
+        ],
+        &rows,
+    );
+}
+
+/// `snag review summary [--repo X] [--at-least severity=count]… [--limit N]
+/// [--format text|json]`
+///
+/// Per-lane (fix owner when set, else filing reporter) open-observation
+/// materiality: a text table
+/// ranked by materiality desc (severity mix, unreviewed, oldest, unowned
+/// bucket) or a `review_summary_v1` JSON envelope. With `--at-least`
+/// thresholds, exits 1 when ANY evaluated lane crosses one (actionable open
+/// obs only), 0 otherwise; `--repo` narrows the evaluated set to that lane.
+fn summary(args: crate::cli::ReviewSummaryArgs) -> Result<()> {
+    // --repo resolution may record checkout bindings for `current`, so a repo
+    // filter needs the write connection (same as `list`/`next`).
+    let mut store = if args.repo.is_some() {
+        Store::open_read_write()?
+    } else {
+        Store::open_read_only()?
+    };
+    let repository_id = resolve_repo_filter(&mut store, args.repo.as_deref())?;
+    let thresholds = parse_thresholds(&args.at_least)?;
+
+    let mut lanes = query_repo_lanes(&store.conn, repository_id.as_deref())?;
+    lanes.sort_by(|a, b| {
+        b.materiality
+            .partial_cmp(&a.materiality)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Unowned bucket (open obs with no primary row) — only without `--repo`.
+    let unowned = if repository_id.is_none() {
+        query_unowned_lane(&store.conn)?
+    } else {
+        None
+    };
+
+    let exit_code = summary_exit_code(&lanes, &unowned, &thresholds);
+    if args.format.as_deref() == Some("json") {
+        render_summary_json(&lanes, &unowned, &thresholds, exit_code)?;
+    } else {
+        render_summary_text(&lanes, &unowned, &thresholds, args.limit);
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
     Ok(())
 }

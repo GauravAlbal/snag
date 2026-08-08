@@ -41,15 +41,28 @@ impl TestContext {
 
 /// File an observation; return its id.
 fn report(ctx: &TestContext, title: &str, kind: &str, severity: &str) -> String {
-    ctx.cmd()
-        .arg("report")
+    report_in(ctx, title, kind, severity, None)
+}
+
+/// File an observation, optionally pinned to a repository; return its id.
+fn report_in(
+    ctx: &TestContext,
+    title: &str,
+    kind: &str,
+    severity: &str,
+    repo: Option<&str>,
+) -> String {
+    let mut cmd = ctx.cmd();
+    cmd.arg("report")
         .arg(title)
         .arg("--kind")
         .arg(kind)
         .arg("--severity")
-        .arg(severity)
-        .assert()
-        .success();
+        .arg(severity);
+    if let Some(r) = repo {
+        cmd.arg("--repo-id").arg(r);
+    }
+    cmd.assert().success();
     let conn = ctx.conn();
     conn.query_row(
         "SELECT observation_id FROM observations WHERE title = ?1 ORDER BY local_sequence DESC LIMIT 1",
@@ -205,6 +218,134 @@ fn t1_active_claims_by_other_sessions_are_excluded() {
         .output()
         .unwrap();
     assert!(String::from_utf8(out.stdout).unwrap().contains(&obs));
+}
+
+// ---------------------------------------------------------------------------
+// T1b: review list filters + pagination.
+// ---------------------------------------------------------------------------
+
+/// `review list --format json` parsed as a row array.
+fn list_json(ctx: &TestContext, args: &[&str]) -> Vec<serde_json::Value> {
+    let out = ctx
+        .cmd()
+        .arg("review")
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "review list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_str::<Vec<serde_json::Value>>(&String::from_utf8(out.stdout).unwrap()).unwrap()
+}
+
+#[test]
+fn t1b_list_filters_by_repository() {
+    let ctx = TestContext::new();
+    let in_r1 = report_in(&ctx, "r1 bug", "bug", "major", Some("repo_alpha"));
+    let in_r2 = report_in(&ctx, "r2 bug", "bug", "minor", Some("repo_beta"));
+
+    let rows = list_json(&ctx, &["--repo", "repo_alpha"]);
+    assert_eq!(rows.len(), 1, "repo filter must scope to the lane");
+    assert_eq!(rows[0]["observation_id"], in_r1);
+    assert_ne!(rows[0]["observation_id"], in_r2);
+
+    // Unknown repo is a typed error, not an empty list.
+    let out = ctx
+        .cmd()
+        .arg("review")
+        .arg("list")
+        .arg("--repo")
+        .arg("no_such_repo")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("no_such_repo"),
+        "unknown repo must name the missing id"
+    );
+}
+
+#[test]
+fn t1b_list_filters_kind_and_severity() {
+    let ctx = TestContext::new();
+    let bug = report(&ctx, "a bug", "bug", "major");
+    let papercut = report(&ctx, "a papercut", "papercut", "minor");
+
+    let rows = list_json(&ctx, &["--kind", "papercut"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["observation_id"], papercut);
+    assert_ne!(rows[0]["observation_id"], bug);
+
+    let rows = list_json(&ctx, &["--severity", "major"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["observation_id"], bug);
+}
+
+#[test]
+fn t1b_list_unreviewed_and_unhandled_with_deferred() {
+    let ctx = TestContext::new();
+    let a = report(&ctx, "unreviewed a", "bug", "major");
+    let b = report(&ctx, "deferred b", "bug", "minor");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&b)
+        .arg("deferred")
+        .assert()
+        .success();
+
+    // --unreviewed: only the untouched observation.
+    let rows = list_json(&ctx, &["--unreviewed"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["observation_id"], a);
+
+    // --unhandled: deferred marks handled=true in the reducer, so b is hidden.
+    let rows = list_json(&ctx, &["--unhandled"]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["observation_id"], a);
+
+    // --unhandled --include-deferred: the lane owner still owns deferred work.
+    let rows = list_json(&ctx, &["--unhandled", "--include-deferred"]);
+    let ids: Vec<&str> = rows
+        .iter()
+        .map(|r| r["observation_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&a.as_str()));
+    assert!(ids.contains(&b.as_str()));
+}
+
+#[test]
+fn t1b_list_paginates() {
+    let ctx = TestContext::new();
+    let mut expected = Vec::new();
+    for i in 0..5 {
+        expected.push(report(&ctx, &format!("page {i}"), "bug", "minor"));
+    }
+
+    let page1 = list_json(&ctx, &["--limit", "2"]);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0]["observation_id"], expected[0]);
+    assert_eq!(page1[1]["observation_id"], expected[1]);
+
+    let page2 = list_json(&ctx, &["--limit", "2", "--offset", "2"]);
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2[0]["observation_id"], expected[2]);
+    assert_eq!(page2[1]["observation_id"], expected[3]);
+
+    // Offset past the end: empty page, not an error.
+    let tail = list_json(&ctx, &["--limit", "2", "--offset", "10"]);
+    assert!(tail.is_empty());
+
+    // Default (limit 0) is unbounded — the text-parse consumer's contract.
+    let all = list_json(&ctx, &[]);
+    assert_eq!(all.len(), 5);
 }
 
 // ---------------------------------------------------------------------------
