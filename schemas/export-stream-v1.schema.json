@@ -23,7 +23,7 @@
       "properties": {
         "export_kind": { "const": "export_header" },
         "export_schema_version": { "const": 1 },
-        "minimum_reader_version": { "const": 1 },
+        "minimum_reader_version": { "enum": [1, 2, 3] },
         "store_id": { "type": "string" },
         "first_sequence": { "type": "integer", "minimum": 0 },
         "through_sequence": { "type": "integer", "minimum": 0 },
@@ -53,7 +53,28 @@
         "record_schema_version": { "const": 1 },
         "local_sequence": { "type": "integer", "minimum": 1 },
         "record_id": { "type": "string" },
-        "record_type": { "enum": ["observation_created", "observation_retracted"] },
+        "record_type": {
+          "enum": [
+            "observation_created",
+            "observation_retracted",
+            "observation_claimed",
+            "observation_claim_heartbeat",
+            "observation_claim_released",
+            "observation_claim_expired",
+            "observation_reviewed",
+            "observation_disposition_set",
+            "observation_reopened",
+            "observation_relationship_added",
+            "observation_relationship_retracted",
+            "observation_promoted",
+            "observation_owner_assigned",
+            "remediation_task_attached",
+            "remediation_fix_attached",
+            "remediation_verification_attached",
+            "remediation_marked_handled",
+            "remediation_reopened"
+          ]
+        },
         "entity_id": { "type": "string" },
         "captured_at": { "type": "string", "format": "date-time" },
         "canonical_payload": {

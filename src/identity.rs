@@ -62,6 +62,200 @@ pub(crate) fn ensure_explicit_repo(
     Ok(id.to_string())
 }
 
+/// Resolve and materialize a remediation owner inside the caller's transaction.
+///
+/// Exact canonical IDs win over aliases. `git_ctx` is supplied for `current`
+/// or local-path arguments; every repository/alias/checkout/worktree write is
+/// then committed or rolled back with the owner-assignment event.
+pub(crate) fn resolve_assignment_repository(
+    tx: &rusqlite::Transaction,
+    input: &str,
+    git_ctx: Option<&GitContext>,
+    now: &str,
+) -> anyhow::Result<String> {
+    if let Some(repository_id) = exact_repository_id(tx, input)? {
+        return Ok(repository_id);
+    }
+    match git_ctx {
+        Some(git_ctx) => resolve_git_assignment(tx, input, git_ctx, now),
+        None => resolve_alias_assignment(tx, input, now),
+    }
+}
+
+fn exact_repository_id(tx: &rusqlite::Transaction, input: &str) -> anyhow::Result<Option<String>> {
+    tx.query_row(
+        "SELECT repository_id FROM repositories WHERE repository_id = ?1",
+        params![input],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn resolve_git_assignment(
+    tx: &rusqlite::Transaction,
+    input: &str,
+    git_ctx: &GitContext,
+    now: &str,
+) -> anyhow::Result<String> {
+    let git_common_dir = git_ctx.git_common_dir.as_deref().ok_or_else(|| {
+        SnagError::RepositoryNotFound(format!("{input}: not inside a git repository"))
+    })?;
+    let repository_id = match checkout_repository_id(tx, git_common_dir)? {
+        Some(repository_id) => repository_id,
+        None => repository_from_git_aliases(tx, git_ctx)?,
+    };
+    materialize_git_assignment(tx, git_ctx, git_common_dir, &repository_id, now)?;
+    Ok(repository_id)
+}
+
+fn checkout_repository_id(
+    tx: &rusqlite::Transaction,
+    git_common_dir: &str,
+) -> anyhow::Result<Option<String>> {
+    tx.query_row(
+        "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
+        params![git_common_dir],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn repository_from_git_aliases(
+    tx: &rusqlite::Transaction,
+    git_ctx: &GitContext,
+) -> anyhow::Result<String> {
+    let mut candidates = std::collections::BTreeSet::new();
+    for alias in &git_ctx.git_remote_aliases {
+        let mut stmt = tx.prepare(
+            "SELECT repository_id FROM repository_aliases
+             WHERE alias = ?1 AND confirmed = 1",
+        )?;
+        let rows = stmt.query_map(params![normalize_remote_alias(alias)], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for candidate in rows {
+            candidates.insert(candidate?);
+        }
+    }
+    if candidates.len() > 1 {
+        anyhow::bail!(SnagError::RepositoryAmbiguous(format!(
+            "aliases {:?} match multiple repositories: {:?}",
+            git_ctx.git_remote_aliases, candidates
+        )));
+    }
+    Ok(candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| generate_id("repo")))
+}
+
+fn materialize_git_assignment(
+    tx: &rusqlite::Transaction,
+    git_ctx: &GitContext,
+    git_common_dir: &str,
+    repository_id: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO repositories (repository_id, created_at)
+         VALUES (?1, ?2)",
+        params![repository_id, now],
+    )?;
+    let checkout_id = ensure_git_checkout(tx, repository_id, git_common_dir, now)?;
+    if let Some(root) = &git_ctx.repository_root {
+        tx.execute(
+            "INSERT OR IGNORE INTO worktrees
+             (worktree_id, checkout_id, worktree_path, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![generate_id("wt"), checkout_id, root, now],
+        )?;
+    }
+    record_git_aliases(tx, &git_ctx.git_remote_aliases, repository_id, now)
+}
+
+fn ensure_git_checkout(
+    tx: &rusqlite::Transaction,
+    repository_id: &str,
+    git_common_dir: &str,
+    now: &str,
+) -> anyhow::Result<String> {
+    if let Some(checkout_id) = checkout_repository_id(tx, git_common_dir)? {
+        return Ok(checkout_id);
+    }
+    let checkout_id = generate_id("chk");
+    tx.execute(
+        "INSERT INTO checkouts
+         (checkout_id, repository_id, git_common_dir, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![checkout_id, repository_id, git_common_dir, now],
+    )?;
+    Ok(checkout_id)
+}
+
+fn record_git_aliases(
+    tx: &rusqlite::Transaction,
+    aliases: &[String],
+    repository_id: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    for alias in aliases {
+        tx.execute(
+            "INSERT INTO repository_aliases
+             (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, 1, ?3, ?3)
+             ON CONFLICT(alias, repository_id) DO UPDATE SET
+                confirmed = 1,
+                last_seen_at = excluded.last_seen_at",
+            params![normalize_remote_alias(alias), repository_id, now],
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_alias_assignment(
+    tx: &rusqlite::Transaction,
+    input: &str,
+    now: &str,
+) -> anyhow::Result<String> {
+    let normalized = normalize_remote_alias(input);
+    let mut stmt = tx.prepare(
+        "SELECT repository_id FROM repository_aliases
+         WHERE alias = ?1 AND confirmed = 1
+         ORDER BY repository_id",
+    )?;
+    let candidates = stmt
+        .query_map(params![normalized], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    match candidates.as_slice() {
+        [repository_id] => Ok(repository_id.clone()),
+        [] => create_alias_repository(tx, input, now),
+        _ => Err(SnagError::RepositoryAmbiguous(format!(
+            "alias {input:?} matches multiple repositories: {candidates:?}"
+        ))
+        .into()),
+    }
+}
+
+fn create_alias_repository(
+    tx: &rusqlite::Transaction,
+    input: &str,
+    now: &str,
+) -> anyhow::Result<String> {
+    if std::path::Path::new(input).exists() {
+        return Err(SnagError::RepositoryNotFound(format!(
+            "{input}: existing path is not a git repository"
+        ))
+        .into());
+    }
+    tx.execute(
+        "INSERT INTO repositories (repository_id, created_at) VALUES (?1, ?2)",
+        params![input, now],
+    )?;
+    Ok(input.to_string())
+}
+
 /// Record that `repo_id` is a candidate for each of the given aliases (G30).
 /// Multiple repositories may share an alias; only a single candidate is
 /// unambiguous.
@@ -236,6 +430,7 @@ pub fn resolve_repository(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
     let mut warnings = git_ctx.warnings.clone();
+    let explicit_identity = explicit_repo_id.is_some();
 
     // 1-3. Explicit identity.
     let repository_id = if let Some(explicit) = explicit_repo_id {
@@ -250,6 +445,28 @@ pub fn resolve_repository(
             warnings,
         });
     };
+
+    // An explicit ID owns the report, but it cannot relabel a checkout that
+    // already has a different canonical identity. Keep G28 attribution while
+    // refusing to project the ambient checkout, worktree, or aliases onto the
+    // foreign ID.
+    if explicit_identity
+        && let Some(dir) = &git_ctx.git_common_dir
+        && let Some(bound_repository_id) = resolve_by_checkout(store, dir)?
+        && bound_repository_id != repository_id
+    {
+        warnings.push(format!(
+            "explicit repository id '{repository_id}' conflicts with repository \
+             '{bound_repository_id}' already bound to {dir}; ambient Git identity was not linked; \
+             use --owner when naming the repository that owns the fix"
+        ));
+        return Ok(RepositoryResolution {
+            repository_id,
+            checkout_id: None,
+            worktree_id: None,
+            warnings,
+        });
+    }
 
     // Link this repo to the current checkout/worktree and record aliases.
     let checkout_id = ensure_checkout_for(store, git_ctx, &repository_id, &now);
@@ -339,23 +556,24 @@ pub fn resolve_affected_repository(
         return resolve_repository(store, &resolved, None).map(|r| r.repository_id);
     }
 
+    // A canonical repository ID is unambiguous even when the same string is
+    // also registered as a remote alias. Check it before alias resolution.
+    let exact: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT repository_id FROM repositories WHERE repository_id = ?1",
+            params![value],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(repository_id) = exact {
+        return Ok(repository_id);
+    }
+
     // Alias form.
     let norm = normalize_remote_alias(value);
     if let Some(rid) = unique_alias_match(store, &[norm])? {
         return Ok(rid);
-    }
-
-    // Repository ID form.
-    let tx = store
-        .conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let exists: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM repositories WHERE repository_id = ?1",
-        params![value],
-        |r| r.get(0),
-    )?;
-    if exists > 0 {
-        return Ok(value.to_string());
     }
     Err(SnagError::RepositoryNotFound(format!(
         "{} is not a known repository, alias, or existing path",

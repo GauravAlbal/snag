@@ -1,6 +1,11 @@
 use assert_cmd::Command;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use predicates::prelude::*;
 use rusqlite::Connection;
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command as Proc;
 
@@ -81,6 +86,23 @@ fn object_path_for(ctx: &TestContext, digest: &str) -> PathBuf {
         .join(hex)
 }
 
+fn object_tree(ctx: &TestContext) -> Vec<PathBuf> {
+    let root = ctx.data_dir.join("objects/blake3");
+    let Ok(prefixes) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for prefix in prefixes.filter_map(Result::ok) {
+        let Ok(objects) = std::fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        entries.push(prefix.path());
+        entries.extend(objects.filter_map(Result::ok).map(|object| object.path()));
+    }
+    entries.sort();
+    entries
+}
+
 // =====================================================================
 // 1. Idempotency under ambient drift (HEAD/branch change must not break replay)
 // =====================================================================
@@ -94,6 +116,7 @@ fn test_idempotency_survives_head_and_branch_drift() {
     first.current_dir(&repo);
     first
         .arg("report")
+        .arg("--unowned")
         .arg("stable report")
         .arg("--repo-id")
         .arg("repo_drift")
@@ -112,6 +135,7 @@ fn test_idempotency_survives_head_and_branch_drift() {
     replay.current_dir(&repo);
     replay
         .arg("report")
+        .arg("--unowned")
         .arg("stable report")
         .arg("--repo-id")
         .arg("repo_drift")
@@ -149,6 +173,7 @@ fn test_artifact_source_mutation_does_not_alter_object() {
     std::fs::write(&src, b"ORIGINAL CONTENT").unwrap();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("art")
         .arg("--artifact")
         .arg(&src)
@@ -173,6 +198,7 @@ fn test_missing_and_modified_artifact_fail_verify() {
     std::fs::write(&src, b"hello").unwrap();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("art")
         .arg("--artifact")
         .arg(&src)
@@ -195,6 +221,7 @@ fn test_missing_and_modified_artifact_fail_verify() {
 
     // Restore and then corrupt.
     std::fs::write(&obj, b"tampered").unwrap();
+    std::fs::set_permissions(&obj, std::fs::Permissions::from_mode(0o600)).unwrap();
     ctx.cmd()
         .arg("verify")
         .arg("--full")
@@ -213,13 +240,17 @@ fn test_orphan_object_reported() {
     let ctx = TestContext::new();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("no artifacts")
         .assert()
         .success();
     // Drop an unreferenced object file.
     let dir = ctx.data_dir.join("objects/blake3/ab");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a".repeat(64)), b"orphan bytes").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let orphan = dir.join("a".repeat(64));
+    std::fs::write(&orphan, b"orphan bytes").unwrap();
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o600)).unwrap();
     ctx.cmd()
         .arg("verify")
         .arg("--full")
@@ -362,7 +393,12 @@ fn test_export_unsupported_schema_rejected() {
 #[test]
 fn test_export_failed_export_preserves_existing_output() {
     let ctx = TestContext::new();
-    ctx.cmd().arg("report").arg("keep me").assert().success();
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("keep me")
+        .assert()
+        .success();
 
     let out = ctx.home_dir.path().join("existing.jsonl");
     std::fs::write(&out, b"SENTINEL\n").unwrap();
@@ -394,6 +430,7 @@ fn test_backup_component_substitution_detected() {
     let a = TestContext::new();
     a.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("store A record")
         .assert()
         .success();
@@ -403,6 +440,7 @@ fn test_backup_component_substitution_detected() {
     let b = TestContext::new();
     b.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("store B DIFFERENT")
         .assert()
         .success();
@@ -474,6 +512,7 @@ fn test_git_timeout_kills_child_and_returns_bounded() {
     let start = std::time::Instant::now();
     let status = Proc::new(&bin)
         .arg("report")
+        .arg("--unowned")
         .arg("timeout bounded")
         .current_dir(&repo)
         .env("XDG_DATA_HOME", ctx.home_dir.path())
@@ -526,6 +565,7 @@ fn test_backup_crash_never_publishes_partial_bundle() {
     let ctx = TestContext::new();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("backup crash")
         .assert()
         .success();
@@ -581,6 +621,7 @@ fn test_restore_crash_leaves_verified_store() {
     let src = TestContext::new();
     src.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("restored data")
         .arg("--idempotency-key")
         .arg("rk")
@@ -609,10 +650,147 @@ fn test_restore_crash_leaves_verified_store() {
 }
 
 #[test]
+fn test_stale_lock_diagnostic_does_not_block_restore() {
+    let src = TestContext::new();
+    src.cmd()
+        .arg("report")
+        .arg("lock source")
+        .arg("--unowned")
+        .assert()
+        .success();
+    src.cmd().arg("backup").assert().success();
+    let archive = latest_archive(&src);
+
+    let dst = TestContext::new();
+    std::fs::create_dir_all(&dst.data_dir).unwrap();
+    std::fs::write(dst.data_dir.join(".maintenance.lock"), b"dead pid=1\n").unwrap();
+    let restore = dst.cmd().arg("restore").arg(&archive).output().unwrap();
+    assert!(
+        restore.status.success(),
+        "a stale diagnostic lock must not block restore: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let verify = dst.cmd().arg("verify").arg("--full").output().unwrap();
+    assert!(
+        verify.status.success(),
+        "the restored store must remain fully verifiable: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn test_restore_lock_blocks_writer_until_cutover_then_releases() {
+    let src = TestContext::new();
+    src.cmd()
+        .arg("report")
+        .arg("barrier source")
+        .arg("--unowned")
+        .assert()
+        .success();
+    src.cmd().arg("backup").assert().success();
+    let archive = latest_archive(&src);
+
+    let dst = TestContext::new();
+    dst.cmd()
+        .arg("report")
+        .arg("empty seed")
+        .arg("--unowned")
+        .assert()
+        .success();
+    dst.conn()
+        .execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM records; DELETE FROM observations;")
+        .unwrap();
+    let mut restore = Proc::new(dst.bin())
+        .args(["restore", archive.to_str().unwrap()])
+        .env("XDG_DATA_HOME", dst.home_dir.path())
+        .env("HOME", dst.home_dir.path())
+        .env("SNAG_FAILPOINT_HOLD", "restore_before_active_switch")
+        .env("SNAG_FAILPOINT_HOLD_MS", "3000")
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if dst.data_dir.join("forensics").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    let mut writer = Proc::new(dst.bin())
+        .args(["report", "barrier writer", "--unowned"])
+        .env("XDG_DATA_HOME", dst.home_dir.path())
+        .env("HOME", dst.home_dir.path())
+        .spawn()
+        .unwrap();
+    let mut reader = Proc::new(dst.bin())
+        .args(["verify", "--full"])
+        .env("XDG_DATA_HOME", dst.home_dir.path())
+        .env("HOME", dst.home_dir.path())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(writer.try_wait().unwrap().is_none());
+    assert!(reader.try_wait().unwrap().is_none());
+    assert!(dst.data_dir.join("snag.sqlite").exists());
+
+    assert!(restore.wait().unwrap().success());
+    assert!(writer.wait().unwrap().success());
+    assert!(reader.wait().unwrap().success());
+    dst.cmd().arg("verify").arg("--full").assert().success();
+    assert_eq!(
+        dst.conn()
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+#[test]
+fn test_killed_restore_releases_lock_for_writer() {
+    let src = TestContext::new();
+    src.cmd()
+        .arg("kill source")
+        .arg("--unowned")
+        .assert()
+        .success();
+    src.cmd().arg("backup").assert().success();
+    let archive = latest_archive(&src);
+
+    let dst = TestContext::new();
+    let mut restore = Proc::new(dst.bin())
+        .args(["restore", archive.to_str().unwrap()])
+        .env("XDG_DATA_HOME", dst.home_dir.path())
+        .env("HOME", dst.home_dir.path())
+        .env("SNAG_FAILPOINT_HOLD", "restore_before_active_switch")
+        .env("SNAG_FAILPOINT_HOLD_MS", "5000")
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if dst.data_dir.join("forensics").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    let mut writer = Proc::new(dst.bin())
+        .args(["report", "surviving writer", "--unowned"])
+        .env("XDG_DATA_HOME", dst.home_dir.path())
+        .env("HOME", dst.home_dir.path())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(writer.try_wait().unwrap().is_none());
+    restore.kill().unwrap();
+    let _ = restore.wait();
+    assert!(writer.wait().unwrap().success());
+    dst.cmd().arg("verify").arg("--full").assert().success();
+}
+#[test]
 fn test_rebuild_crash_never_publishes_destination() {
     let ctx = TestContext::new();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("rebuild crash")
         .assert()
         .success();
@@ -657,6 +835,245 @@ fn test_rebuild_crash_never_publishes_destination() {
 }
 
 // =====================================================================
+// 7b. Hermetic consumer hardening (Darn harvest): export → rebuild into an
+//     isolated data home → full verify → reopen read-only → verify again →
+//     assert identity; mutation verbs fail against the read-only store.
+// =====================================================================
+
+#[test]
+fn test_hermetic_export_rebuild_verify_identity() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("hermetic a")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .assert()
+        .success();
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("hermetic b")
+        .arg("--kind")
+        .arg("papercut")
+        .arg("--severity")
+        .arg("minor")
+        .assert()
+        .success();
+
+    // Fingerprint the original store.
+    let out = ctx
+        .cmd()
+        .arg("verify")
+        .arg("--quick")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let original: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(original["record_count"], 2);
+    assert!(!original["store_id"].as_str().unwrap().is_empty());
+    assert!(!original["head_hash"].as_str().unwrap().is_empty());
+
+    // Export the stream.
+    let export = ctx.home_dir.path().join("hermetic.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export)
+        .assert()
+        .success();
+
+    // Rebuild into an isolated data home. XDG_DATA_HOME resolves to
+    // <home>/snag/snag.sqlite, so the destination must be a directory named
+    // `snag` inside a fresh home for read-reopen to land on the rebuilt store.
+    let new_home = ctx.home_dir.path().join("isolated");
+    let rebuilt = new_home.join("snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export)
+        .arg("--destination")
+        .arg(&rebuilt)
+        .assert()
+        .success();
+    assert!(rebuilt.join("snag.sqlite").exists());
+
+    // Full verify against the rebuilt store (point XDG_DATA_HOME at the
+    // isolated home).
+    let mut verify = ctx.cmd();
+    verify
+        .env("XDG_DATA_HOME", &new_home)
+        .arg("verify")
+        .arg("--full")
+        .arg("--json");
+    let out = verify.output().unwrap();
+    assert!(
+        out.status.success(),
+        "full verify failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rebuilt_fp: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+
+    // Identity: same store_id, sequence, head hash, record count.
+    assert_eq!(rebuilt_fp["store_id"], original["store_id"]);
+    assert_eq!(rebuilt_fp["through_sequence"], original["through_sequence"]);
+    assert_eq!(rebuilt_fp["head_hash"], original["head_hash"]);
+    assert_eq!(rebuilt_fp["record_count"], original["record_count"]);
+
+    // Reopen read-only and verify again: the reconstructed store must be
+    // consumable without mutation.
+    let mut verify2 = ctx.cmd();
+    verify2
+        .env("XDG_DATA_HOME", &new_home)
+        .arg("verify")
+        .arg("--full");
+    let out = verify2.output().unwrap();
+    assert!(
+        out.status.success(),
+        "second verify failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Read verbs work against the reconstructed store.
+    let mut list = ctx.cmd();
+    list.env("XDG_DATA_HOME", &new_home)
+        .arg("review")
+        .arg("list")
+        .arg("--format")
+        .arg("json");
+    let out = list.output().unwrap();
+    assert!(out.status.success());
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn test_rebuild_destination_rejects_database_path() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("reject me")
+        .assert()
+        .success();
+    let export = ctx.home_dir.path().join("e.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export)
+        .assert()
+        .success();
+
+    // A .sqlite destination is the classic Darn ambiguity: caller passes the
+    // database path, rebuild silently creates <path>.sqlite/snag.sqlite.
+    let out = ctx
+        .cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export)
+        .arg("--destination")
+        .arg(ctx.home_dir.path().join("dest.sqlite"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("DATA DIRECTORY"),
+        "must name the directory-vs-file semantics"
+    );
+}
+
+#[test]
+fn test_rebuilt_readonly_store_rejects_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("ro store")
+        .assert()
+        .success();
+    let export = ctx.home_dir.path().join("ro-export.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export)
+        .assert()
+        .success();
+
+    let new_home = ctx.home_dir.path().join("ro-isolated");
+    let rebuilt = new_home.join("snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export)
+        .arg("--destination")
+        .arg(&rebuilt)
+        .assert()
+        .success();
+
+    // Read-only consumption must not require mutation: reads succeed first.
+    let mut list = ctx.cmd();
+    list.env("XDG_DATA_HOME", &new_home)
+        .arg("review")
+        .arg("list");
+    assert!(list.output().unwrap().status.success());
+
+    // Make the store read-only (files and dir).
+    for entry in std::fs::read_dir(&rebuilt).unwrap() {
+        let p = entry.unwrap().path();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&p, perms).unwrap();
+    }
+    let mut perms = std::fs::metadata(&rebuilt).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&rebuilt, perms).unwrap();
+
+    // Mutation verb (report) must fail against the read-only store.
+    let mut report = ctx.cmd();
+    report
+        .env("XDG_DATA_HOME", &new_home)
+        .arg("report")
+        .arg("--unowned")
+        .arg("must fail");
+    let out = report.output().unwrap();
+    assert!(
+        !out.status.success(),
+        "mutation must fail against read-only store: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Read verb still works on the read-only store.
+    let mut list2 = ctx.cmd();
+    list2
+        .env("XDG_DATA_HOME", &new_home)
+        .arg("review")
+        .arg("list");
+    assert!(list2.output().unwrap().status.success());
+
+    // Restore permissions so the tempdir can be cleaned up.
+    for entry in std::fs::read_dir(&rebuilt).unwrap() {
+        let p = entry.unwrap().path();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&p, perms).unwrap();
+    }
+    let mut perms = std::fs::metadata(&rebuilt).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&rebuilt, perms).unwrap();
+}
+
+// =====================================================================
 // 7. Remaining T-matrix sub-bullets (T1/T7): prose headings, outside-Git
 //    capture, invalid schema, per-file artifact limit, concurrent same-object
 // =====================================================================
@@ -666,6 +1083,7 @@ fn test_prose_headings_intake() {
     let prose = "Prose title here\n\nExpected:\nworks fine\n\nObserved:\nbroken\n\nReproduction:\nstep one\n";
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("--stdin")
         .write_stdin(prose)
         .assert()
@@ -703,7 +1121,7 @@ fn test_outside_git_capture() {
 
     let mut c = ctx.cmd();
     c.current_dir(&plain);
-    c.arg("report").arg("no repo here");
+    c.arg("report").arg("--unowned").arg("no repo here");
     c.assert().success();
 
     let conn = ctx.conn();
@@ -728,6 +1146,7 @@ fn test_invalid_json_schema_rejected() {
     let bad = r#"{"schema_version": 99, "title": "too new"}"#;
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("--json")
         .write_stdin(bad)
         .assert()
@@ -749,6 +1168,7 @@ fn test_artifact_per_file_limit() {
     std::fs::write(&big, &blob).unwrap();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("too big")
         .arg("--artifact")
         .arg(&big)
@@ -763,6 +1183,68 @@ fn test_artifact_per_file_limit() {
 }
 
 #[test]
+fn test_aggregate_artifact_limit_preflight_leaves_no_objects() {
+    let ctx = TestContext::new();
+    let mut paths = Vec::new();
+    for index in 0..6 {
+        let path = ctx.home_dir.path().join(format!("sparse-{index}.bin"));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(42 * 1024 * 1024).unwrap();
+        paths.push(path);
+    }
+
+    let mut cmd = ctx.cmd();
+    cmd.arg("report").arg("--unowned").arg("aggregate too big");
+    for path in &paths {
+        cmd.arg("--artifact").arg(path);
+    }
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("250 MiB"));
+    assert_eq!(obs_count(&ctx), 0);
+    assert!(object_tree(&ctx).is_empty());
+}
+
+#[test]
+fn test_idempotency_conflict_removes_only_new_objects() {
+    let ctx = TestContext::new();
+    let first = ctx.home_dir.path().join("first.bin");
+    let second = ctx.home_dir.path().join("second.bin");
+    std::fs::write(&first, b"first artifact").unwrap();
+    std::fs::write(&second, b"second artifact").unwrap();
+
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("first artifact")
+        .arg("--artifact")
+        .arg(&first)
+        .arg("--idempotency-key")
+        .arg("artifact-conflict")
+        .assert()
+        .success();
+    let before_tree = object_tree(&ctx);
+    assert_eq!(before_tree.len(), 2);
+
+    ctx.cmd()
+        .arg("report")
+        .arg("--unowned")
+        .arg("different artifact")
+        .arg("--artifact")
+        .arg(&second)
+        .arg("--idempotency-key")
+        .arg("artifact-conflict")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Idempotency conflict"));
+    assert_eq!(
+        object_tree(&ctx),
+        before_tree,
+        "idempotency rejection must preserve the preexisting object tree"
+    );
+}
+
+#[test]
 fn test_concurrent_same_object_single_artifact() {
     let ctx = TestContext::new();
     let f = ctx.home_dir.path().join("shared.bin");
@@ -773,6 +1255,7 @@ fn test_concurrent_same_object_single_artifact() {
     for _ in 0..2 {
         let mut c = Proc::new(ctx.bin());
         c.arg("report")
+            .arg("--unowned")
             .arg("dup obj")
             .arg("--artifact")
             .arg(&f)
@@ -794,4 +1277,148 @@ fn test_concurrent_same_object_single_artifact() {
         "concurrent same-object ingestion must dedup to one artifact"
     );
     ctx.cmd().arg("verify").arg("--full").assert().success();
+}
+
+fn write_archive_entries(path: &Path, entries: &[(&str, tar::EntryType, &[u8])]) {
+    let file = File::create(path).unwrap();
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    for (entry_path, entry_type, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(entry_path).unwrap();
+        header.set_entry_type(*entry_type);
+        header.set_size(data.len() as u64);
+        header.set_cksum();
+        builder.append(&header, *data).unwrap();
+    }
+    let encoder = builder.into_inner().unwrap();
+    encoder.finish().unwrap();
+}
+
+fn write_rejected_archive(path: &Path, entry_path: &str, entry_type: tar::EntryType, size: u64) {
+    let data = if size <= 4096 {
+        vec![0u8; size as usize]
+    } else {
+        Vec::new()
+    };
+    write_archive_entries(path, &[(entry_path, entry_type, data.as_slice())]);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_bundle_symlink_tree_rejected_without_touching_target() {
+    let ctx = TestContext::new();
+    let target = ctx.home_dir.path().join("outside");
+    std::fs::write(&target, b"sentinel").unwrap();
+    let bundle = ctx.home_dir.path().join("bundle");
+    std::fs::create_dir(&bundle).unwrap();
+    symlink(&target, bundle.join("snag.sqlite")).unwrap();
+    ctx.cmd()
+        .arg("verify")
+        .arg("--backup")
+        .arg(&bundle)
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(&target).unwrap(), b"sentinel");
+}
+
+#[test]
+fn test_archive_forbidden_entries_and_budgets_rejected_before_cutover() {
+    let ctx = TestContext::new();
+    let cases = [
+        ("symlink", None, tar::EntryType::symlink(), "target", 0),
+        ("special", None, tar::EntryType::new(b'6'), "special", 0),
+        (
+            "per-entry",
+            Some(("SNAG_ARCHIVE_MAX_ENTRY_BYTES", "1")),
+            tar::EntryType::file(),
+            "large",
+            2,
+        ),
+        (
+            "depth",
+            Some(("SNAG_ARCHIVE_MAX_DEPTH", "16")),
+            tar::EntryType::file(),
+            "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q",
+            0,
+        ),
+    ];
+    for (name, limit, kind, entry, size) in cases {
+        let archive = ctx.home_dir.path().join(format!("{name}.tar.gz"));
+        write_rejected_archive(&archive, entry, kind, size);
+        let mut command = ctx.cmd();
+        if let Some((key, value)) = limit {
+            command.env(key, value);
+        }
+        command
+            .arg("verify")
+            .arg("--backup")
+            .arg(&archive)
+            .assert()
+            .failure();
+        assert!(!ctx.data_dir.join("snag.sqlite").exists());
+    }
+    let aggregate = ctx.home_dir.path().join("aggregate.tar.gz");
+    write_archive_entries(
+        &aggregate,
+        &[
+            ("a", tar::EntryType::file(), b"x"),
+            ("b", tar::EntryType::file(), b"x"),
+        ],
+    );
+    ctx.cmd()
+        .env("SNAG_ARCHIVE_MAX_TOTAL_BYTES", "1")
+        .arg("verify")
+        .arg("--backup")
+        .arg(&aggregate)
+        .assert()
+        .failure();
+    let count = ctx.home_dir.path().join("count.tar.gz");
+    write_archive_entries(
+        &count,
+        &[
+            ("a", tar::EntryType::file(), b""),
+            ("b", tar::EntryType::file(), b""),
+        ],
+    );
+    ctx.cmd()
+        .env("SNAG_ARCHIVE_MAX_ENTRIES", "1")
+        .arg("verify")
+        .arg("--backup")
+        .arg(&count)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_successful_verify_cleans_private_snapshot_and_managed_modes() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("mode check")
+        .arg("--unowned")
+        .assert()
+        .success();
+    ctx.cmd().arg("backup").assert().success();
+    let archive = latest_archive(&ctx);
+    let scratch = tempfile::tempdir().unwrap();
+    ctx.cmd()
+        .env("TMPDIR", scratch.path())
+        .arg("verify")
+        .arg("--backup")
+        .arg(&archive)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    #[cfg(unix)]
+    {
+        assert_eq!(std::fs::metadata(&archive).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(ctx.data_dir.join("backups"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 }

@@ -91,6 +91,7 @@ A wrapper can provide richer session context through `SNAG_CONTEXT_FILE`. See [A
 ```bash
 snag report "build reports success but creates no artifact" \
   --kind bug \
+  --owner GauravAlbal/snag \
   --observed "make release exited 0, but dist/app does not exist" \
   --expected "a successful release build creates dist/app" \
   --repro "run make release in a fresh clone"
@@ -101,6 +102,7 @@ The shorter form is equivalent:
 ```bash
 snag "build reports success but creates no artifact" \
   --kind bug \
+  --owner GauravAlbal/snag \
   --observed "make release exited 0, but dist/app does not exist" \
   --expected "a successful release build creates dist/app" \
   --repro "run make release in a fresh clone"
@@ -119,11 +121,32 @@ Optional artifacts can be attached explicitly:
 
 ```bash
 snag report "compiler crashes on generated schema" \
+  --unowned \
   --observed "compiler exited with signal 11" \
   --expected "compiler emits generated.rs" \
   --repro "run ./scripts/generate-schema.sh" \
-  --artifact compiler.log
+  --artifact /tmp/compiler-crash.log
 ```
+
+## Ownership: CLI, prose, and JSON
+
+Ownership is declared on every capture in one of three forms. They are
+equivalent for persistence — pick the one your pipeline supports:
+
+| Form | Known owner | Explicitly unowned |
+|---|---|---|
+| CLI flags | `--owner <id\|alias\|path\|current>` | `--unowned` |
+| Prose stdin (`--stdin`) | `Owner:` section containing the repository | `Unowned:` section containing `true` |
+| JSON intake (`--json <file>`) | schema v2 with `"owner": "..."` | schema v2 with `"unowned": true` |
+
+Flags are mutually exclusive. CLI ownership flags override any JSON or prose
+declaration as one complete choice. Empty owner and `unowned: false` do not
+satisfy the requirement — capture is rejected with a typed error pointing at
+`--owner <repository>` or `--unowned`. Schema v1 JSON intake remains accepted
+only when the CLI supplies `--owner` or `--unowned`; v1 documents that omit
+ownership are rejected. Persisted explicit-unowned observations keep
+`owner_repository_id = None` and never gain a phantom owner later; see
+[Assign a fix owner later](#assign-a-fix-owner-later).
 
 ## Inspect observations
 
@@ -141,6 +164,26 @@ Use `snag context` before reporting to see what repository and session context S
 snag context
 snag context --format json
 ```
+
+## Decide when an owner lane needs another agent
+
+`review summary` separates all open observations from work that is ready for a
+fresh agent. `READY` and the compact `R:*` severity columns (`R:B`, `R:M`,
+`R:MED`, `R:MIN`, `R:LOW`) exclude observations already in `candidate_fix` or
+`remediation_in_progress`; `INFLT` shows that excluded work. Thresholds use the
+ready severity counts:
+
+```bash
+snag review summary --at-least blocker=1 --at-least major=3
+snag review summary --at-least blocker=1 --at-least major=3 \
+  --format json --limit 10
+```
+
+The command exits 1 when any evaluated owner lane (including a lane hidden by
+`--limit`) crosses any threshold, and 0 otherwise. JSON exposes both
+`severity_counts` (all open) and `actionable_severity_counts` (ready), plus
+`actionable` and `in_flight`. Observations without a fix owner remain in the
+separate `(unowned)` bucket.
 
 ## Pick up an observation later
 
@@ -185,6 +228,35 @@ snag review relate <left-id> <right-id> \
   --relation same-finding \
   --rationale "both fail after the same stale-session transition"
 ```
+
+## Declare ownership on every capture
+
+Every `snag report` must declare exactly one fix owner: a repository lane
+(`--owner <id|alias|path|current>`) when the owner is known, or `--unowned`
+when the observation is genuinely ambiguous or purely environmental. Reporter
+location is not ownership — your current checkout says where the observation
+was filed FROM, not which repository should fix it. Guessing `current`
+recreates the misrouting the explicit flag exists to prevent.
+
+```bash
+snag report "<title>" --owner GauravAlbal/snag ...    # known owner
+snag report "<title>" --unowned ...                    # ambiguous / environmental
+```
+
+Explicitly-unowned observations can be reassigned later without rewriting the
+original record — see [Assign a fix owner later](#assign-a-fix-owner-later).
+
+### Assign a fix owner later
+
+Move an explicitly-unowned observation into a repository lane without
+rewriting the original capture:
+
+```bash
+snag review assign-owner <observation-id> owner/repository
+```
+
+Owner assignment is append-only. Reassigning records another event; the latest
+assignment determines the lane shown by `review summary`.
 
 ## Link the fix and verification
 
@@ -340,12 +412,12 @@ See [Recovery runbook](docs/RUNBOOK.md) for detailed procedures.
 | Task                              | Commands                                                                  |
 | --------------------------------- | ------------------------------------------------------------------------- |
 | Configure an agent                | `snag init`                                                               |
-| Record a problem                  | `snag report`, or `snag "<title>"`                                        |
+| Record a problem                  | `snag report ... --owner <repo>`, or `snag report ... --unowned`             |
 | Inspect captured context          | `snag context`                                                            |
 | Find and inspect observations     | `snag list`, `snag show`                                                  |
 | Review the queue                  | `snag review next`, `list`, `show`, `history`                             |
 | Claim work                        | `snag review claim`, `release`, `heartbeat`                               |
-| Classify and relate observations  | `snag review disposition`, `reopen`, `relate`, `unrelate`                 |
+| Assign work to an owner lane       | `snag review assign-owner`                                               |
 | Link remediation                  | `snag review promote`, `attach-task`, `attach-fix`, `attach-verification` |
 | Close or reopen remediation       | `snag review mark-handled`, `reopen-remediation`                          |
 | Validate a completion report      | `snag review verify-report`                                               |

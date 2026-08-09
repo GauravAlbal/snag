@@ -62,6 +62,7 @@ fn report_in(
     if let Some(r) = repo {
         cmd.arg("--repo-id").arg(r);
     }
+    cmd.arg("--unowned");
     cmd.assert().success();
     let conn = ctx.conn();
     conn.query_row(
@@ -70,6 +71,26 @@ fn report_in(
         |r| r.get(0),
     )
     .unwrap()
+}
+fn report_owned(ctx: &TestContext, title: &str, kind: &str, severity: &str, owner: &str) -> String {
+    ctx.cmd()
+        .arg("report")
+        .arg(title)
+        .arg("--kind")
+        .arg(kind)
+        .arg("--severity")
+        .arg(severity)
+        .arg("--owner")
+        .arg(owner)
+        .assert()
+        .success();
+    ctx.conn()
+        .query_row(
+            "SELECT observation_id FROM observations WHERE title = ?1 ORDER BY local_sequence DESC LIMIT 1",
+            [title],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 fn record_count(ctx: &TestContext) -> i64 {
@@ -243,14 +264,27 @@ fn list_json(ctx: &TestContext, args: &[&str]) -> Vec<serde_json::Value> {
     serde_json::from_str::<Vec<serde_json::Value>>(&String::from_utf8(out.stdout).unwrap()).unwrap()
 }
 
+fn assign_owner(ctx: &TestContext, observation_id: &str, repository_id: &str) {
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(observation_id)
+        .arg(repository_id)
+        .assert()
+        .success();
+}
+
 #[test]
 fn t1b_list_filters_by_repository() {
     let ctx = TestContext::new();
     let in_r1 = report_in(&ctx, "r1 bug", "bug", "major", Some("repo_alpha"));
     let in_r2 = report_in(&ctx, "r2 bug", "bug", "minor", Some("repo_beta"));
+    assign_owner(&ctx, &in_r1, "repo_alpha");
+    assign_owner(&ctx, &in_r2, "repo_beta");
 
     let rows = list_json(&ctx, &["--repo", "repo_alpha"]);
     assert_eq!(rows.len(), 1, "repo filter must scope to the lane");
+
     assert_eq!(rows[0]["observation_id"], in_r1);
     assert_ne!(rows[0]["observation_id"], in_r2);
 
@@ -270,6 +304,152 @@ fn t1b_list_filters_by_repository() {
             .contains("no_such_repo"),
         "unknown repo must name the missing id"
     );
+}
+#[test]
+fn t1b_owner_filter_uses_latest_owner_for_list_and_next() {
+    let ctx = TestContext::new();
+    let moved = report_in(&ctx, "moves to beta", "bug", "major", Some("repo_alpha"));
+    let alpha_stays = report_in(&ctx, "stays with alpha", "bug", "minor", Some("repo_alpha"));
+    assign_owner(&ctx, &moved, "repo_alpha");
+    assign_owner(&ctx, &alpha_stays, "repo_alpha");
+    assign_owner(&ctx, &moved, "repo_beta");
+
+    let alpha = list_json(&ctx, &["--repo", "repo_alpha"]);
+    assert!(alpha.iter().all(|row| row["observation_id"] != moved));
+    assert!(alpha.iter().any(|row| row["observation_id"] == alpha_stays));
+    let beta = list_json(&ctx, &["--repo", "repo_beta"]);
+    assert!(beta.iter().any(|row| row["observation_id"] == moved));
+
+    let alpha_next = ctx
+        .cmd()
+        .arg("review")
+        .arg("next")
+        .arg("--repo")
+        .arg("repo_alpha")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(alpha_next.stdout)
+            .unwrap()
+            .contains(&alpha_stays)
+    );
+    let beta_next = ctx
+        .cmd()
+        .arg("review")
+        .arg("next")
+        .arg("--repo")
+        .arg("repo_beta")
+        .arg("--format")
+        .arg("agent")
+        .output()
+        .unwrap();
+    let packet: serde_json::Value = serde_json::from_slice(&beta_next.stdout).unwrap();
+    assert_eq!(packet["observation"]["observation_id"], moved);
+    assert_eq!(packet["current_state"]["owner_repository_id"], "repo_beta");
+}
+
+#[test]
+fn t1b_agent_packet_includes_fresh_report_owner() {
+    let ctx = TestContext::new();
+    let observation = report_owned(&ctx, "fresh owner", "bug", "major", "repo_fresh");
+    let out = ctx
+        .cmd()
+        .arg("review")
+        .arg("next")
+        .arg("--repo")
+        .arg("repo_fresh")
+        .arg("--format")
+        .arg("agent")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let packet: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(packet["observation"]["observation_id"], observation);
+    assert_eq!(packet["current_state"]["owner_repository_id"], "repo_fresh");
+}
+
+#[test]
+fn t1b_next_unknown_current_repo_is_read_only() {
+    let ctx = TestContext::new();
+    let unknown_repo = ctx.home_dir.path().join("fresh-unknown");
+    std::fs::create_dir_all(&unknown_repo).unwrap();
+    assert!(
+        Proc::new("git")
+            .args(["init", "-q"])
+            .current_dir(&unknown_repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Proc::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:acme/never-recorded-read-purity.git",
+            ])
+            .current_dir(&unknown_repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _ = report(&ctx, "read-only repo lookup", "bug", "major");
+    let before_records = record_count(&ctx);
+    let before_claims = claim_count(&ctx);
+    let before_observations = ctx
+        .conn()
+        .query_row("SELECT COUNT(*) FROM observations", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+    let before_bytes = std::fs::metadata(ctx.data_dir.join("snag.sqlite"))
+        .unwrap()
+        .len();
+    let out = ctx
+        .cmd()
+        .arg("review")
+        .arg("next")
+        .arg("--repo")
+        .arg("current")
+        .current_dir(&unknown_repo)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(record_count(&ctx), before_records);
+    assert_eq!(claim_count(&ctx), before_claims);
+    assert_eq!(
+        ctx.conn()
+            .query_row("SELECT COUNT(*) FROM observations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        before_observations
+    );
+    assert_eq!(
+        std::fs::metadata(ctx.data_dir.join("snag.sqlite"))
+            .unwrap()
+            .len(),
+        before_bytes
+    );
+}
+
+#[test]
+fn t1b_review_repo_help_names_fix_owner_lane() {
+    let ctx = TestContext::new();
+    for subcommand in ["next", "list", "summary"] {
+        let out = ctx
+            .cmd()
+            .args(["review", subcommand, "--help"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(help.contains("fix-owner"), "{subcommand} help: {help}");
+        assert!(
+            help.contains("top-level `snag list --repo`"),
+            "{subcommand} help: {help}"
+        );
+    }
 }
 
 #[test]
@@ -641,6 +821,119 @@ fn t2_concurrent_acquisition_yields_exactly_one_winner() {
     }
     assert_eq!(winners, 1, "exactly one session may hold the claim");
     assert_eq!(claim_count(&ctx), 1);
+}
+
+#[test]
+fn t2_concurrent_owner_assignment_preserves_projection_and_stream() {
+    let ctx = TestContext::new();
+    let observation = report_owned(&ctx, "owner race", "bug", "major", "repo_alpha");
+    let unrelated = report(&ctx, "unrelated survives", "bug", "minor");
+    let before_records = record_count(&ctx);
+    let bin = ctx.bin();
+    let mut children = Vec::new();
+    for (i, owner) in ["repo_alpha", "repo_beta"].into_iter().enumerate() {
+        let mut child = Proc::new(&bin);
+        child
+            .args(["review", "assign-owner", &observation, owner])
+            .env("XDG_DATA_HOME", ctx.home_dir.path())
+            .env("HOME", ctx.home_dir.path())
+            .env("SNAG_REVIEWER_ID", format!("rev_owner_{i}"))
+            .env("SNAG_REVIEW_SESSION_ID", format!("sess_owner_{i}"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        children.push(child.spawn().unwrap());
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent owner assignment failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let conn = ctx.conn();
+    let mut owner_stmt = conn
+        .prepare(
+            "SELECT repository_id FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+        )
+        .unwrap();
+    let owner_rows: Vec<String> = owner_stmt
+        .query_map([&observation], |row| row.get(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(owner_rows.len(), 1, "owner projection must remain singular");
+    let stream_owner: String = conn
+        .query_row(
+            "SELECT json_extract(canonical_payload_json, '$.owner_repository_id')
+             FROM records
+             WHERE entity_id = ?1 AND record_type = 'observation_owner_assigned'
+             ORDER BY local_sequence DESC LIMIT 1",
+            [&observation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let show = ctx
+        .cmd()
+        .args(["review", "show", &observation, "--format", "agent"])
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let packet: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(packet["current_state"]["owner_repository_id"], stream_owner);
+    assert_eq!(owner_rows[0], stream_owner);
+    assert_eq!(record_count(&ctx), before_records + 2);
+    assert!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observations WHERE observation_id = ?1)",
+            [&unrelated],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn t2_owner_assignment_failpoints_preserve_identity_and_projection() {
+    let ctx = TestContext::new();
+    let observation = report_owned(&ctx, "owner failpoint", "bug", "major", "repo_initial");
+    let before_records = record_count(&ctx);
+
+    assert!(!run_with_failpoint(
+        &ctx,
+        "remediation_before_commit",
+        &["review", "assign-owner", &observation, "repo_before"],
+    ));
+    assert_eq!(record_count(&ctx), before_records);
+    let conn = ctx.conn();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM repositories WHERE repository_id = 'repo_before'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+
+    assert!(!run_with_failpoint(
+        &ctx,
+        "remediation_after_commit",
+        &["review", "assign-owner", &observation, "repo_after"],
+    ));
+    assert_eq!(record_count(&ctx), before_records + 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT repository_id FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+            [&observation],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "repo_after"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1620,6 +1913,13 @@ fn t8_export_rebuild_preserves_all_remediation_state() {
         .arg("t2")
         .assert()
         .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&b)
+        .arg("repo_owner")
+        .assert()
+        .success();
 
     // Snapshot the materialized state before the round trip.
     let conn = ctx.conn();
@@ -1634,6 +1934,20 @@ fn t8_export_rebuild_preserves_all_remediation_state() {
         }
         v
     };
+    let owners_before: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT observation_id, repository_id
+                 FROM observation_repositories
+                 WHERE role = 'owner'
+                 ORDER BY observation_id, repository_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
 
     let export_path = ctx.home_dir.path().join("export.jsonl");
     ctx.cmd()
@@ -1642,6 +1956,18 @@ fn t8_export_rebuild_preserves_all_remediation_state() {
         .arg(&export_path)
         .assert()
         .success();
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&export_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        header["minimum_reader_version"], 3,
+        "owner assignment requires a reader that understands its event"
+    );
     let rebuilt = ctx.home_dir.path().join("rebuilt");
     // Rebuild's destination is a data dir (the store lands at
     // <destination>/snag.sqlite), so pointing it at the XDG store dir makes
@@ -1679,6 +2005,24 @@ fn t8_export_rebuild_preserves_all_remediation_state() {
     assert_eq!(
         state_before, state_after,
         "review state must survive rebuild"
+    );
+    let owners_after: Vec<(String, String)> = {
+        let mut stmt = conn2
+            .prepare(
+                "SELECT observation_id, repository_id
+                 FROM observation_repositories
+                 WHERE role = 'owner'
+                 ORDER BY observation_id, repository_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        owners_before, owners_after,
+        "owner projection must survive rebuild"
     );
 
     // Event history is complete.
@@ -1897,3 +2241,71 @@ fn t7_crash_after_commit_leaves_one_complete_event() {
 }
 
 // ---------------------------------------------------------------------------
+
+#[test]
+fn verify_rejects_initial_owner_projection_drift() {
+    let ctx = TestContext::new();
+    let observation = report_owned(&ctx, "initial owner drift", "bug", "major", "repo_initial");
+    report_owned(
+        &ctx,
+        "initial owner target",
+        "bug",
+        "minor",
+        "repo_tampered",
+    );
+    let conn = ctx.conn();
+    conn.execute(
+        "UPDATE observation_repositories
+         SET repository_id = 'repo_tampered'
+         WHERE observation_id = ?1 AND role = 'owner'",
+        [&observation],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = ctx.cmd().arg("verify").arg("--full").output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("owner mismatch"), "{err}");
+}
+
+#[test]
+fn verify_rejects_projected_owner_drift() {
+    let ctx = TestContext::new();
+    let observation = report_owned(
+        &ctx,
+        "projected owner drift",
+        "bug",
+        "major",
+        "repo_initial",
+    );
+    report_owned(
+        &ctx,
+        "projected owner target",
+        "bug",
+        "minor",
+        "repo_second",
+    );
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation)
+        .arg("repo_second")
+        .assert()
+        .success();
+
+    let conn = ctx.conn();
+    conn.execute(
+        "UPDATE observation_repositories
+         SET repository_id = 'repo_initial'
+         WHERE observation_id = ?1 AND role = 'owner'",
+        [&observation],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = ctx.cmd().arg("verify").arg("--full").output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("owner mismatch"), "{err}");
+}

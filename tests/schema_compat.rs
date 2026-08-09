@@ -8,11 +8,13 @@
 //!
 //! The validator is a small dependency-free subset of JSON Schema draft-07
 //! covering exactly the keywords the published schemas use (type, const, enum,
-//! required, properties, additionalProperties, minimum/maximum, pattern,
-//! format: date-time, oneOf, items). If a schema starts using a keyword this
-//! subset does not implement, the validator fails loudly rather than skipping.
+//! required, properties, additionalProperties, minimum/maximum, minLength,
+//! pattern, format: date-time, oneOf, not, items). If a schema starts using a
+//! keyword this subset does not implement, the validator fails loudly rather
+//! than skipping.
 
 use assert_cmd::Command;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
 use std::path::PathBuf;
@@ -50,20 +52,28 @@ fn date_time_ok(s: &str) -> bool {
 }
 
 fn validate(schema: &Value, doc: &Value, path: &str) -> Result<(), String> {
-    // oneOf: first matching variant wins, mirroring the schemas' intent that
-    // every line matches exactly one variant.
+    // oneOf requires exactly one matching variant, as specified by JSON Schema.
     if let Some(one_of) = schema.get("oneOf") {
+        let mut matches = 0;
         let mut tried = Vec::new();
         for (i, sub) in one_of.as_array().unwrap().iter().enumerate() {
             match validate(sub, doc, path) {
-                Ok(()) => return Ok(()),
+                Ok(()) => matches += 1,
                 Err(e) => tried.push(format!("variant {i}: {e}")),
             }
         }
-        return fail(
-            path,
-            &format!("matches no oneOf variant: {}", tried.join("; ")),
-        );
+        if matches != 1 {
+            return fail(
+                path,
+                &format!("matches {matches} oneOf variants: {}", tried.join("; ")),
+            );
+        }
+    }
+
+    if let Some(not) = schema.get("not")
+        && validate(not, doc, path).is_ok()
+    {
+        return fail(path, "matches a forbidden `not` schema");
     }
 
     if let Some(t) = schema.get("type") {
@@ -99,12 +109,20 @@ fn validate(schema: &Value, doc: &Value, path: &str) -> Result<(), String> {
     {
         return fail(path, &format!("value {} above maximum {max}", doc));
     }
+    if let Some(min_len) = schema.get("minLength")
+        && doc
+            .as_str()
+            .is_none_or(|s| s.chars().count() < min_len.as_u64().unwrap() as usize)
+    {
+        return fail(path, &format!("string is shorter than minLength {min_len}"));
+    }
 
     if let Some(pat) = schema.get("pattern") {
         let p = pat.as_str().unwrap();
         let s = doc.as_str().unwrap();
         let ok = match p {
             "^(blake3:[0-9a-f]{64}|0{64})$" => hash_pattern_ok(s),
+            "\\S" => s.chars().any(|c| !c.is_whitespace()),
             other => panic!("validator does not implement pattern {other}"),
         };
         if !ok {
@@ -290,13 +308,14 @@ fn test_context_output_validates() {
 }
 
 /// The document the CLI accepts via `report --json` validates against the
-/// observation input schema; unknown top-level fields are permitted.
+/// observation input schemas; unknown top-level fields are permitted.
 #[test]
 fn test_observation_input_validates() {
     let ctx = TestContext::new();
-    let doc = r#"{
-        "schema_version": 1,
+    let v2_doc = r#"{
+        "schema_version": 2,
         "title": "schema gate observation",
+        "owner": "repo_schema",
         "kind_assertion": "bug",
         "severity_assertion": "major",
         "confidence": 0.9,
@@ -305,22 +324,46 @@ fn test_observation_input_validates() {
         "context": {"execution": {"tool_name": "bash"}},
         "wrapper_owned_key": "ignored by the reader"
     }"#;
-    let s = schema("observation-input-v1.schema.json");
-    let parsed: Value = serde_json::from_str(doc).unwrap();
-    validate(&s, &parsed, "observation-input").unwrap();
+    let v2 = schema("observation-input-v2.schema.json");
+    let parsed: Value = serde_json::from_str(v2_doc).unwrap();
+    validate(&v2, &parsed, "observation-input-v2").unwrap();
 
-    // The CLI actually accepts it.
     ctx.cmd()
         .arg("report")
         .arg("--json")
-        .write_stdin(doc)
+        .write_stdin(v2_doc)
         .assert()
         .success();
 
-    // A confidence above 1 must fail the schema.
-    let bad: Value =
-        serde_json::from_str(r#"{"schema_version": 1, "title": "t", "confidence": 1.5}"#).unwrap();
-    assert!(validate(&s, &bad, "observation-input").is_err());
+    // v1 remains valid when the ownership choice is supplied by the CLI.
+    let v1_doc = r#"{"schema_version": 1, "title": "legacy intake", "kind_assertion": "bug"}"#;
+    let v1 = schema("observation-input-v1.schema.json");
+    let legacy: Value = serde_json::from_str(v1_doc).unwrap();
+    validate(&v1, &legacy, "observation-input-v1").unwrap();
+    ctx.cmd()
+        .arg("report")
+        .arg("--json")
+        .arg("--unowned")
+        .write_stdin(v1_doc)
+        .assert()
+        .success();
+
+    // A confidence above 1 must fail the v2 schema.
+    let bad: Value = serde_json::from_str(
+        r#"{"schema_version": 2, "title": "t", "owner": "r", "confidence": 1.5}"#,
+    )
+    .unwrap();
+    assert!(validate(&v2, &bad, "observation-input-v2").is_err());
+    for bad in [
+        r#"{"schema_version":2,"title":"missing"}"#,
+        r#"{"schema_version":2,"title":"both","owner":"repo","unowned":true}"#,
+        r#"{"schema_version":2,"title":"empty","owner":""}"#,
+        r#"{"schema_version":2,"title":"whitespace","owner":"   \t  "}"#,
+        r#"{"schema_version":2,"title":"false","unowned":false}"#,
+    ] {
+        let bad: Value = serde_json::from_str(bad).unwrap();
+        assert!(validate(&v2, &bad, "observation-input-v2").is_err());
+    }
 }
 
 /// A real `snag export` stream validates line-by-line against the export
@@ -333,9 +376,33 @@ fn test_export_stream_validates() {
         .arg("stream one")
         .arg("--kind")
         .arg("bug")
+        .arg("--unowned")
         .assert()
         .success();
-    ctx.cmd().arg("report").arg("stream two").assert().success();
+    let conn = Connection::open(ctx.home_dir.path().join("snag").join("snag.sqlite")).unwrap();
+    let observation_id: String = conn
+        .query_row(
+            "SELECT observation_id FROM observations
+             WHERE title = 'stream one'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg("repo_owner")
+        .assert()
+        .success();
+
+    ctx.cmd()
+        .arg("report")
+        .arg("stream two")
+        .arg("--unowned")
+        .assert()
+        .success();
 
     let out_path = ctx.home_dir.path().join("stream.jsonl");
     ctx.cmd()
@@ -353,6 +420,10 @@ fn test_export_stream_validates() {
     // Header line.
     let header: Value = serde_json::from_str(lines[0]).unwrap();
     validate(&s, &header, "export.header").unwrap();
+    assert_eq!(
+        header["minimum_reader_version"], 3,
+        "owner assignment advertises the reader capability it requires"
+    );
     assert_eq!(header["export_kind"], "export_header");
 
     // Record lines.
@@ -366,8 +437,116 @@ fn test_export_stream_validates() {
         last_seq = seq;
     }
 
-    // Tampered record hash must fail the validator (proves it is not vacuous).
     let mut tampered: Value = serde_json::from_str(lines[1]).unwrap();
     tampered["record_hash"] = Value::String("blake3:not-a-hash".into());
     assert!(validate(&s, &tampered, "export.record.tampered").is_err());
+
+    // A future event vocabulary must advertise a newer reader version. This
+    // reader refuses it before attempting to deserialize unknown payloads.
+    let mut future_header = header;
+    future_header["minimum_reader_version"] = Value::from(4);
+    let incompatible_path = ctx.home_dir.path().join("future.jsonl");
+    let mut incompatible = vec![serde_json::to_string(&future_header).unwrap()];
+    incompatible.extend(lines[1..].iter().map(|line| (*line).to_string()));
+    std::fs::write(&incompatible_path, incompatible.join("\n") + "\n").unwrap();
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&incompatible_path)
+        .arg("--destination")
+        .arg(ctx.home_dir.path().join("future-rebuild"))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "Unsupported minimum reader version: 4",
+        ));
+}
+
+#[test]
+fn test_direct_owner_export_requires_v3_and_rebuild_preserves_ownership() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("direct owner")
+        .arg("--owner")
+        .arg("repo_owner")
+        .assert()
+        .success();
+    ctx.cmd()
+        .arg("report")
+        .arg("direct unowned")
+        .arg("--unowned")
+        .assert()
+        .success();
+
+    let export_path = ctx.home_dir.path().join("owner-stream.jsonl");
+    ctx.cmd()
+        .arg("export")
+        .arg("--output")
+        .arg(&export_path)
+        .assert()
+        .success();
+    let export = std::fs::read_to_string(&export_path).unwrap();
+    let lines: Vec<&str> = export.lines().collect();
+    let header: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(
+        header["minimum_reader_version"], 3,
+        "persisted ownership fields require the same reader as owner-assignment events"
+    );
+    let records: Vec<Value> = lines[1..]
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["canonical_payload"]["owner_repository_id"] == "repo_owner" })
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["canonical_payload"]["owner_was_explicitly_unowned"] == true })
+    );
+
+    let rebuilt = ctx.home_dir.path().join("owner-rebuilt");
+    let destination = rebuilt.join("snag");
+    ctx.cmd()
+        .arg("rebuild")
+        .arg("--from-export")
+        .arg(&export_path)
+        .arg("--destination")
+        .arg(&destination)
+        .assert()
+        .success();
+    let conn = Connection::open(destination.join("snag.sqlite")).unwrap();
+    let owner: String = conn
+        .query_row(
+            "SELECT json_extract(canonical_payload_json, '$.owner_repository_id')
+             FROM observations WHERE title = 'direct owner'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, "repo_owner");
+    let owner_projection: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observation_repositories r
+             JOIN observations o ON o.observation_id = r.observation_id
+             WHERE o.title = 'direct owner'
+               AND r.repository_id = 'repo_owner'
+               AND r.role = 'owner'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_projection, 1);
+    let unowned_marker: i64 = conn
+        .query_row(
+            "SELECT json_extract(canonical_payload_json, '$.owner_was_explicitly_unowned')
+             FROM observations WHERE title = 'direct unowned'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unowned_marker, 1);
 }

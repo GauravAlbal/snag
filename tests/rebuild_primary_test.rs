@@ -46,6 +46,7 @@ fn report_in(ctx: &TestContext, title: &str, repo_id: &str) -> String {
         .arg("major")
         .arg("--repo-id")
         .arg(repo_id)
+        .arg("--unowned")
         .assert()
         .success();
     ctx.conn()
@@ -201,6 +202,7 @@ fn t2_rebuild_unowned_obs_stays_unowned() {
         .arg("bug")
         .arg("--severity")
         .arg("minor")
+        .arg("--unowned")
         .assert()
         .success();
 

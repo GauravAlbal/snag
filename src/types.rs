@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Observation {
     pub schema_version: u32,
@@ -61,6 +65,11 @@ pub struct Observation {
     /// canonical encoding is byte-identical (no hash-chain orphaning).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_repository_id: Option<String>,
+
+    /// True only when capture explicitly chose `--unowned` (or its prose/JSON
+    /// equivalent). Omitted on legacy and owned observations.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owner_was_explicitly_unowned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

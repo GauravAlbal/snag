@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use rusqlite::Connection;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command as Proc;
 
@@ -51,6 +52,7 @@ fn test_32_concurrent_writers() {
     for i in 0..32 {
         let mut c = Proc::new(&bin);
         c.arg("report")
+            .arg("--unowned")
             .arg(format!("concurrent-{}", i))
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
@@ -90,6 +92,7 @@ fn test_concurrent_same_key_single_observation() {
     for _ in 0..16 {
         let mut c = Proc::new(&bin);
         c.arg("report")
+            .arg("--unowned")
             .arg("same idempotent report")
             .arg("--idempotency-key")
             .arg("concurrent_shared")
@@ -126,6 +129,7 @@ fn test_artifact_dedup_and_symlink_rejection() {
 
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("two same artifacts")
         .arg("--artifact")
         .arg(&f1)
@@ -150,6 +154,7 @@ fn test_artifact_dedup_and_symlink_rejection() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
     ctx.cmd()
         .arg("report")
+        .arg("--unowned")
         .arg("symlink")
         .arg("--artifact")
         .arg(&link)
@@ -177,6 +182,7 @@ fn test_crash_injection_report_failpoints() {
     for stage in stages {
         let mut c = Proc::new(&bin);
         c.arg("report")
+            .arg("--unowned")
             .arg(format!("crash-{}", stage))
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
@@ -203,4 +209,51 @@ fn test_crash_injection_report_failpoints() {
             ctx.cmd().arg("verify").arg("--full").assert().success();
         }
     }
+}
+
+#[test]
+fn test_read_only_command_preserves_store_bytes_and_modes() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("read purity")
+        .arg("--unowned")
+        .assert()
+        .success();
+    // SQLite materializes WAL reader sidecars on the first read-only open.
+    // Establish them before comparing the durable store and all entry modes.
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+    let db = ctx.data_dir.join("snag.sqlite");
+    let before_db = std::fs::read(&db).unwrap();
+    let before_entries: Vec<(String, u32)> = std::fs::read_dir(&ctx.data_dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::symlink_metadata(path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+            )
+        })
+        .collect();
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+    assert_eq!(before_db, std::fs::read(&db).unwrap());
+    let after_entries: Vec<(String, u32)> = std::fs::read_dir(&ctx.data_dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::symlink_metadata(path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+            )
+        })
+        .collect();
+    assert_eq!(before_entries, after_entries);
 }

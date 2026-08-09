@@ -2,15 +2,63 @@ use crate::artifacts::ArtifactStorage;
 use crate::cli::ReportArgs;
 use crate::context::gather_context;
 use crate::error::SnagError;
-use crate::parser::{JsonInput, parse_prose};
+use crate::parser::{
+    JsonInput, MAX_ARTIFACTS, MAX_INTAKE_BYTES, MAX_REPOSITORIES, MAX_STRING_BYTES, parse_prose,
+    read_bounded, validate_json_input, validate_json_nesting, validate_prose, validate_string,
+};
 use crate::store::Store;
 use crate::types::{ArtifactReference, Observation, generate_id};
 use anyhow::Result;
 use serde_json::json;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Crash-injection failpoint (T6): see `crate::failpoint::failpoint`.
+#[derive(Debug)]
+enum OwnershipDeclaration {
+    Repository(String),
+    Unowned,
+}
+
+impl OwnershipDeclaration {
+    fn repository(&self) -> Option<&str> {
+        match self {
+            Self::Repository(repository) => Some(repository),
+            Self::Unowned => None,
+        }
+    }
+
+    fn was_explicitly_unowned(&self) -> bool {
+        matches!(self, Self::Unowned)
+    }
+}
+
+fn ownership_declaration(
+    owner: Option<String>,
+    unowned: Option<bool>,
+) -> Result<OwnershipDeclaration> {
+    match (owner, unowned) {
+        (Some(owner), None) if !owner.trim().is_empty() => {
+            Ok(OwnershipDeclaration::Repository(owner.trim().to_string()))
+        }
+        (Some(_), None) => Err(SnagError::Validation(
+            "--owner must name a non-empty repository; pass --owner <repository> or --unowned"
+                .to_string(),
+        )
+        .into()),
+        (None, Some(true)) => Ok(OwnershipDeclaration::Unowned),
+        (None, Some(false)) => Err(SnagError::Validation(
+            "an explicit unowned declaration must be true; pass --owner <repository> or --unowned"
+                .to_string(),
+        )
+        .into()),
+        _ => Err(SnagError::Validation(
+            "ownership is required: pass --owner <repository> or --unowned".to_string(),
+        )
+        .into()),
+    }
+}
+
 /// Parsed report inputs after CLI/JSON/prose merging (CLI explicit flags win).
 struct ReportInputs {
     title: String,
@@ -27,175 +75,298 @@ struct ReportInputs {
     labels: Option<std::collections::BTreeMap<String, String>>,
     idempotency_key: Option<String>,
     affected_repos: Vec<String>,
-    owner: Option<String>,
+    ownership: OwnershipDeclaration,
     source_override: Option<crate::types::SourceInfo>,
     context_override: Option<crate::types::ContextInfo>,
     artifact_paths: Vec<PathBuf>,
 }
 
-fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
-    let mut title = args.title.clone();
-    let mut summary = None;
-    let mut expected_behavior = args.expected.clone();
-    let mut observed_behavior = args.observed.clone();
-    let mut workaround = args.workaround.clone();
-    let mut repro = args.repro.clone();
-    let mut kind = args.kind.clone();
-    let mut severity = args.severity.clone();
-    let mut idempotency_key = args.idempotency_key.clone();
-    let mut affected_repos = args.affected_repos.clone();
-    let owner = args.owner.clone();
-    let mut impact = None;
-    let mut confidence: Option<f64> = None;
-    let mut sensitivity: Option<String> = None;
-    let mut labels: Option<std::collections::BTreeMap<String, String>> = None;
-    let mut source_override: Option<crate::types::SourceInfo> = None;
-    let mut context_override: Option<crate::types::ContextInfo> = None;
-    let mut artifact_paths = args.artifacts.clone();
-    let cli_kind = args.kind.clone();
-    let cli_severity = args.severity.clone();
+struct ReportInputDraft {
+    title: Option<String>,
+    summary: Option<String>,
+    kind: Option<String>,
+    severity: Option<String>,
+    expected_behavior: Option<String>,
+    observed_behavior: Option<String>,
+    repro: Option<String>,
+    workaround: Option<String>,
+    impact: Option<String>,
+    confidence: Option<f64>,
+    sensitivity: Option<String>,
+    labels: Option<std::collections::BTreeMap<String, String>>,
+    idempotency_key: Option<String>,
+    affected_repos: Vec<String>,
+    owner: Option<String>,
+    unowned: Option<bool>,
+    invalid_unowned: Option<String>,
+    source_override: Option<crate::types::SourceInfo>,
+    context_override: Option<crate::types::ContextInfo>,
+    artifact_paths: Vec<PathBuf>,
+}
 
-    // Collapse repetitive Option merges into single-node macro calls so the
-    // merge chain does not inflate cognitive complexity.
-    macro_rules! take {
-        ($dst:expr, $src:expr) => {
-            if let Some(v) = $src {
-                $dst = Some(v);
-            }
-        };
-    }
-
-    if args.stdin {
-        let mut buffer = String::new();
-        io::stdin()
-            .read_to_string(&mut buffer)
-            .map_err(|e| SnagError::Other(e.into()))?;
-        let parsed = parse_prose(&buffer);
-        if !parsed.title.is_empty() && title.is_none() {
-            title = Some(parsed.title);
+impl ReportInputDraft {
+    fn from_args(args: &ReportArgs) -> Self {
+        Self {
+            title: args.title.clone(),
+            summary: None,
+            kind: args.kind.clone(),
+            severity: args.severity.clone(),
+            expected_behavior: args.expected.clone(),
+            observed_behavior: args.observed.clone(),
+            repro: args.repro.clone(),
+            workaround: args.workaround.clone(),
+            impact: None,
+            confidence: None,
+            sensitivity: None,
+            labels: None,
+            idempotency_key: args.idempotency_key.clone(),
+            affected_repos: args.affected_repos.clone(),
+            owner: None,
+            unowned: None,
+            invalid_unowned: None,
+            source_override: None,
+            context_override: None,
+            artifact_paths: args.artifacts.clone(),
         }
-        take!(summary, parsed.summary);
-        take!(expected_behavior, parsed.expected);
-        take!(observed_behavior, parsed.observed);
-        take!(repro, parsed.repro);
-        take!(workaround, parsed.workaround);
-        take!(impact, parsed.impact);
     }
 
-    // `--json` selects JSON intake (stdin when no title, `-` for stdin
-    // explicitly, or a JSON file when the title names an existing file) AND
-    // JSON output. A bare title with `--json` is treated as the observation
-    // title with JSON output — previously it was misread as a file path and
-    // failed with a validation error (dogfood finding, fixed). With `--stdin`
-    // the prose intake owns stdin and `--json` only selects JSON output.
-    let json_intake = args.json
+    fn merge_prose(&mut self, args: &ReportArgs) -> Result<()> {
+        if !args.stdin {
+            return Ok(());
+        }
+        let buffer = read_bounded(io::stdin(), MAX_INTAKE_BYTES, "prose report input")
+            .map_err(anyhow::Error::from)?;
+        let parsed = parse_prose(&buffer);
+        validate_prose(&parsed).map_err(anyhow::Error::from)?;
+        if !parsed.title.is_empty() && self.title.is_none() {
+            self.title = Some(parsed.title);
+        }
+        macro_rules! take {
+            ($dst:expr, $src:expr) => {
+                if let Some(value) = $src {
+                    $dst = Some(value);
+                }
+            };
+        }
+        take!(self.summary, parsed.summary);
+        take!(self.expected_behavior, parsed.expected);
+        take!(self.observed_behavior, parsed.observed);
+        take!(self.repro, parsed.repro);
+        take!(self.workaround, parsed.workaround);
+        take!(self.impact, parsed.impact);
+        take!(self.owner, parsed.owner);
+        if let Some(value) = parsed.unowned {
+            match value.as_str() {
+                "true" => self.unowned = Some(true),
+                "false" => self.unowned = Some(false),
+                _ => self.invalid_unowned = Some(value),
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_json(&mut self, args: &ReportArgs) -> Result<()> {
+        if !uses_json_intake(args) {
+            return Ok(());
+        }
+        let path = args.title.clone().unwrap_or_else(|| "-".to_string());
+        let buffer = if path == "-" {
+            read_bounded(io::stdin(), MAX_INTAKE_BYTES, "JSON report input")
+                .map_err(anyhow::Error::from)?
+        } else {
+            let file = std::fs::File::open(&path).map_err(|error| {
+                SnagError::Validation(format!(
+                    "Could not read JSON file: {} — with --json, a TITLE that is not an existing file is JSON output; use --stdin for JSON intake on stdin, or a valid file path for file intake",
+                    error
+                ))
+            })?;
+            read_bounded(file, MAX_INTAKE_BYTES, "JSON report input")
+                .map_err(anyhow::Error::from)?
+        };
+        validate_json_nesting(&buffer).map_err(anyhow::Error::from)?;
+        let json_input: JsonInput = serde_json::from_str(&buffer)
+            .map_err(|error| SnagError::Validation(format!("Invalid JSON: {}", error)))?;
+        validate_json_input(&json_input).map_err(anyhow::Error::from)?;
+        let schema_version = json_input.schema_version.unwrap_or(1);
+        if !matches!(schema_version, 1 | 2) {
+            return Err(SnagError::UnsupportedSchema(schema_version.to_string()).into());
+        }
+        macro_rules! take {
+            ($dst:expr, $src:expr) => {
+                if let Some(value) = $src {
+                    $dst = Some(value);
+                }
+            };
+        }
+        take!(self.title, json_input.title);
+        take!(self.summary, json_input.summary);
+        take!(self.kind, json_input.kind_assertion);
+        take!(self.severity, json_input.severity_assertion);
+        take!(self.expected_behavior, json_input.expected_behavior);
+        take!(self.observed_behavior, json_input.observed_behavior);
+        take!(self.repro, json_input.reproduction);
+        take!(self.workaround, json_input.workaround);
+        take!(self.impact, json_input.impact);
+        take!(self.idempotency_key, json_input.idempotency_key);
+        if let Some(repositories) = json_input.affected_repositories {
+            self.affected_repos = repositories;
+        }
+        take!(self.confidence, json_input.confidence);
+        take!(self.sensitivity, json_input.sensitivity);
+        take!(self.labels, json_input.labels);
+        take!(self.source_override, json_input.source);
+        take!(self.context_override, json_input.context);
+        if let Some(artifacts) = json_input.artifacts {
+            self.artifact_paths
+                .extend(artifacts.into_iter().map(PathBuf::from));
+        }
+        if schema_version == 2 {
+            take!(self.owner, json_input.owner);
+            if json_input.unowned.is_some() {
+                self.unowned = json_input.unowned;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_cli_overrides(&mut self, args: &ReportArgs) {
+        if args.kind.is_some() {
+            self.kind = args.kind.clone();
+        }
+        if args.severity.is_some() {
+            self.severity = args.severity.clone();
+        }
+        if args.owner.is_some() || args.unowned {
+            self.owner = args.owner.clone();
+            self.unowned = args.unowned.then_some(true);
+            self.invalid_unowned = None;
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_string("title", self.title.as_deref().unwrap_or_default())
+            .map_err(anyhow::Error::from)?;
+        for (name, value) in [
+            ("kind", self.kind.as_ref()),
+            ("severity", self.severity.as_ref()),
+            ("summary", self.summary.as_ref()),
+            ("expected_behavior", self.expected_behavior.as_ref()),
+            ("observed_behavior", self.observed_behavior.as_ref()),
+            ("reproduction", self.repro.as_ref()),
+            ("workaround", self.workaround.as_ref()),
+            ("impact", self.impact.as_ref()),
+            ("idempotency_key", self.idempotency_key.as_ref()),
+            ("owner", self.owner.as_ref()),
+        ] {
+            if let Some(value) = value {
+                validate_string(name, value).map_err(anyhow::Error::from)?;
+            }
+        }
+        validate_collections(&self.affected_repos, &self.artifact_paths)?;
+        validate_vocabulary(self.kind.as_deref(), self.severity.as_deref())?;
+        if self.title.as_deref().unwrap_or_default().is_empty() {
+            return Err(SnagError::Validation("Title is required".to_string()).into());
+        }
+        if self.invalid_unowned.is_some() {
+            return Err(SnagError::Validation(
+                "the prose Unowned section must contain true".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ReportInputs> {
+        let ownership = ownership_declaration(self.owner, self.unowned)?;
+        Ok(ReportInputs {
+            title: self.title.unwrap_or_default(),
+            summary: self.summary,
+            kind: self.kind,
+            severity: self.severity,
+            expected_behavior: self.expected_behavior,
+            observed_behavior: self.observed_behavior,
+            repro: self.repro,
+            workaround: self.workaround,
+            impact: self.impact,
+            confidence: self.confidence,
+            sensitivity: self.sensitivity,
+            labels: self.labels,
+            idempotency_key: self.idempotency_key,
+            affected_repos: self.affected_repos,
+            ownership,
+            source_override: self.source_override,
+            context_override: self.context_override,
+            artifact_paths: self.artifact_paths,
+        })
+    }
+}
+
+fn uses_json_intake(args: &ReportArgs) -> bool {
+    args.json
         && !args.stdin
         && (args.title.is_none()
             || args.title.as_deref() == Some("-")
-            || Path::new(args.title.as_deref().unwrap()).is_file());
-    if json_intake {
-        let path = args.title.clone().unwrap_or_else(|| "-".to_string());
-        let mut buffer = String::new();
-        if path == "-" {
-            io::stdin()
-                .read_to_string(&mut buffer)
-                .map_err(|e| SnagError::Other(e.into()))?;
-        } else {
-            buffer = std::fs::read_to_string(&path).map_err(|e| {
-                SnagError::Validation(format!(
-                    "Could not read JSON file: {} — with --json, a TITLE that is not an existing file is JSON output; use --stdin for JSON intake on stdin, or a valid file path for file intake",
-                    e
-                ))
-            })?;
-        }
-        let json_input: JsonInput = serde_json::from_str(&buffer)
-            .map_err(|e| SnagError::Validation(format!("Invalid JSON: {}", e)))?;
-        if let Some(sv) = json_input.schema_version
-            && sv != 1
-        {
-            return Err(SnagError::UnsupportedSchema(sv.to_string()).into());
-        }
-        take!(title, json_input.title);
-        take!(summary, json_input.summary);
-        take!(kind, json_input.kind_assertion);
-        take!(severity, json_input.severity_assertion);
-        take!(expected_behavior, json_input.expected_behavior);
-        take!(observed_behavior, json_input.observed_behavior);
-        take!(repro, json_input.reproduction);
-        take!(workaround, json_input.workaround);
-        take!(impact, json_input.impact);
-        take!(idempotency_key, json_input.idempotency_key);
-        if let Some(ar) = json_input.affected_repositories {
-            affected_repos = ar;
-        }
-        take!(confidence, json_input.confidence);
-        take!(sensitivity, json_input.sensitivity);
-        take!(labels, json_input.labels);
-        take!(source_override, json_input.source);
-        take!(context_override, json_input.context);
-        if let Some(arts) = json_input.artifacts {
-            artifact_paths.extend(arts.into_iter().map(PathBuf::from));
-        }
-    }
+            || Path::new(args.title.as_deref().unwrap()).is_file())
+}
 
-    // CLI explicit flags override JSON fields.
-    if cli_kind.is_some() {
-        kind = cli_kind;
+fn validate_collections(affected_repos: &[String], artifact_paths: &[PathBuf]) -> Result<()> {
+    if affected_repos.len() > MAX_REPOSITORIES {
+        return Err(SnagError::Validation(format!(
+            "affected repositories exceed the {MAX_REPOSITORIES}-item limit"
+        ))
+        .into());
     }
-    if cli_severity.is_some() {
-        severity = cli_severity;
+    for value in affected_repos {
+        validate_string("affected repository", value).map_err(anyhow::Error::from)?;
     }
+    if artifact_paths.len() > MAX_ARTIFACTS {
+        return Err(SnagError::Validation(format!(
+            "artifacts exceed the {MAX_ARTIFACTS}-item limit"
+        ))
+        .into());
+    }
+    for value in artifact_paths {
+        if value.to_string_lossy().len() > MAX_STRING_BYTES {
+            return Err(SnagError::Validation(format!(
+                "artifact path exceeds the {MAX_STRING_BYTES}-byte string limit"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
 
-    // Intake vocabulary check: unknown kind/severity values are rejected here
-    // (CLI, JSON, and bare fast path all merge into these values) so the
-    // corpus never accumulates drift that the queue ranking silently ranks
-    // last. Filters stay permissive: legacy rows may carry pre-vocabulary
-    // values, and filters are the only way to query them.
-    if let Some(k) = &kind
-        && !crate::parser::KINDS.contains(&k.as_str())
+fn validate_vocabulary(kind: Option<&str>, severity: Option<&str>) -> Result<()> {
+    if let Some(kind) = kind
+        && !crate::parser::KINDS.contains(&kind)
     {
         return Err(SnagError::Validation(format!(
             "invalid --kind '{}'; allowed: {}",
-            k,
+            kind,
             crate::parser::KINDS.join("|")
         ))
         .into());
     }
-    if let Some(s) = &severity
-        && !crate::parser::SEVERITIES.contains(&s.as_str())
+    if let Some(severity) = severity
+        && !crate::parser::SEVERITIES.contains(&severity)
     {
         return Err(SnagError::Validation(format!(
             "invalid --severity '{}'; allowed: {}",
-            s,
+            severity,
             crate::parser::SEVERITIES.join("|")
         ))
         .into());
     }
+    Ok(())
+}
 
-    let title = title.unwrap_or_default();
-    if title.is_empty() {
-        return Err(SnagError::Validation("Title is required".to_string()).into());
-    }
-    Ok(ReportInputs {
-        title,
-        summary,
-        kind,
-        severity,
-        expected_behavior,
-        observed_behavior,
-        repro,
-        workaround,
-        impact,
-        confidence,
-        sensitivity,
-        labels,
-        idempotency_key,
-        affected_repos,
-        owner,
-        source_override,
-        context_override,
-        artifact_paths,
-    })
+fn parse_inputs(args: &ReportArgs) -> Result<ReportInputs> {
+    let mut draft = ReportInputDraft::from_args(args);
+    draft.merge_prose(args)?;
+    draft.merge_json(args)?;
+    draft.apply_cli_overrides(args);
+    draft.validate()?;
+    draft.finish()
 }
 
 /// Apply explicit source/context overrides from JSON input onto gathered
@@ -236,18 +407,27 @@ fn apply_overrides(
     (source, context)
 }
 
-fn ingest_artifacts(
-    artifact_storage: &ArtifactStorage,
+fn ingest_artifacts<'a>(
+    artifact_storage: &'a ArtifactStorage,
     artifact_paths: &[PathBuf],
-) -> Result<Vec<ArtifactReference>> {
-    let mut artifacts = Vec::new();
+) -> Result<(
+    Vec<ArtifactReference>,
+    crate::artifacts::ArtifactAttempt<'a>,
+)> {
+    artifact_storage.preflight(artifact_paths)?;
+    let mut attempt = artifact_storage.begin_attempt();
+    let mut artifacts = Vec::with_capacity(artifact_paths.len());
     let mut total_artifact_bytes = 0_u64;
     for artifact_path in artifact_paths {
-        let (digest, size) = artifact_storage.ingest_file(artifact_path)?;
-        total_artifact_bytes += size;
-        if total_artifact_bytes > 250 * 1024 * 1024 {
-            return Err(SnagError::Validation(
-                "Total artifacts size exceeds 250 MiB limit".to_string(),
+        let (digest, size) = attempt.ingest_file(artifact_path)?;
+        total_artifact_bytes = total_artifact_bytes.checked_add(size).ok_or_else(|| {
+            anyhow::Error::from(SnagError::ArtifactTooLarge(
+                "aggregate artifact size overflows".to_string(),
+            ))
+        })?;
+        if total_artifact_bytes > crate::artifacts::MAX_ARTIFACT_BYTES {
+            return Err(SnagError::ArtifactTooLarge(
+                "total artifacts size exceeds 250 MiB limit".to_string(),
             )
             .into());
         }
@@ -264,28 +444,45 @@ fn ingest_artifacts(
                 .unwrap(),
         });
     }
-    Ok(artifacts)
+    Ok((artifacts, attempt))
 }
 
-/// Resolve the reporter repository (explicit-ID precedence), every affected
-/// repository, and the optional fix-owner repository before the transaction.
-/// Returns (reporter_repo_id, resolved_affected, resolved_owner).
+fn context_git_context(context: &crate::types::ContextInfo) -> crate::git::GitContext {
+    let mut git_ctx = crate::git::GitContext::default();
+    if let Some(repo_ctx) = &context.repository {
+        git_ctx.git_common_dir = repo_ctx.git_common_dir.clone();
+        git_ctx.git_remote_aliases = repo_ctx.git_remote_aliases.clone();
+        git_ctx.repository_root = repo_ctx.repository_root.clone();
+    }
+    git_ctx
+}
+
+fn owner_git_context(
+    context: &crate::types::ContextInfo,
+    owner: &str,
+) -> Result<Option<crate::git::GitContext>> {
+    if owner == "current" {
+        return Ok(Some(context_git_context(context)));
+    }
+    let path = Path::new(owner);
+    if path.exists() {
+        return Ok(Some(crate::git::collect_git_context(path)?));
+    }
+    Ok(None)
+}
+
+/// Resolve the reporter repository (explicit-ID precedence) and every affected
+/// repository before the observation transaction. Owner resolution is deferred
+/// until that transaction so identity materialization rolls back with a failed
+/// report.
+/// Returns (reporter_repo_id, resolved_affected).
 fn resolve_identity(
     store: &mut Store,
     context: &mut crate::types::ContextInfo,
     affected_repos: &[String],
-    owner: Option<&str>,
-) -> Result<(Option<String>, Vec<String>, Option<String>)> {
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap();
-    let mut temp_git = crate::git::GitContext::default();
+) -> Result<(Option<String>, Vec<String>)> {
     let mut primary_repo_id: Option<String> = None;
-    if let Some(repo_ctx) = &context.repository {
-        temp_git.git_common_dir = repo_ctx.git_common_dir.clone();
-        temp_git.git_remote_aliases = repo_ctx.git_remote_aliases.clone();
-        temp_git.repository_root = repo_ctx.repository_root.clone();
-    }
+    let temp_git = context_git_context(context);
     if let Some(repo_ctx) = context.repository.as_mut() {
         let res = crate::identity::resolve_repository(
             store,
@@ -309,30 +506,7 @@ fn resolve_identity(
             resolved_affected.push(rid);
         }
     }
-    // The fix owner resolves through the same id/alias/current machinery;
-    // a bare unknown id is created (like `--repo-id`) so an owner lane
-    // works even before it has any recorded aliases.
-    let resolved_owner = match owner {
-        Some(raw) if raw == "current" => Some(crate::identity::resolve_affected_repository(
-            store, raw, &temp_git,
-        )?),
-        Some(raw) => {
-            let rid = crate::identity::resolve_affected_repository(store, raw, &temp_git);
-            match rid {
-                Ok(rid) => Some(rid),
-                Err(_) => Some(crate::identity::ensure_explicit_repo(store, raw, &now)?),
-            }
-        }
-        None => None,
-    };
-    let mut all_repo_ids = resolved_affected.clone();
-    if let Some(p) = &primary_repo_id
-        && !all_repo_ids.contains(p)
-    {
-        all_repo_ids.push(p.clone());
-    }
-    let _ = all_repo_ids;
-    Ok((primary_repo_id, resolved_affected, resolved_owner))
+    Ok((primary_repo_id, resolved_affected))
 }
 
 /// Outcome of the idempotency check for a report attempt.
@@ -589,21 +763,35 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     // 3. Artifact storage setup + ingestion.
     let mut store = Store::open_read_write()?;
     let artifact_storage = ArtifactStorage::new(&store.data_dir)?;
-    let artifacts = ingest_artifacts(&artifact_storage, &inputs.artifact_paths)?;
+    let (artifacts, artifact_attempt) =
+        ingest_artifacts(&artifact_storage, &inputs.artifact_paths)?;
 
-    // 3.5. Identity resolution before the transaction.
-    let (primary_repo_id, resolved_affected, resolved_owner) = resolve_identity(
-        &mut store,
-        &mut context,
-        &inputs.affected_repos,
-        inputs.owner.as_deref(),
-    )?;
+    // Reporter and affected identities may be resolved before the transaction;
+    // owner materialization is deliberately deferred until it can roll back
+    // with the observation.
+    let (primary_repo_id, resolved_affected) =
+        resolve_identity(&mut store, &mut context, &inputs.affected_repos)?;
+    let owner_input = inputs.ownership.repository().map(str::to_string);
+    let owner_git_ctx = owner_input
+        .as_deref()
+        .map(|owner| owner_git_context(&context, owner))
+        .transpose()?
+        .flatten();
 
     // 4. Begin Transaction and allocate.
     crate::failpoint::failpoint("before_tx");
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let resolved_owner = owner_input
+        .as_deref()
+        .map(|owner| {
+            crate::identity::resolve_assignment_repository(&tx, owner, owner_git_ctx.as_ref(), &now)
+        })
+        .transpose()?;
     let local_sequence: i64 = tx.query_row(
         "SELECT COALESCE(MAX(local_sequence), 0) + 1 FROM records",
         [],
@@ -621,9 +809,6 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     crate::failpoint::failpoint("after_seq");
 
     let obs_id = generate_id("obs");
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap();
     let mut obs = Observation {
         schema_version: 1,
         observation_id: obs_id.clone(),
@@ -648,6 +833,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
         artifacts: artifacts.clone(),
         affected_repository_ids: inputs.affected_repos,
         owner_repository_id: resolved_owner.clone(),
+        owner_was_explicitly_unowned: inputs.ownership.was_explicitly_unowned(),
     };
 
     // repro_key: a deterministic, store-scoped hash key that localizes this
@@ -712,6 +898,7 @@ pub fn handle(args: ReportArgs) -> Result<()> {
     )?;
 
     tx.commit()?;
+    artifact_attempt.commit();
 
     // Crash after the transaction is committed but before the response is
     // written: the observation must be durably present.

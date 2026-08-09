@@ -96,6 +96,7 @@ mod tests {
             artifacts: vec![],
             affected_repository_ids: vec![],
             owner_repository_id: None,
+            owner_was_explicitly_unowned: false,
         }
     }
 

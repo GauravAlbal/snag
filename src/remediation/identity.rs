@@ -7,6 +7,7 @@
 
 use crate::types::generate_id;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 /// The resolved reviewer + session pair for one remediation command.
 #[derive(Debug, Clone)]
@@ -34,9 +35,12 @@ fn session_file_path() -> Option<std::path::PathBuf> {
         .ok()
         .map(|(data_dir, _)| data_dir.join("review_session.json"))
 }
-
 fn read_session_file() -> Option<(String, String)> {
     let path = session_file_path()?;
+    if path.exists() {
+        crate::store::ensure_private_file(&path)
+            .expect("failed to secure remediation session file");
+    }
     let content = std::fs::read_to_string(path).ok()?;
     let parsed: SessionFile = serde_json::from_str(&content).ok()?;
     Some((parsed.reviewer_id, parsed.session_id))
@@ -47,17 +51,28 @@ fn write_session_file(reviewer: &str, session: &str) {
         return;
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        crate::store::ensure_private_dir(parent)
+            .expect("failed to secure remediation session directory");
     }
     let payload = SessionFile {
         reviewer_id: reviewer.to_string(),
         session_id: session.to_string(),
     };
-    // Atomic publish: write a temp sibling, then rename.
+    let bytes = serde_json::to_vec(&payload).expect("failed to serialize remediation session");
+    // Atomic publish: create a private temp sibling, sync it, then rename.
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, serde_json::to_string(&payload).unwrap_or_default()).is_ok() {
-        let _ = std::fs::rename(tmp, path);
-    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .expect("failed to create remediation session temporary file");
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .expect("failed to write remediation session temporary file");
+    crate::store::ensure_private_file(&tmp)
+        .expect("failed to secure remediation session temporary file");
+    std::fs::rename(&tmp, &path).expect("failed to publish remediation session");
+    crate::store::ensure_private_file(&path).expect("failed to secure remediation session file");
 }
 
 /// Read the remediation identity from `SNAG_CONTEXT_FILE`, if set.

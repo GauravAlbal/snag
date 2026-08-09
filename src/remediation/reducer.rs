@@ -31,6 +31,49 @@ pub const STATE_VERIFIED_FIXED: &str = "verified_fixed";
 pub const STATE_DEFERRED: &str = "deferred";
 pub const STATE_REOPENED: &str = "reopened";
 
+/// Canonical current-remediation work status: what an agent should rely on
+/// when asking "is there current work on this observation?". Derived by one
+/// function (`derive_work_status`) from the reduced state — never inferred
+/// from raw event history by consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStatus {
+    /// Not active, resolved, or terminal: remediation may proceed.
+    Actionable,
+    /// Current remediation work owns the observation (active claim, linked
+    /// task, or a candidate fix awaiting verification).
+    Active,
+    /// Current authoritative evidence says remediation completed (accepted
+    /// verification or handled status), not invalidated by reopening.
+    Resolved,
+    /// Remediation should not proceed for a non-work reason (expected
+    /// behavior, environmental, duplicate, superseded); a redirect target
+    /// may be explicit.
+    Terminal,
+}
+
+impl WorkStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkStatus::Actionable => "actionable",
+            WorkStatus::Active => "active",
+            WorkStatus::Resolved => "resolved",
+            WorkStatus::Terminal => "terminal",
+        }
+    }
+}
+
+/// Dispositions that make an observation `Terminal`: remediation should not
+/// proceed for a non-work reason. Distinct from `TERMINAL_NEGATIVE_DISPOSITIONS`
+/// (queue semantics): `insufficient_evidence` is a queue-handled negative but
+/// stays `Actionable` — the observation can be revisited with more evidence.
+pub const TERMINAL_NON_WORK_DISPOSITIONS: &[&str] = &[
+    DISP_DUPLICATE,
+    DISP_EXPECTED_BEHAVIOR,
+    DISP_ENVIRONMENTAL,
+    DISP_SUPERSEDED,
+];
+
 /// A commit link derived from `remediation_fix_attached` events.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitLink {
@@ -63,8 +106,17 @@ pub struct ReducedObservation {
     pub disposition: Option<String>,
     pub disposition_target: Option<String>,
     pub handled: bool,
+    /// True when a reopen event invalidated a prior resolution and no
+    /// subsequent event has restored it. Canonical currentness input:
+    /// reopening must not leave stale fix/verification evidence counting
+    /// as current work.
+    pub reopened: bool,
+    /// Canonical current remediation work status (derived, never inferred
+    /// by consumers from raw events).
+    pub work_status: WorkStatus,
     pub active_claim: Option<ActiveClaim>,
     pub promoted_finding_id: Option<String>,
+    pub owner_repository_id: Option<String>,
     pub task_ids: Vec<String>,
     pub commits: Vec<CommitLink>,
     pub verification_receipts: Vec<VerificationReceipt>,
@@ -90,6 +142,7 @@ struct Work {
     handled: bool,
     active_claim: Option<ActiveClaim>,
     promoted_finding_id: Option<String>,
+    owner_repository_id: Option<String>,
     task_ids: Vec<String>,
     commits: Vec<CommitLink>,
     verification_receipts: Vec<VerificationReceipt>,
@@ -101,21 +154,85 @@ struct Work {
 
 impl Work {
     fn snapshot(&self, observation_id: &str, last_event_sequence: i64) -> ReducedObservation {
-        ReducedObservation {
+        let reduced = ReducedObservation {
             observation_id: observation_id.to_string(),
             state: self.state.clone(),
             disposition: self.disposition.clone(),
             disposition_target: self.disposition_target.clone(),
             handled: self.handled,
+            reopened: self.observation_reopened || self.remediation_reopened,
+            work_status: WorkStatus::Actionable,
             active_claim: self.active_claim.clone(),
+            owner_repository_id: self.owner_repository_id.clone(),
             promoted_finding_id: self.promoted_finding_id.clone(),
             task_ids: self.task_ids.clone(),
             commits: self.commits.clone(),
             verification_receipts: self.verification_receipts.clone(),
             latest_verification_status: self.latest_verification_status.clone(),
             last_event_sequence,
+        };
+        // The typed projection is derived by the single canonical function;
+        // consumers never infer currentness from raw event history.
+        ReducedObservation {
+            work_status: derive_work_status(&reduced),
+            ..reduced
         }
     }
+}
+
+/// Canonical current-remediation work status for one reduced observation.
+///
+/// The single authority for "is there current work?": consumers must never
+/// re-derive currentness from raw event history. Order matters:
+///
+/// 1. Terminal wins — a non-work disposition (duplicate/superseded/expected/
+///    environmental) closes remediation; the redirect target is explicit.
+/// 2. An unreleased active claim is the strongest work signal and beats a
+///    stale deferred marking (the reducer keeps both; the claim wins).
+/// 3. Deferred / insufficient_evidence stay `Actionable` even though the
+///    queue marks them handled — the observation can be revisited.
+/// 4. Reopening invalidates a prior resolution: without new work the
+///    observation is actionable again, never silently resolved.
+/// 5. Resolved — accepted verification or a durable handled declaration.
+/// 6. Active — a linked execution task or a candidate fix awaiting
+///    verification (claims were checked earlier).
+/// 7. Otherwise Actionable (released claims, confirmed-unclaimed, promotion
+///    history only, plain unreviewed).
+fn derive_work_status(r: &ReducedObservation) -> WorkStatus {
+    // Terminal: non-work closure. Reopen clears the disposition, so a
+    // reopened terminal observation falls through to actionable/active.
+    if let Some(d) = r.disposition.as_deref()
+        && TERMINAL_NON_WORK_DISPOSITIONS.contains(&d)
+    {
+        return WorkStatus::Terminal;
+    }
+    // An unreleased/unexpired active claim means someone is working it now,
+    // even if an earlier disposition said deferred.
+    if r.active_claim.is_some() {
+        return WorkStatus::Active;
+    }
+    // Deferred / insufficient evidence: no current work, not terminal, not
+    // resolved — the queue's handled flag must not mask revisability.
+    if let Some(d) = r.disposition.as_deref()
+        && (d == DISP_DEFERRED || d == DISP_INSUFFICIENT_EVIDENCE)
+    {
+        return WorkStatus::Actionable;
+    }
+    // Reopening invalidates prior resolution; without subsequent work the
+    // observation is actionable, not resolved.
+    if !r.reopened {
+        if r.latest_verification_status.as_deref() == Some(VERIFY_ACCEPTED) {
+            return WorkStatus::Resolved;
+        }
+        if r.handled {
+            return WorkStatus::Resolved;
+        }
+    }
+    // Active: current work owns the observation (claim checked earlier).
+    if !r.task_ids.is_empty() || !r.commits.is_empty() {
+        return WorkStatus::Active;
+    }
+    WorkStatus::Actionable
 }
 
 /// Re-derive `state` from the current working fields (the precedence table
@@ -227,6 +344,15 @@ fn apply_event(w: &mut Work, ev: &ReducedEvent) {
             w.handled = false;
             w.marked_handled = false;
             w.observation_reopened = true;
+            // Reopening invalidates the prior current-work evidence: stale
+            // tasks/commits/verification must not count as current work
+            // (the events stay in the stream; `review history` still shows
+            // them). Without this, a reopened observation with an old fix
+            // would read as Active instead of Actionable.
+            w.task_ids.clear();
+            w.commits.clear();
+            w.verification_receipts.clear();
+            w.latest_verification_status = None;
             w.state = STATE_REOPENED.to_string();
         }
         (RECORD_RELATIONSHIP_ADDED, R(E::RelationshipAdded(_)))
@@ -238,6 +364,9 @@ fn apply_event(w: &mut Work, ev: &ReducedEvent) {
             w.promoted_finding_id = Some(p.finding_id.clone());
             w.remediation_reopened = false;
             derive_state(w);
+        }
+        (RECORD_OWNER_ASSIGNED, R(E::OwnerAssigned(p))) => {
+            w.owner_repository_id = Some(p.owner_repository_id.clone());
         }
         (RECORD_TASK_ATTACHED, R(E::TaskAttached(p))) => {
             if !w.task_ids.contains(&p.task_id) {
@@ -279,6 +408,12 @@ fn apply_event(w: &mut Work, ev: &ReducedEvent) {
             w.handled = false;
             w.marked_handled = false;
             w.remediation_reopened = true;
+            // Same invalidation as observation reopen: the prior fix/verify
+            // evidence stops being current work until new evidence restores it.
+            w.task_ids.clear();
+            w.commits.clear();
+            w.verification_receipts.clear();
+            w.latest_verification_status = None;
             w.state = STATE_REOPENED.to_string();
         }
         _ => {
@@ -375,7 +510,7 @@ pub fn reduce_observation(
              'observation_claimed','observation_claim_heartbeat','observation_claim_released',
              'observation_claim_expired','observation_reviewed','observation_disposition_set',
              'observation_reopened','observation_relationship_added','observation_relationship_retracted',
-             'observation_promoted','remediation_task_attached','remediation_fix_attached',
+             'observation_promoted','observation_owner_assigned','remediation_task_attached','remediation_fix_attached',
              'remediation_verification_attached','remediation_marked_handled','remediation_reopened'
          )
          ORDER BY local_sequence ASC",
@@ -436,6 +571,49 @@ pub fn upsert_review_state(
         ],
     )?;
     Ok(())
+}
+
+/// Observation ids whose canonical work status matches `status`, derived by
+/// replaying the stream through the reducer (one pass). Observations with no
+/// remediation events reduce to `Actionable` and are included for that status.
+/// Callers inject the returned set into their SQL as a `json_each` IN-clause,
+/// so the filter runs against the canonical derivation, never a parallel
+/// SQL re-implementation.
+pub fn work_status_matching_ids(
+    conn: &rusqlite::Connection,
+    status: WorkStatus,
+) -> anyhow::Result<Vec<String>> {
+    let reduced = replay_all(conn)?;
+    let mut ids: Vec<String> = Vec::new();
+    for (id, r) in &reduced {
+        if r.work_status == status {
+            ids.push(id.clone());
+        }
+    }
+    if status == WorkStatus::Actionable {
+        // Observations without remediation events reduce to Actionable but
+        // are absent from `replay_all` (no records). Include them. The
+        // record-type list is built from the membership authority so a new
+        // remediation record type can never silently change the set.
+        let types = REMEDIATION_RECORD_TYPES
+            .iter()
+            .map(|t| format!("'{t}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT observation_id FROM observations o
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM records r
+                 WHERE r.entity_id = o.observation_id AND r.record_type IN ({types})
+             )"
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            ids.push(row?);
+        }
+    }
+    ids.sort();
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -511,6 +689,50 @@ mod tests {
                 idempotency_key: None,
             },
         ))
+    }
+
+    fn released(claim_id: &str) -> RecordPayload {
+        RecordPayload::Remediation(RemediationEvent::ClaimReleased(ClaimReleasedPayload {
+            claim_id: claim_id.to_string(),
+            released_by: "reviewer_a".to_string(),
+            release_session_id: "session_reviewer_a".to_string(),
+            release_reason: "done".to_string(),
+            released_at: now(),
+            created_at: now(),
+            idempotency_key: None,
+        }))
+    }
+
+    fn observation_reopened() -> RecordPayload {
+        RecordPayload::Remediation(RemediationEvent::Reopened(ReopenedPayload {
+            rationale: Some("reopen".to_string()),
+            reviewer: "reviewer_a".to_string(),
+            review_session_id: "session_a".to_string(),
+            created_at: now(),
+            idempotency_key: None,
+        }))
+    }
+
+    fn remediation_reopened() -> RecordPayload {
+        RecordPayload::Remediation(RemediationEvent::RemediationReopened(
+            RemediationReopenedPayload {
+                rationale: Some("regression".to_string()),
+                reviewer: "reviewer_a".to_string(),
+                review_session_id: "session_a".to_string(),
+                created_at: now(),
+                idempotency_key: None,
+            },
+        ))
+    }
+
+    fn promoted(finding_id: &str) -> RecordPayload {
+        RecordPayload::Remediation(RemediationEvent::Promoted(PromotedPayload {
+            finding_id: finding_id.to_string(),
+            reviewer: "reviewer_a".to_string(),
+            review_session_id: "session_a".to_string(),
+            created_at: now(),
+            idempotency_key: None,
+        }))
     }
 
     fn reduce(events: &[ReducedEvent]) -> ReducedObservation {
@@ -779,6 +1001,346 @@ mod tests {
         assert!(!r.handled);
     }
 
+    // -------------------------------------------------------------------
+    // Lifecycle contract: the canonical work-status table (Darn harvest).
+    // These pin the temporal semantics so a future schema/event change
+    // cannot silently alter currentness.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ws_claim_release_is_actionable_not_active() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_CLAIMED,
+                &claimed("c1", "reviewer_a", "2026-08-05T01:00:00Z"),
+            ),
+            ev(2, RECORD_CLAIM_RELEASED, &released("c1")),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert_eq!(r.active_claim, None);
+    }
+
+    #[test]
+    fn ws_claim_release_new_claim_is_active() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_CLAIMED,
+                &claimed("c1", "reviewer_a", "2026-08-05T01:00:00Z"),
+            ),
+            ev(2, RECORD_CLAIM_RELEASED, &released("c1")),
+            ev(
+                3,
+                RECORD_CLAIMED,
+                &claimed("c2", "reviewer_a", "2026-08-05T02:00:00Z"),
+            ),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Active);
+        assert_eq!(
+            r.active_claim.as_ref().map(|c| c.claim_id.as_str()),
+            Some("c2")
+        );
+    }
+
+    #[test]
+    fn ws_fix_verify_handled_is_resolved() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_FIX_ATTACHED, &fix("abc123", "repo_1")),
+            ev(
+                3,
+                RECORD_VERIFICATION_ATTACHED,
+                &verify(VERIFY_ACCEPTED, "r1"),
+            ),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Resolved);
+        assert!(r.handled);
+    }
+
+    #[test]
+    fn ws_fix_verify_handled_then_reopen_is_actionable() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_FIX_ATTACHED, &fix("abc123", "repo_1")),
+            ev(
+                3,
+                RECORD_VERIFICATION_ATTACHED,
+                &verify(VERIFY_ACCEPTED, "r1"),
+            ),
+            ev(4, RECORD_REMEDIATION_REOPENED, &remediation_reopened()),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert!(r.reopened);
+        // The prior fix/verify evidence stops counting as current work.
+        assert!(r.commits.is_empty());
+        assert_eq!(r.latest_verification_status, None);
+    }
+
+    #[test]
+    fn ws_reopen_then_new_claim_is_active() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_REMEDIATION_REOPENED, &remediation_reopened()),
+            ev(
+                3,
+                RECORD_CLAIMED,
+                &claimed("c1", "reviewer_a", "2026-08-05T02:00:00Z"),
+            ),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Active);
+    }
+
+    #[test]
+    fn ws_deferred_only_is_actionable() {
+        let r = reduce(&[ev(
+            1,
+            RECORD_DISPOSITION_SET,
+            &disposition(DISP_DEFERRED, None),
+        )]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        // The queue flags it handled; canonical currentness says actionable.
+        assert!(r.handled);
+    }
+
+    #[test]
+    fn ws_promotion_only_is_actionable() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_PROMOTED, &promoted("finding_1")),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert!(!r.handled);
+    }
+
+    #[test]
+    fn ws_duplicate_of_redirects() {
+        let r = reduce(&[ev(
+            1,
+            RECORD_DISPOSITION_SET,
+            &disposition(DISP_DUPLICATE, Some("obs_2")),
+        )]);
+        assert_eq!(r.work_status, WorkStatus::Terminal);
+        assert_eq!(r.disposition_target.as_deref(), Some("obs_2"));
+    }
+
+    #[test]
+    fn ws_environmental_is_terminal() {
+        let r = reduce(&[ev(
+            1,
+            RECORD_DISPOSITION_SET,
+            &disposition(DISP_ENVIRONMENTAL, None),
+        )]);
+        assert_eq!(r.work_status, WorkStatus::Terminal);
+    }
+
+    #[test]
+    fn ws_insufficient_evidence_is_actionable() {
+        let r = reduce(&[ev(
+            1,
+            RECORD_DISPOSITION_SET,
+            &disposition(DISP_INSUFFICIENT_EVIDENCE, None),
+        )]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert!(r.handled, "queue marks it handled; work stays actionable");
+    }
+
+    #[test]
+    fn ws_confirmed_unclaimed_is_actionable() {
+        let r = reduce(&[ev(
+            1,
+            RECORD_DISPOSITION_SET,
+            &disposition(DISP_CONFIRMED, None),
+        )]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert!(!r.handled);
+    }
+
+    // Adversarial orderings that must stay deterministic.
+
+    #[test]
+    fn ws_adversarial_verify_reopen_new_fix() {
+        // verify → reopen → new fix: candidate fix awaiting verification.
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_FIX_ATTACHED, &fix("abc123", "repo_1")),
+            ev(
+                3,
+                RECORD_VERIFICATION_ATTACHED,
+                &verify(VERIFY_ACCEPTED, "r1"),
+            ),
+            ev(4, RECORD_REMEDIATION_REOPENED, &remediation_reopened()),
+            ev(5, RECORD_FIX_ATTACHED, &fix("def456", "repo_1")),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Active);
+        assert_eq!(r.commits.len(), 1);
+    }
+
+    #[test]
+    fn ws_adversarial_verify_reopen_new_fix_verify() {
+        // verify → reopen → new fix → verify: restored resolution.
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_FIX_ATTACHED, &fix("abc123", "repo_1")),
+            ev(
+                3,
+                RECORD_VERIFICATION_ATTACHED,
+                &verify(VERIFY_ACCEPTED, "r1"),
+            ),
+            ev(4, RECORD_REMEDIATION_REOPENED, &remediation_reopened()),
+            ev(5, RECORD_FIX_ATTACHED, &fix("def456", "repo_1")),
+            ev(
+                6,
+                RECORD_VERIFICATION_ATTACHED,
+                &verify(VERIFY_ACCEPTED, "r2"),
+            ),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Resolved);
+        assert!(r.handled);
+        assert!(!r.reopened);
+    }
+
+    #[test]
+    fn ws_adversarial_claim_a_release_claim_b() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_CLAIMED,
+                &claimed("c_a", "alice", "2026-08-05T01:00:00Z"),
+            ),
+            ev(2, RECORD_CLAIM_RELEASED, &released("c_a")),
+            ev(
+                3,
+                RECORD_CLAIMED,
+                &claimed("c_b", "bob", "2026-08-05T02:00:00Z"),
+            ),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Active);
+        assert_eq!(
+            r.active_claim.as_ref().map(|c| c.claimed_by.as_str()),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn ws_adversarial_handled_reopen_deferred() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_CONFIRMED, None),
+            ),
+            ev(2, RECORD_FIX_ATTACHED, &fix("abc123", "repo_1")),
+            ev(
+                3,
+                RECORD_VERIFICATION_ATTACHED,
+                &verify(VERIFY_ACCEPTED, "r1"),
+            ),
+            ev(4, RECORD_REMEDIATION_REOPENED, &remediation_reopened()),
+            ev(5, RECORD_DISPOSITION_SET, &disposition(DISP_DEFERRED, None)),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert_eq!(r.disposition.as_deref(), Some(DISP_DEFERRED));
+    }
+
+    #[test]
+    fn ws_adversarial_terminal_then_reopen_is_actionable() {
+        let r = reduce(&[
+            ev(
+                1,
+                RECORD_DISPOSITION_SET,
+                &disposition(DISP_DUPLICATE, Some("obs_2")),
+            ),
+            ev(2, RECORD_REOPENED, &observation_reopened()),
+        ]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+        assert_eq!(r.disposition, None);
+        assert_eq!(r.disposition_target, None);
+    }
+
+    #[test]
+    fn ws_unreviewed_is_actionable() {
+        let r = reduce(&[]);
+        assert_eq!(r.work_status, WorkStatus::Actionable);
+    }
+
+    #[test]
+    fn latest_owner_assignment_wins() {
+        let owner_a =
+            RecordPayload::Remediation(RemediationEvent::OwnerAssigned(OwnerAssignedPayload {
+                owner_repository_id: "repo_a".to_string(),
+                reviewer: "reviewer_a".to_string(),
+                review_session_id: "session_a".to_string(),
+                created_at: now(),
+                idempotency_key: None,
+            }));
+        let owner_b =
+            RecordPayload::Remediation(RemediationEvent::OwnerAssigned(OwnerAssignedPayload {
+                owner_repository_id: "repo_b".to_string(),
+                reviewer: "reviewer_a".to_string(),
+                review_session_id: "session_a".to_string(),
+                created_at: now(),
+                idempotency_key: None,
+            }));
+        let r = reduce(&[
+            ev(1, RECORD_OWNER_ASSIGNED, &owner_a),
+            ev(2, RECORD_OWNER_ASSIGNED, &owner_b),
+        ]);
+        assert_eq!(r.owner_repository_id.as_deref(), Some("repo_b"));
+        assert_eq!(r.last_event_sequence, 2);
+    }
+
+    #[test]
+    fn replay_rejects_unknown_owner_event_variant() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE records (
+                local_sequence INTEGER PRIMARY KEY,
+                record_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                canonical_payload_json TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO records
+             (local_sequence, record_type, entity_id, canonical_payload_json)
+             VALUES (1, ?1, 'obs_a',
+                     '{\"event_type\":\"future_owner_assignment\",\"owner_repository_id\":\"repo_a\"}')",
+            rusqlite::params![RECORD_OWNER_ASSIGNED],
+        )
+        .unwrap();
+
+        let error = replay_all(&conn).expect_err("unknown event variants must fail closed");
+        assert!(
+            error.to_string().contains("untagged enum RecordPayload"),
+            "unexpected replay error: {error:#}"
+        );
+    }
     #[test]
     fn replay_all_groups_by_observation_in_stream_order() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

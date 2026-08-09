@@ -379,3 +379,47 @@ pub fn migrate_v6_to_v7(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
     )?;
     Ok(())
 }
+
+/// v7 -> v8: rebuild the materialized review-state projection from the
+/// append-only remediation event stream.
+///
+/// Reducer semantics evolved after the v5 projection was introduced. Stores
+/// materialized by an older binary can therefore carry valid records but stale
+/// lineage arrays. The record stream remains authoritative; replace only the
+/// derived projection, seed observations without remediation events as
+/// unreviewed, then replay every event-bearing observation.
+pub fn migrate_v7_to_v8(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM observation_review_state", [])?;
+    tx.execute(
+        "INSERT INTO observation_review_state (
+            observation_id, state, handled, task_ids_json, commits_json,
+            verification_receipts_json, updated_through_sequence
+        )
+        SELECT observation_id, 'unreviewed', 0, '[]', '[]', '[]', local_sequence
+        FROM observations",
+        [],
+    )?;
+
+    let reduced = crate::remediation::reducer::replay_all(tx)?;
+    for state in reduced.values() {
+        crate::remediation::reducer::upsert_review_state(tx, state)?;
+    }
+    Ok(())
+}
+/// v8 -> v9: index record event lookups by entity and type while preserving
+/// stream order. `IF NOT EXISTS` keeps retries and forensic rebuilds safe.
+pub fn migrate_v8_to_v9(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_records_entity_type_sequence
+         ON records(entity_id, record_type, local_sequence)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// v10 -> v11: replay the authoritative event stream into the review-state
+/// projection. Versions 8 and 9 were already in use by deployed lane variants,
+/// so their migration markers cannot prove that the projection replay ran.
+pub fn migrate_v10_to_v11(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    migrate_v7_to_v8(tx)
+}

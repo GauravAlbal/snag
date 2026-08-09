@@ -83,6 +83,29 @@ fn build_header(store: &Store, bounds: &ExportBounds) -> serde_json::Value {
     // only know observations/retractions can still reject the new record
     // types cleanly, but any reader that must reconstruct remediation state
     // (rebuild) needs to understand them — hence the version bump.
+    let has_owner_assignment: bool = store
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM records
+             WHERE record_type = 'observation_owner_assigned'
+               AND local_sequence >= ?1 AND local_sequence <= ?2)",
+            rusqlite::params![bounds.min_seq, bounds.actual_through_seq],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let has_owner_payload: bool = store
+        .conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM records
+             WHERE record_type = 'observation_created'
+               AND local_sequence >= ?1 AND local_sequence <= ?2
+               AND (json_type(canonical_payload_json, '$.owner_repository_id') IS NOT NULL
+                    OR json_type(canonical_payload_json, '$.owner_was_explicitly_unowned') IS NOT NULL))",
+            rusqlite::params![bounds.min_seq, bounds.actual_through_seq],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let requires_owner_reader = has_owner_assignment || has_owner_payload;
     let has_remediation: bool = store
         .conn
         .query_row(
@@ -100,7 +123,7 @@ fn build_header(store: &Store, bounds: &ExportBounds) -> serde_json::Value {
     json!({
         "export_kind": "export_header",
         "export_schema_version": 1,
-        "minimum_reader_version": if has_remediation { 2 } else { 1 },
+        "minimum_reader_version": if requires_owner_reader { 3 } else if has_remediation { 2 } else { 1 },
         "store_id": store.store_id,
         "first_sequence": bounds.first_seq,
         "through_sequence": bounds.actual_through_seq,

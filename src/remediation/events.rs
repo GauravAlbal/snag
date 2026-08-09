@@ -31,6 +31,7 @@ pub const RECORD_FIX_ATTACHED: &str = "remediation_fix_attached";
 pub const RECORD_VERIFICATION_ATTACHED: &str = "remediation_verification_attached";
 pub const RECORD_MARKED_HANDLED: &str = "remediation_marked_handled";
 pub const RECORD_REMEDIATION_REOPENED: &str = "remediation_reopened";
+pub const RECORD_OWNER_ASSIGNED: &str = "observation_owner_assigned";
 
 /// Every remediation record type. The reducer, rebuild, export reader-version
 /// bump, and verify all key off membership here.
@@ -50,6 +51,7 @@ pub const REMEDIATION_RECORD_TYPES: &[&str] = &[
     RECORD_VERIFICATION_ATTACHED,
     RECORD_MARKED_HANDLED,
     RECORD_REMEDIATION_REOPENED,
+    RECORD_OWNER_ASSIGNED,
 ];
 
 // ---------------------------------------------------------------------------
@@ -300,6 +302,18 @@ pub struct PromotedPayload {
     pub idempotency_key: Option<String>,
 }
 
+/// `observation_owner_assigned` — explicit fix ownership. The latest event is
+/// authoritative; earlier assignments remain in the append-only history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OwnerAssignedPayload {
+    pub owner_repository_id: String,
+    pub reviewer: String,
+    pub review_session_id: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
 /// `remediation_task_attached` — owned work item linked to the observation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskAttachedPayload {
@@ -382,6 +396,7 @@ pub enum RemediationEvent {
     RelationshipAdded(RelationshipAddedPayload),
     RelationshipRetracted(RelationshipRetractedPayload),
     Promoted(PromotedPayload),
+    OwnerAssigned(OwnerAssignedPayload),
     TaskAttached(TaskAttachedPayload),
     FixAttached(FixAttachedPayload),
     VerificationAttached(VerificationAttachedPayload),
@@ -403,6 +418,7 @@ pub fn payload_idempotency_key(payload: &crate::record::RecordPayload) -> Option
             RemediationEvent::Reopened(p) => p.idempotency_key.as_deref(),
             RemediationEvent::RelationshipAdded(p) => p.idempotency_key.as_deref(),
             RemediationEvent::RelationshipRetracted(p) => p.idempotency_key.as_deref(),
+            RemediationEvent::OwnerAssigned(p) => p.idempotency_key.as_deref(),
             RemediationEvent::Promoted(p) => p.idempotency_key.as_deref(),
             RemediationEvent::TaskAttached(p) => p.idempotency_key.as_deref(),
             RemediationEvent::FixAttached(p) => p.idempotency_key.as_deref(),
@@ -427,6 +443,7 @@ pub fn payload_created_at(payload: &crate::record::RecordPayload) -> Option<&str
             RemediationEvent::DispositionSet(p) => Some(&p.created_at),
             RemediationEvent::Reopened(p) => Some(&p.created_at),
             RemediationEvent::RelationshipAdded(p) => Some(&p.created_at),
+            RemediationEvent::OwnerAssigned(p) => Some(&p.created_at),
             RemediationEvent::RelationshipRetracted(p) => Some(&p.created_at),
             RemediationEvent::Promoted(p) => Some(&p.created_at),
             RemediationEvent::TaskAttached(p) => Some(&p.created_at),
@@ -470,7 +487,7 @@ pub struct AppendedEvent {
 /// Append one remediation event to the global record stream inside `tx`.
 ///
 /// Idempotency: when the payload carries an `idempotency_key`, a prior record
-/// of the same type with the same key is looked up by JSON extraction. An
+/// of the same type, entity, and key is looked up by JSON extraction. An
 /// identical payload replays (returns the existing record, no new row); a
 /// different payload is a typed conflict.
 ///
@@ -503,11 +520,12 @@ pub fn append_event_with_id(
         let mut stmt = tx.prepare(
             "SELECT record_id, local_sequence, record_hash, canonical_payload_json
              FROM records
-             WHERE record_type = ?1 AND json_extract(canonical_payload_json, '$.idempotency_key') = ?2
+             WHERE record_type = ?1 AND entity_id = ?2
+               AND json_extract(canonical_payload_json, '$.idempotency_key') = ?3
              ORDER BY local_sequence ASC LIMIT 1",
         )?;
         let existing = stmt
-            .query_row(rusqlite::params![record_type, ik], |row| {
+            .query_row(rusqlite::params![record_type, entity_id, ik], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
@@ -597,11 +615,12 @@ mod tests {
 
     #[test]
     fn vocabularies_are_stable_and_recognized() {
-        assert_eq!(REMEDIATION_RECORD_TYPES.len(), 15);
+        assert_eq!(REMEDIATION_RECORD_TYPES.len(), 16);
         assert_eq!(DISPOSITIONS.len(), 7);
         assert_eq!(RELATIONSHIPS.len(), 6);
         assert_eq!(VERIFICATION_STATUSES.len(), 5);
         assert!(DISPOSITIONS.contains(&DISP_CONFIRMED));
+        assert!(REMEDIATION_RECORD_TYPES.contains(&RECORD_OWNER_ASSIGNED));
         assert!(RELATIONSHIPS.contains(&REL_SUPERSEDES));
         assert!(is_accepted(VERIFY_ACCEPTED));
         assert!(!is_accepted(VERIFY_REJECTED));

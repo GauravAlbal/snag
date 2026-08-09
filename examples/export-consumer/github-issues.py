@@ -40,7 +40,7 @@ def validate_header(line: str) -> dict:
         raise ValueError("first line is not an export header")
     if header.get("export_schema_version") != 1:
         raise ValueError("unsupported export_schema_version")
-    if header.get("minimum_reader_version", 1) > 1:
+    if header.get("minimum_reader_version", 1) > 3:
         raise ValueError("stream requires a newer reader")
     return header
 
@@ -79,6 +79,10 @@ def issue_body(obs: dict, rec: dict) -> str:
     body += field("observed_behavior", "Observed")
     body += field("reproduction", "Reproduction")
     body += field("workaround", "Workaround")
+    if obs.get("owner_repository_id"):
+        body += field("owner_repository_id", "Fix owner")
+    elif obs.get("owner_was_explicitly_unowned"):
+        body += "**Fix owner:** explicitly unowned\n\n"
     body += field("impact", "Impact")
     body += (
         "---\n"

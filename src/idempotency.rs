@@ -149,6 +149,7 @@ mod tests {
             artifacts: vec![],
             affected_repository_ids: vec![],
             owner_repository_id: None,
+            owner_was_explicitly_unowned: false,
         }
     }
 
@@ -166,6 +167,18 @@ mod tests {
         assert_eq!(
             observation_semantic_digest(&a),
             observation_semantic_digest(&b)
+        );
+    }
+
+    #[test]
+    fn explicit_unowned_marker_does_not_break_legacy_replay() {
+        let legacy = base();
+        let mut explicitly_unowned = base();
+        explicitly_unowned.owner_was_explicitly_unowned = true;
+        assert_eq!(
+            observation_semantic_digest(&legacy),
+            observation_semantic_digest(&explicitly_unowned),
+            "the admission marker is not observation content"
         );
     }
 

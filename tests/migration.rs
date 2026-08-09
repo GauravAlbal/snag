@@ -176,6 +176,7 @@ fn test_v1_migration_fixture() {
     ctx.cmd()
         .arg("report")
         .arg("post-migration")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -251,6 +252,7 @@ fn test_v1_migration_malformed_payload_fails() {
     ctx.cmd()
         .arg("report")
         .arg("boom")
+        .arg("--unowned")
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid legacy payload"));
@@ -496,6 +498,7 @@ fn test_v4_to_v5_remediation_migration() {
     ctx.cmd()
         .arg("report")
         .arg("post-migration")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -557,4 +560,263 @@ fn test_v4_to_v5_remediation_migration() {
         v
     };
     assert_eq!(legacy_hashes.len(), 2, "legacy records keep their hashes");
+}
+
+/// T11: v11 rebuilds the review-state projection from the authoritative event
+/// stream. This repairs deployed stores whose lane-specific v8/v9 marker did
+/// not prove that the replay ran, without changing append-only records.
+#[test]
+fn test_v11_rebuilds_stale_review_projection_after_legacy_markers() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("projection-source")
+        .arg("--unowned")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .assert()
+        .success();
+    let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let observation_id: String = conn
+        .query_row(
+            "SELECT observation_id FROM observations WHERE title = 'projection-source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+
+    ctx.cmd()
+        .arg("review")
+        .arg("disposition")
+        .arg(&observation_id)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd()
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&observation_id)
+        .arg("--commit")
+        .arg("abc123")
+        .arg("--repo")
+        .arg("repo_projection")
+        .assert()
+        .success();
+
+    let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE observation_review_state SET commits_json = '[]'
+         WHERE observation_id = ?1",
+        [&observation_id],
+    )
+    .unwrap();
+    // Exercise the original v7 -> v8 replay path and continue through the
+    // current migration head.
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11)",
+        [],
+    )
+    .unwrap();
+    let record_snapshot: (i64, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*),
+                    MAX(CASE WHEN record_type = 'remediation_fix_attached'
+                             THEN record_hash END)
+             FROM records WHERE entity_id = ?1",
+            [&observation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(conn);
+
+    // Any later write-open applies pending migrations before appending.
+    ctx.cmd()
+        .arg("report")
+        .arg("migration-trigger")
+        .arg("--unowned")
+        .assert()
+        .success();
+
+    let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let (state, disposition, handled, commits_json): (String, Option<String>, i64, String) = conn
+        .query_row(
+            "SELECT state, disposition, handled, commits_json
+             FROM observation_review_state WHERE observation_id = ?1",
+            [&observation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "candidate_fix");
+    assert_eq!(disposition.as_deref(), Some("confirmed"));
+    assert_eq!(handled, 0);
+    assert_eq!(
+        commits_json, r#"[{"commit_sha":"abc123","repository_id":"repo_projection"}]"#,
+        "v11 must replay commit lineage from records"
+    );
+    let records_after: (i64, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*),
+                    MAX(CASE WHEN record_type = 'remediation_fix_attached'
+                             THEN record_hash END)
+             FROM records WHERE entity_id = ?1",
+            [&observation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        records_after, record_snapshot,
+        "projection rebuild must not alter append-only records"
+    );
+    drop(conn);
+
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+
+    // A deployed store can already carry the old v8/v9 markers even though a
+    // lane variant never replayed this projection. Only v11 closes that gap.
+    let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE observation_review_state SET commits_json = '[]'
+         WHERE observation_id = ?1",
+        [&observation_id],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM schema_migrations WHERE version = 11", [])
+        .unwrap();
+    drop(conn);
+    ctx.cmd()
+        .arg("report")
+        .arg("deployed-marker-trigger")
+        .arg("--unowned")
+        .assert()
+        .success();
+    let conn = Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let commits_json: String = conn
+        .query_row(
+            "SELECT commits_json FROM observation_review_state WHERE observation_id = ?1",
+            [&observation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        commits_json,
+        r#"[{"commit_sha":"abc123","repository_id":"repo_projection"}]"#
+    );
+    drop(conn);
+    ctx.cmd().arg("verify").arg("--full").assert().success();
+}
+
+fn assert_record_lookup_index(conn: &Connection) {
+    let index_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_records_entity_type_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        index_sql
+            .to_ascii_lowercase()
+            .contains("on records(entity_id, record_type, local_sequence)"),
+        "record lookup index must preserve entity/type/sequence order: {index_sql}"
+    );
+
+    let lookup_queries = [
+        "SELECT local_sequence FROM records
+         WHERE entity_id = 'obs_a'
+           AND record_type IN ('observation_claimed', 'observation_reviewed')
+         ORDER BY local_sequence ASC",
+        "SELECT local_sequence FROM records
+         WHERE entity_id = 'obs_a' AND record_type = 'observation_retracted'
+         ORDER BY local_sequence ASC",
+        "SELECT local_sequence FROM records
+         WHERE entity_id = 'obs_a' AND record_type = 'observation_owner_assigned'
+         ORDER BY local_sequence ASC",
+    ];
+    for query in lookup_queries {
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("INDEX idx_records_entity_type_sequence")),
+            "entity/type lookup must use the composite index: {query}; plan={plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN records")),
+            "entity/type lookup must not scan records: {query}; plan={plan:?}"
+        );
+    }
+}
+
+#[test]
+fn test_record_lookup_index_fresh_upgraded_and_rerun_safe() {
+    let fresh = TestContext::new();
+    fresh
+        .cmd()
+        .arg("report")
+        .arg("index-fresh")
+        .arg("--unowned")
+        .assert()
+        .success();
+    let conn = Connection::open(fresh.data_dir.join("snag.sqlite")).unwrap();
+    assert_record_lookup_index(&conn);
+    let index_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_records_entity_type_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_count, 1);
+    drop(conn);
+
+    // Re-run the forward migration marker while the index already exists.
+    let conn = Connection::open(fresh.data_dir.join("snag.sqlite")).unwrap();
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    fresh
+        .cmd()
+        .arg("report")
+        .arg("index-rerun")
+        .arg("--unowned")
+        .assert()
+        .success();
+    let conn = Connection::open(fresh.data_dir.join("snag.sqlite")).unwrap();
+    assert_record_lookup_index(&conn);
+    let index_count_after_rerun: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_records_entity_type_sequence'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_count_after_rerun, 1);
+    drop(conn);
+
+    // A pre-index upgraded store receives the same index during the chain.
+    let upgraded = TestContext::new();
+    build_v4_fixture(&upgraded);
+    upgraded
+        .cmd()
+        .arg("report")
+        .arg("index-upgraded")
+        .arg("--unowned")
+        .assert()
+        .success();
+    let conn = Connection::open(upgraded.data_dir.join("snag.sqlite")).unwrap();
+    assert_record_lookup_index(&conn);
 }

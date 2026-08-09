@@ -254,6 +254,36 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
         )?;
     }
 
+    if current_version < 8 {
+        crate::migrations::migrate_v7_to_v8(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (8, datetime('now'))",
+            [],
+        )?;
+    }
+    if current_version < 9 {
+        crate::migrations::migrate_v8_to_v9(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (9, datetime('now'))",
+            [],
+        )?;
+    }
+    // v10 is a compatibility marker: the internal lane already uses it for
+    // the same record lookup index installed by public v9.
+    if current_version < 10 {
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (10, datetime('now'))",
+            [],
+        )?;
+    }
+    if current_version < 11 {
+        crate::migrations::migrate_v10_to_v11(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (11, datetime('now'))",
+            [],
+        )?;
+    }
+
     tx.commit()?;
     Ok(())
 }

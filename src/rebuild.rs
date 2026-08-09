@@ -46,7 +46,7 @@ fn parse_and_validate_header(header_line: &str) -> Result<(String, u64, String, 
     if let Some(min_v) = header
         .get("minimum_reader_version")
         .and_then(|v| v.as_i64())
-        && min_v > 2
+        && min_v > 3
     {
         anyhow::bail!("Unsupported minimum reader version: {min_v}");
     }
@@ -446,6 +446,25 @@ fn reconstruct_remediation_event(
                 ],
             )?;
         }
+        RemediationEvent::OwnerAssigned(p) => {
+            tx.execute(
+                "INSERT OR IGNORE INTO repositories (repository_id, created_at)
+                 VALUES (?1, ?2)",
+                rusqlite::params![&p.owner_repository_id, &p.created_at],
+            )?;
+            tx.execute(
+                "DELETE FROM observation_repositories
+                 WHERE observation_id = ?1 AND role = 'owner'",
+                rusqlite::params![entity_id],
+            )?;
+            tx.execute(
+                "INSERT INTO observation_repositories
+                 (observation_id, repository_id, role)
+                 VALUES (?1, ?2, 'owner')",
+                rusqlite::params![entity_id, &p.owner_repository_id],
+            )?;
+        }
+
         RemediationEvent::TaskAttached(p) => {
             tx.execute(
                 "INSERT INTO remediation_links (
@@ -517,6 +536,31 @@ fn finalize_destination(
 }
 
 pub fn handle(args: RebuildArgs) -> Result<()> {
+    // The destination is a Snag DATA DIRECTORY, never a database file path:
+    // open_at creates `<destination>/snag.sqlite`. A `.sqlite`-suffixed
+    // argument is almost certainly a caller passing the database path
+    // (Darn consumer ambiguity) — reject it loudly instead of silently
+    // creating `<path>.sqlite/snag.sqlite`.
+    if args.destination.extension().is_some_and(|e| {
+        let e = e.to_string_lossy().to_lowercase();
+        e == "sqlite" || e == "sqlite3" || e == "db"
+    }) {
+        anyhow::bail!(
+            "--destination takes a Snag DATA DIRECTORY, not a database file path \
+             (a fresh snag.sqlite is created inside it); got {:?}",
+            args.destination
+        );
+    }
+    if args.destination.exists() {
+        let db = args.destination.join("snag.sqlite");
+        if db.exists() {
+            anyhow::bail!(
+                "--destination already contains a store ({}) — rebuild into a fresh \
+                 directory; refusing to overwrite",
+                db.display()
+            );
+        }
+    }
     let file = File::open(&args.from_export)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();

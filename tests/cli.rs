@@ -1,8 +1,9 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::env;
+use std::path::Path;
+use std::process::Command as Proc;
 use tempfile::TempDir;
-
 /// Provides an isolated environment for a snag test instance
 pub struct TestContext {
     pub home_dir: TempDir,
@@ -46,12 +47,59 @@ impl Drop for TestContext {
     }
 }
 
+fn review_filter_git_cli_test(dir: &Path, args: &[&str]) {
+    let status = Proc::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn review_filter_init_git_repo(dir: &Path, remote: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    review_filter_git_cli_test(dir, &["init", "-q", "-b", "main"]);
+    review_filter_git_cli_test(dir, &["config", "user.email", "test@example.invalid"]);
+    review_filter_git_cli_test(dir, &["config", "user.name", "Test"]);
+    std::fs::write(dir.join("README.md"), "# test\n").unwrap();
+    review_filter_git_cli_test(dir, &["add", "."]);
+    review_filter_git_cli_test(dir, &["commit", "-q", "-m", "init"]);
+    review_filter_git_cli_test(dir, &["remote", "add", "origin", remote]);
+}
+
+fn review_filter_repository_state_snapshot(ctx: &TestContext) -> (Vec<u8>, i64, [i64; 4]) {
+    let db_path = ctx.data_dir.join("snag.sqlite");
+    let bytes = std::fs::read(&db_path).unwrap();
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let sequence = conn
+        .query_row(
+            "SELECT COALESCE(MAX(local_sequence), 0) FROM records",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let counts = [
+        "repositories",
+        "repository_aliases",
+        "checkouts",
+        "worktrees",
+    ]
+    .map(|table| {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    });
+    (bytes, sequence, counts)
+}
+
 #[test]
 fn test_bare_fast_path() {
     let ctx = TestContext::new();
     ctx.cmd()
         .arg("report")
         .arg("Bare fast path test")
+        .arg("--unowned")
         .assert()
         .success()
         .stdout(predicate::str::contains("Recorded obs_"));
@@ -63,11 +111,303 @@ fn test_bare_fast_path() {
 }
 
 #[test]
+fn test_report_requires_explicit_ownership_choice() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("missing ownership")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--owner"))
+        .stderr(predicate::str::contains("--unowned"));
+    assert_eq!(obs_count_if_store_exists(&ctx), 0);
+}
+
+#[test]
+fn test_unowned_cli_persists_no_owner_and_marker() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("explicitly unowned")
+        .arg("--unowned")
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&ctx, "explicitly unowned"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unowned_marker_for_title(&ctx, "explicitly unowned"),
+        Some(1)
+    );
+}
+
+#[test]
+fn test_owner_cli_persists_singular_owner_without_unowned_marker() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("explicit owner")
+        .arg("--owner")
+        .arg("repo_cli_owner")
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&ctx, "explicit owner"),
+        vec!["repo_cli_owner".to_string()]
+    );
+    assert!(
+        matches!(
+            unowned_marker_for_title(&ctx, "explicit owner"),
+            None | Some(0)
+        ),
+        "owned input must not persist an explicit-unowned marker"
+    );
+}
+
+#[test]
+fn test_review_show_deduplicates_reporter_owner_repository() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("same reporter and owner")
+        .arg("--repo-id")
+        .arg("repo_same")
+        .arg("--owner")
+        .arg("repo_same")
+        .assert()
+        .success();
+    let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let observation_id: String = conn
+        .query_row(
+            "SELECT observation_id FROM observations WHERE title = 'same reporter and owner'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let out = ctx
+        .cmd()
+        .arg("review")
+        .arg("show")
+        .arg(observation_id)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let packet: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        packet["repositories"].as_array().unwrap().len(),
+        1,
+        "reporter and owner roles for one repository must project one repository id"
+    );
+}
+
+#[test]
+fn test_owner_flags_are_mutually_exclusive_and_atomic() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("conflicting ownership")
+        .arg("--owner")
+        .arg("repo_conflict")
+        .arg("--unowned")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--owner"));
+    assert_eq!(obs_count_if_store_exists(&ctx), 0);
+}
+
+#[test]
+fn test_json_v2_owner_and_unowned_project_roles() {
+    let owner_ctx = TestContext::new();
+    let owner_doc = r#"{"schema_version":2,"title":"json v2 owner","owner":"repo_json_owner"}"#;
+    owner_ctx
+        .cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(owner_doc)
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&owner_ctx, "json v2 owner"),
+        vec!["repo_json_owner".to_string()]
+    );
+    assert!(matches!(
+        unowned_marker_for_title(&owner_ctx, "json v2 owner"),
+        None | Some(0)
+    ));
+
+    let unowned_ctx = TestContext::new();
+    let unowned_doc = r#"{"schema_version":2,"title":"json v2 unowned","unowned":true}"#;
+    unowned_ctx
+        .cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(unowned_doc)
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&unowned_ctx, "json v2 unowned"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unowned_marker_for_title(&unowned_ctx, "json v2 unowned"),
+        Some(1)
+    );
+}
+
+#[test]
+fn test_cli_ownership_choice_overrides_embedded_json_choice() {
+    let unowned_ctx = TestContext::new();
+    unowned_ctx
+        .cmd()
+        .arg("report")
+        .arg("--json")
+        .arg("--unowned")
+        .write_stdin(r#"{"schema_version":2,"title":"cli wins unowned","owner":"embedded_owner"}"#)
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&unowned_ctx, "cli wins unowned"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unowned_marker_for_title(&unowned_ctx, "cli wins unowned"),
+        Some(1)
+    );
+
+    let owner_ctx = TestContext::new();
+    owner_ctx
+        .cmd()
+        .arg("report")
+        .arg("--json")
+        .arg("--owner")
+        .arg("cli_owner")
+        .write_stdin(r#"{"schema_version":2,"title":"cli wins owner","unowned":true}"#)
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&owner_ctx, "cli wins owner"),
+        vec!["cli_owner".to_string()]
+    );
+    assert!(matches!(
+        unowned_marker_for_title(&owner_ctx, "cli wins owner"),
+        None | Some(0)
+    ));
+}
+
+#[test]
+fn test_json_v2_invalid_ownership_is_rejected_without_writes() {
+    for (name, doc) in [
+        (
+            "json v2 missing",
+            r#"{"schema_version":2,"title":"json v2 missing"}"#,
+        ),
+        (
+            "json v2 both",
+            r#"{"schema_version":2,"title":"json v2 both","owner":"repo","unowned":true}"#,
+        ),
+        (
+            "json v2 empty",
+            r#"{"schema_version":2,"title":"json v2 empty","owner":""}"#,
+        ),
+        (
+            "json v2 whitespace",
+            r#"{"schema_version":2,"title":"json v2 whitespace","owner":"   \t  "}"#,
+        ),
+        (
+            "json v2 false",
+            r#"{"schema_version":2,"title":"json v2 false","unowned":false}"#,
+        ),
+    ] {
+        let ctx = TestContext::new();
+        ctx.cmd()
+            .arg("report")
+            .arg("--json")
+            .write_stdin(doc)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--owner"))
+            .stderr(predicate::str::contains("--unowned"));
+        assert_eq!(obs_count_if_store_exists(&ctx), 0, "{name} must not write");
+    }
+}
+
+#[test]
+fn test_json_v1_requires_cli_ownership_choice() {
+    let doc = r#"{"schema_version":1,"title":"json v1 legacy"}"#;
+    let missing = TestContext::new();
+    missing
+        .cmd()
+        .arg("report")
+        .arg("--json")
+        .write_stdin(doc)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--owner"))
+        .stderr(predicate::str::contains("--unowned"));
+    assert_eq!(obs_count_if_store_exists(&missing), 0);
+
+    let supplied = TestContext::new();
+    supplied
+        .cmd()
+        .arg("report")
+        .arg("--json")
+        .arg("--unowned")
+        .write_stdin(doc)
+        .assert()
+        .success();
+    assert_eq!(
+        unowned_marker_for_title(&supplied, "json v1 legacy"),
+        Some(1)
+    );
+}
+
+#[test]
+fn test_prose_self_contained_owner_and_unowned_paths() {
+    let owner_ctx = TestContext::new();
+    owner_ctx
+        .cmd()
+        .arg("report")
+        .arg("--stdin")
+        .write_stdin("Prose owner\n\nOwner:\nrepo_prose_owner\n\nObserved:\nfailed\n")
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&owner_ctx, "Prose owner"),
+        vec!["repo_prose_owner".to_string()]
+    );
+    assert!(matches!(
+        unowned_marker_for_title(&owner_ctx, "Prose owner"),
+        None | Some(0)
+    ));
+
+    let unowned_ctx = TestContext::new();
+    unowned_ctx
+        .cmd()
+        .arg("report")
+        .arg("--stdin")
+        .write_stdin("Prose unowned\n\nUnowned:\ntrue\n\nObserved:\nfailed\n")
+        .assert()
+        .success();
+    assert_eq!(
+        owner_rows_for_title(&unowned_ctx, "Prose unowned"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unowned_marker_for_title(&unowned_ctx, "Prose unowned"),
+        Some(1)
+    );
+}
+
+#[test]
 fn test_structured_cli_report() {
     let ctx = TestContext::new();
     ctx.cmd()
         .arg("report")
         .arg("Test structured CLI")
+        .arg("--unowned")
         .arg("--kind")
         .arg("bug")
         .arg("--severity")
@@ -93,6 +433,7 @@ fn test_list_filters_gap() {
     ctx.cmd()
         .arg("report")
         .arg("List filter test")
+        .arg("--unowned")
         .arg("--kind")
         .arg("tooling")
         .assert()
@@ -138,6 +479,7 @@ fn test_json_intake_gap() {
     ctx.cmd()
         .arg("report")
         .arg("--json")
+        .arg("--unowned")
         .write_stdin(json_payload)
         .assert()
         .success();
@@ -157,6 +499,7 @@ fn test_idempotency_gap() {
     ctx.cmd()
         .arg("report")
         .arg("Idempotency Test")
+        .arg("--unowned")
         .arg("--idempotency-key")
         .arg("key_123")
         .assert()
@@ -166,6 +509,7 @@ fn test_idempotency_gap() {
     ctx.cmd()
         .arg("report")
         .arg("Idempotency Test")
+        .arg("--unowned")
         .arg("--idempotency-key")
         .arg("key_123")
         .assert()
@@ -176,6 +520,7 @@ fn test_idempotency_gap() {
     ctx.cmd()
         .arg("report")
         .arg("Idempotency Test DIFFERENT")
+        .arg("--unowned")
         .arg("--idempotency-key")
         .arg("key_123")
         .assert()
@@ -196,6 +541,7 @@ fn test_certification_mission() {
     ctx.cmd()
         .arg("report")
         .arg("System crashed during start")
+        .arg("--unowned")
         .arg("--kind")
         .arg("bug")
         .arg("--idempotency-key")
@@ -243,6 +589,7 @@ fn test_metadata_tamper() {
     ctx.cmd()
         .arg("report")
         .arg("Tamper Test")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -276,6 +623,7 @@ fn test_export_protocol() {
     ctx.cmd()
         .arg("report")
         .arg("Export Test 1")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -305,6 +653,7 @@ fn test_rebuild_protocol() {
     ctx.cmd()
         .arg("report")
         .arg("Rebuild Test 1")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -344,6 +693,7 @@ fn test_restore_protocol() {
     ctx.cmd()
         .arg("report")
         .arg("Restore Test")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -403,6 +753,41 @@ fn latest_backup(ctx: &TestContext) -> std::path::PathBuf {
     archive_path.expect("Backup archive not found")
 }
 
+fn obs_count_if_store_exists(ctx: &TestContext) -> i64 {
+    if !ctx.data_dir.join("snag.sqlite").exists() {
+        return 0;
+    }
+    obs_count(ctx)
+}
+
+fn owner_rows_for_title(ctx: &TestContext, title: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.repository_id
+             FROM observation_repositories r
+             JOIN observations o ON o.observation_id = r.observation_id
+             WHERE o.title = ?1 AND r.role = 'owner'
+             ORDER BY r.repository_id",
+        )
+        .unwrap();
+    stmt.query_map([title], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+fn unowned_marker_for_title(ctx: &TestContext, title: &str) -> Option<i64> {
+    let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    conn.query_row(
+        "SELECT json_extract(canonical_payload_json, '$.owner_was_explicitly_unowned')
+         FROM observations WHERE title = ?1",
+        [title],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn obs_count(ctx: &TestContext) -> i64 {
     let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
     conn.query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
@@ -423,6 +808,7 @@ fn test_e2e_backup_restore_roundtrip() {
     ctx.cmd()
         .arg("report")
         .arg("E2E roundtrip")
+        .arg("--unowned")
         .arg("--artifact")
         .arg(&art)
         .arg("--idempotency-key")
@@ -522,6 +908,7 @@ fn test_json_full_intake_and_replay() {
     ctx.cmd()
         .arg("report")
         .arg("--json")
+        .arg("--unowned")
         .write_stdin(json_payload)
         .assert()
         .success()
@@ -543,6 +930,7 @@ fn test_json_full_intake_and_replay() {
     ctx.cmd()
         .arg("report")
         .arg("--json")
+        .arg("--unowned")
         .write_stdin(json_payload)
         .assert()
         .success()
@@ -565,6 +953,7 @@ fn test_idempotency_conflict_typed() {
     ctx.cmd()
         .arg("report")
         .arg("original")
+        .arg("--unowned")
         .arg("--idempotency-key")
         .arg("k2")
         .assert()
@@ -572,6 +961,7 @@ fn test_idempotency_conflict_typed() {
     ctx.cmd()
         .arg("report")
         .arg("different payload")
+        .arg("--unowned")
         .arg("--idempotency-key")
         .arg("k2")
         .assert()
@@ -592,6 +982,7 @@ fn test_list_since_json_retracted() {
     ctx.cmd()
         .arg("report")
         .arg("recent thing")
+        .arg("--unowned")
         .assert()
         .success();
 
@@ -669,7 +1060,12 @@ fn test_list_since_json_retracted() {
 #[test]
 fn test_read_purity() {
     let ctx = TestContext::new();
-    ctx.cmd().arg("report").arg("purity").assert().success();
+    ctx.cmd()
+        .arg("report")
+        .arg("purity")
+        .arg("--unowned")
+        .assert()
+        .success();
 
     let db_path = ctx.data_dir.join("snag.sqlite");
     let before = std::fs::read(&db_path).unwrap();
@@ -732,6 +1128,7 @@ fn test_report_json_output_mode_with_title() {
     ctx.cmd()
         .arg("report")
         .arg("JSON output mode test")
+        .arg("--unowned")
         .arg("--json")
         .assert()
         .success()
@@ -759,6 +1156,7 @@ fn test_report_json_intake_from_file() {
         .arg("report")
         .arg("--json")
         .arg(&payload)
+        .arg("--unowned")
         .assert()
         .success();
     ctx.cmd()
@@ -781,6 +1179,7 @@ fn test_report_rejects_unknown_kind_and_severity() {
     ctx.cmd()
         .arg("report")
         .arg("rogue severity")
+        .arg("--unowned")
         .arg("--severity")
         .arg("P2")
         .assert()
@@ -791,6 +1190,7 @@ fn test_report_rejects_unknown_kind_and_severity() {
     // Unknown kind on the bare fast path.
     ctx.cmd()
         .arg("rogue kind")
+        .arg("--unowned")
         .arg("--kind")
         .arg("defect")
         .assert()
@@ -804,6 +1204,7 @@ fn test_report_rejects_unknown_kind_and_severity() {
     ctx.cmd()
         .arg("report")
         .arg("--json")
+        .arg("--unowned")
         .write_stdin(
             r#"{"schema_version": 1, "title": "bad json kind", "kind_assertion": "runtime"}"#,
         )
@@ -856,6 +1257,7 @@ fn test_bare_fast_path_structured_flags() {
     let ctx = TestContext::new();
     ctx.cmd()
         .arg("bare flags test")
+        .arg("--unowned")
         .arg("--kind")
         .arg("bug")
         .arg("--severity")
@@ -895,6 +1297,7 @@ fn test_context_file_schema_version_validation() {
         .env("SNAG_CONTEXT_FILE", &bad)
         .arg("report")
         .arg("rejected context version")
+        .arg("--unowned")
         .assert()
         .failure()
         .stderr(predicate::str::contains("Unsupported schema"));
@@ -913,6 +1316,7 @@ fn test_context_file_schema_version_validation() {
         .env("SNAG_CONTEXT_FILE", &ok)
         .arg("report")
         .arg("accepted context version")
+        .arg("--unowned")
         .assert()
         .success();
 }
@@ -935,7 +1339,12 @@ fn test_context_json_has_schema_version() {
 #[test]
 fn test_closed_pipe_exits_cleanly() {
     let ctx = TestContext::new();
-    ctx.cmd().arg("report").arg("pipe test").assert().success();
+    ctx.cmd()
+        .arg("report")
+        .arg("pipe test")
+        .arg("--unowned")
+        .assert()
+        .success();
     let bin = assert_cmd::cargo::cargo_bin("snag");
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -970,10 +1379,70 @@ fn test_init_writes_instructions() {
         .stdout(predicate::str::contains("Configured"));
     let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
     assert!(
-        content.contains("1. Record it with `snag` while the evidence is fresh."),
-        "block must be installed"
+        content.contains("1. Decide who owns the fix BEFORE recording:"),
+        "block must install the ownership decision before capture"
     );
     assert!(content.contains("<!-- snag:instructions -->"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_init_rejects_symlink_without_modifying_target() {
+    use std::os::unix::fs::symlink;
+
+    let ctx = TestContext::new();
+    let dir = ctx.home_dir.path();
+    let external = dir.join("external.md");
+    let target = dir.join("AGENTS.md");
+    let original = b"external instructions\n";
+    std::fs::write(&external, original).unwrap();
+    symlink(&external, &target).unwrap();
+
+    ctx.cmd()
+        .current_dir(dir)
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Validation error"));
+
+    assert!(
+        std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&external).unwrap(), original);
+}
+
+#[test]
+fn test_init_rejects_directory_target() {
+    let ctx = TestContext::new();
+    let target = ctx.home_dir.path().join("AGENTS.md");
+    std::fs::create_dir(&target).unwrap();
+
+    ctx.cmd()
+        .current_dir(ctx.home_dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Validation error"));
+    assert!(target.is_dir());
+}
+
+#[test]
+fn test_init_rejects_non_utf8_existing_file() {
+    let ctx = TestContext::new();
+    let target = ctx.home_dir.path().join("AGENTS.md");
+    let original = [0xff, 0xfe, b'\n'];
+    std::fs::write(&target, original).unwrap();
+
+    ctx.cmd()
+        .current_dir(ctx.home_dir.path())
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Validation error"));
+    assert_eq!(std::fs::read(&target).unwrap(), original);
 }
 
 /// `snag init` is idempotent: a second run reports already-configured and
@@ -1024,7 +1493,7 @@ fn test_init_preserves_existing_file() {
         content.starts_with("# existing instructions"),
         "existing content must survive"
     );
-    assert!(content.contains("1. Record it with `snag` while the evidence is fresh."));
+    assert!(content.contains("1. Decide who owns the fix BEFORE recording:"));
 }
 
 /// `snag init --file <path>` targets a custom file.
@@ -1109,6 +1578,7 @@ fn repro_key_is_labeled_deterministic_and_distinct() {
         c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
         c.arg("report")
             .arg(title)
+            .arg("--unowned")
             .arg("--kind")
             .arg("bug")
             .arg("--severity")
@@ -1174,7 +1644,14 @@ fn thin_high_severity_report_nudges() {
         }
         c.output().unwrap()
     };
-    let out = run(&["thin blocker", "--kind", "bug", "--severity", "blocker"]);
+    let out = run(&[
+        "thin blocker",
+        "--unowned",
+        "--kind",
+        "bug",
+        "--severity",
+        "blocker",
+    ]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
@@ -1184,6 +1661,7 @@ fn thin_high_severity_report_nudges() {
 
     let out = run(&[
         "full major",
+        "--unowned",
         "--kind",
         "bug",
         "--severity",
@@ -1214,7 +1692,15 @@ fn prefix_observation_ids_resolve() {
         }
         c.output().unwrap()
     };
-    let out = run(&["report", "prefix-a", "--kind", "bug", "--severity", "minor"]);
+    let out = run(&[
+        "report",
+        "prefix-a",
+        "--unowned",
+        "--kind",
+        "bug",
+        "--severity",
+        "minor",
+    ]);
     let id = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
@@ -1222,7 +1708,15 @@ fn prefix_observation_ids_resolve() {
         .and_then(|l| l.split_whitespace().next())
         .expect("obs id")
         .to_string();
-    run(&["report", "prefix-b", "--kind", "bug", "--severity", "minor"]);
+    run(&[
+        "report",
+        "prefix-b",
+        "--unowned",
+        "--kind",
+        "bug",
+        "--severity",
+        "minor",
+    ]);
 
     // Unique prefix resolves for show.
     let out = run(&["show", &id[..14]]);
@@ -1237,4 +1731,87 @@ fn prefix_observation_ids_resolve() {
     // Retract by prefix works.
     let out = run(&["retract", &id[..14]]);
     assert!(out.status.success());
+}
+
+#[test]
+fn test_review_repo_filters_are_read_pure() {
+    let ctx = TestContext::new();
+    let known = ctx.home_dir.path().join("known");
+    let fresh_known = ctx.home_dir.path().join("fresh-known");
+    let fresh_unknown = ctx.home_dir.path().join("fresh-unknown");
+    let known_remote = "git@github.com:acme/read-purity.git";
+
+    review_filter_init_git_repo(&known, known_remote);
+    ctx.cmd()
+        .current_dir(&known)
+        .arg("report")
+        .arg("bound checkout")
+        .arg("--unowned")
+        .assert()
+        .success();
+
+    let before_bound = review_filter_repository_state_snapshot(&ctx);
+    ctx.cmd()
+        .current_dir(&known)
+        .args(["review", "summary", "--repo", "current"])
+        .assert()
+        .success();
+    ctx.cmd()
+        .current_dir(&known)
+        .args(["review", "list", "--repo", "current"])
+        .assert()
+        .success();
+    assert_eq!(
+        before_bound,
+        review_filter_repository_state_snapshot(&ctx),
+        "current bound checkout reads must not mutate store state"
+    );
+
+    review_filter_init_git_repo(&fresh_known, known_remote);
+    let before_fresh_alias = review_filter_repository_state_snapshot(&ctx);
+    ctx.cmd()
+        .current_dir(&fresh_known)
+        .args(["review", "summary", "--repo", "current"])
+        .assert()
+        .success();
+    ctx.cmd()
+        .current_dir(&fresh_known)
+        .args(["review", "list", "--repo", "current"])
+        .assert()
+        .success();
+    assert_eq!(
+        before_fresh_alias,
+        review_filter_repository_state_snapshot(&ctx),
+        "fresh checkout with a unique confirmed alias must resolve read-only"
+    );
+
+    review_filter_init_git_repo(
+        &fresh_unknown,
+        "git@github.com:acme/never-recorded-read-purity.git",
+    );
+    let before_unknown = review_filter_repository_state_snapshot(&ctx);
+    for args in [
+        ["review", "summary", "--repo", "current"],
+        ["review", "list", "--repo", "current"],
+    ] {
+        let out = ctx
+            .cmd()
+            .current_dir(&fresh_unknown)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "unknown current checkout must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .to_ascii_lowercase()
+                .contains("repository not found"),
+            "unknown current checkout must be a typed not-found: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(
+        before_unknown,
+        review_filter_repository_state_snapshot(&ctx),
+        "unknown current checkout must not mutate store state"
+    );
 }

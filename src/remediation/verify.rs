@@ -8,6 +8,7 @@ use crate::remediation::events::*;
 use crate::remediation::reducer;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
 
 /// Verify every remediation invariant. `quick` restricts the materialized-vs-
 /// replay comparison to observations touched by the bounded record suffix
@@ -30,7 +31,8 @@ fn verify_record_references(conn: &Connection) -> Result<()> {
              'observation_claimed','observation_claim_heartbeat','observation_claim_released',
              'observation_claim_expired','observation_reviewed','observation_disposition_set',
              'observation_reopened','observation_relationship_added','observation_relationship_retracted',
-             'observation_promoted','remediation_task_attached','remediation_fix_attached',
+             'observation_promoted','observation_owner_assigned',
+             'remediation_task_attached','remediation_fix_attached',
              'remediation_verification_attached','remediation_marked_handled','remediation_reopened'
          )
          AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.observation_id = r.entity_id)",
@@ -39,6 +41,22 @@ fn verify_record_references(conn: &Connection) -> Result<()> {
     )?;
     if count > 0 {
         anyhow::bail!("{count} remediation record(s) reference missing observations");
+    }
+    let missing_owner_repositories: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM records r
+         WHERE r.record_type = 'observation_owner_assigned'
+           AND NOT EXISTS (
+               SELECT 1 FROM repositories repo
+               WHERE repo.repository_id =
+                     json_extract(r.canonical_payload_json, '$.owner_repository_id')
+           )",
+        [],
+        |r| r.get(0),
+    )?;
+    if missing_owner_repositories > 0 {
+        anyhow::bail!(
+            "{missing_owner_repositories} owner assignment record(s) reference missing repositories"
+        );
     }
     Ok(())
 }
@@ -154,31 +172,68 @@ fn verify_materialized_state(conn: &Connection, quick: bool) -> Result<()> {
 
     if quick {
         // Bounded scope: observations touched by the last 3 records.
-        let touched: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT entity_id FROM (
-                     SELECT local_sequence, entity_id FROM records
-                     ORDER BY local_sequence DESC LIMIT 3
-                 )",
-            )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut v = Vec::new();
-            for r in rows {
-                v.push(r?);
-            }
-            v
-        };
-        for obs in touched {
-            if let Some(expected) = reduced.get(&obs) {
-                compare_row(conn, expected)?;
-            }
-        }
+        let touched = load_touched_observation_ids(conn)?;
+        let owner_projections = load_owner_projections(conn, Some(&touched))?;
+        compare_observations(conn, &reduced, &touched, &owner_projections)?;
         return Ok(());
     }
 
-    for expected in reduced.values() {
-        compare_row(conn, expected)?;
+    let observation_ids = load_observation_ids(conn)?;
+    let owner_projections = load_owner_projections(conn, None)?;
+    compare_observations(conn, &reduced, &observation_ids, &owner_projections)?;
+    verify_unreviewed_rows(conn)
+}
+
+fn load_touched_observation_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT entity_id FROM (
+             SELECT local_sequence, entity_id FROM records
+             ORDER BY local_sequence DESC LIMIT 3
+         )",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut touched = Vec::new();
+    for row in rows {
+        touched.push(row?);
     }
+    Ok(touched)
+}
+
+fn load_observation_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT observation_id FROM observations")?;
+    Ok(stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn compare_observations(
+    conn: &Connection,
+    reduced: &std::collections::BTreeMap<String, reducer::ReducedObservation>,
+    observation_ids: &[String],
+    owner_projections: &OwnerProjections,
+) -> Result<()> {
+    for observation_id in observation_ids {
+        compare_observation(conn, reduced, observation_id, owner_projections)?;
+    }
+    Ok(())
+}
+
+fn compare_observation(
+    conn: &Connection,
+    reduced: &std::collections::BTreeMap<String, reducer::ReducedObservation>,
+    observation_id: &str,
+    owner_projections: &OwnerProjections,
+) -> Result<()> {
+    if let Some(expected) = reduced.get(observation_id) {
+        compare_row(conn, expected, owner_projections)?;
+    } else {
+        let expected = reducer::reduce_events(observation_id, &[]);
+        compare_row(conn, &expected, owner_projections)?;
+    }
+    Ok(())
+}
+
+fn verify_unreviewed_rows(conn: &Connection) -> Result<()> {
     // Observations with no remediation events must not carry a stale row
     // (the migration backfill is the only allowed non-empty shape: unreviewed,
     // unhandled, no disposition). Anything else requires backing events.
@@ -219,17 +274,96 @@ type MaterializedRow = (
     i64,
 );
 
-/// Compare one reduced observation against its materialized row. The reducer's
-/// `last_event_sequence == 0` means the observation has no remediation events:
-/// the row must then be absent or the unreviewed migration backfill.
-fn compare_row(conn: &Connection, expected: &reducer::ReducedObservation) -> Result<()> {
-    let row: Option<MaterializedRow> = conn
+type OwnerProjection = (Option<String>, Vec<String>);
+type OwnerProjections = HashMap<String, OwnerProjection>;
+
+fn load_owner_projections(
+    conn: &Connection,
+    observation_ids: Option<&[String]>,
+) -> Result<OwnerProjections> {
+    let mut sql = String::from(
+        "SELECT o.observation_id,
+                json_extract(o.canonical_payload_json, '$.owner_repository_id'),
+                r.repository_id
+         FROM observations o
+         LEFT JOIN observation_repositories r
+           ON r.observation_id = o.observation_id AND r.role = 'owner'",
+    );
+    if let Some(observation_ids) = observation_ids {
+        if observation_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (1..=observation_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" WHERE o.observation_id IN ({placeholders})"));
+    }
+    sql.push_str(" ORDER BY o.observation_id, r.repository_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = match observation_ids {
+        Some(observation_ids) => stmt.query(rusqlite::params_from_iter(observation_ids.iter()))?,
+        None => stmt.query([])?,
+    };
+    let mut projections = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let observation_id = row.get::<_, String>(0)?;
+        let initial_owner = row.get::<_, Option<String>>(1)?;
+        let projected_owner = row.get::<_, Option<String>>(2)?;
+        let entry = projections
+            .entry(observation_id)
+            .or_insert_with(|| (initial_owner, Vec::new()));
+        if let Some(projected_owner) = projected_owner {
+            entry.1.push(projected_owner);
+        }
+    }
+    Ok(projections)
+}
+
+fn verify_owner_projection(
+    expected: &reducer::ReducedObservation,
+    owner_projections: &OwnerProjections,
+) -> Result<()> {
+    let (initial_owner, owner_rows) =
+        owner_projections
+            .get(&expected.observation_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "observation {} owner mismatch: materialized [], replay {:?}",
+                    expected.observation_id,
+                    expected.owner_repository_id
+                )
+            })?;
+    let expected_owner = expected
+        .owner_repository_id
+        .as_ref()
+        .or(initial_owner.as_ref());
+    let owner_matches = match expected_owner {
+        Some(owner_repository_id) => owner_rows.len() == 1 && owner_rows[0] == *owner_repository_id,
+        None => owner_rows.is_empty(),
+    };
+    if !owner_matches {
+        anyhow::bail!(
+            "observation {} owner mismatch: materialized {:?}, replay {:?}",
+            expected.observation_id,
+            owner_rows,
+            expected_owner
+        );
+    }
+    Ok(())
+}
+
+fn load_materialized_row(
+    conn: &Connection,
+    observation_id: &str,
+) -> Result<Option<MaterializedRow>> {
+    Ok(conn
         .query_row(
             "SELECT state, disposition, handled, active_claim_id, task_ids_json,
                     commits_json, verification_receipts_json, latest_verification_status,
                     updated_through_sequence
              FROM observation_review_state WHERE observation_id = ?1",
-            rusqlite::params![expected.observation_id],
+            rusqlite::params![observation_id],
             |r| {
                 Ok((
                     r.get(0)?,
@@ -244,20 +378,50 @@ fn compare_row(conn: &Connection, expected: &reducer::ReducedObservation) -> Res
                 ))
             },
         )
-        .optional()?;
+        .optional()?)
+}
+
+/// Compare one reduced observation against its materialized row. The reducer's
+/// `last_event_sequence == 0` means the observation has no remediation events:
+/// the row must then be absent or the unreviewed migration backfill.
+fn compare_row(
+    conn: &Connection,
+    expected: &reducer::ReducedObservation,
+    owner_projections: &OwnerProjections,
+) -> Result<()> {
+    let row = load_materialized_row(conn, &expected.observation_id)?;
+    verify_owner_projection(expected, owner_projections)?;
 
     if expected.last_event_sequence == 0 {
-        if let Some((state, disposition, handled, ..)) = row
-            && (state != reducer::STATE_UNREVIEWED || disposition.is_some() || handled != 0)
-        {
-            anyhow::bail!(
-                "observation {} has no remediation events but a non-unreviewed state row",
-                expected.observation_id
-            );
-        }
+        verify_eventless_row(&expected.observation_id, row.as_ref())?;
         return Ok(());
     }
 
+    let row = row.ok_or_else(|| {
+        anyhow::anyhow!(
+            "observation {} has remediation events but no materialized state row",
+            expected.observation_id
+        )
+    })?;
+    compare_materialized_fields(expected, row)
+}
+
+fn verify_eventless_row(observation_id: &str, row: Option<&MaterializedRow>) -> Result<()> {
+    if let Some((state, disposition, handled, ..)) = row
+        && (state != reducer::STATE_UNREVIEWED || disposition.is_some() || *handled != 0)
+    {
+        anyhow::bail!(
+            "observation {} has no remediation events but a non-unreviewed state row",
+            observation_id
+        );
+    }
+    Ok(())
+}
+
+fn compare_materialized_fields(
+    expected: &reducer::ReducedObservation,
+    row: MaterializedRow,
+) -> Result<()> {
     let (
         state,
         disposition,
@@ -268,12 +432,7 @@ fn compare_row(conn: &Connection, expected: &reducer::ReducedObservation) -> Res
         receipts_json,
         latest,
         seq,
-    ) = row.ok_or_else(|| {
-        anyhow::anyhow!(
-            "observation {} has remediation events but no materialized state row",
-            expected.observation_id
-        )
-    })?;
+    ) = row;
     if state != expected.state {
         anyhow::bail!(
             "observation {} state mismatch: materialized {state}, replay {}",
@@ -337,6 +496,7 @@ fn compare_row(conn: &Connection, expected: &reducer::ReducedObservation) -> Res
             expected.last_event_sequence
         );
     }
+
     // verified_fixed requires accepted verification evidence (direct check).
     if state == reducer::STATE_VERIFIED_FIXED && latest.as_deref() != Some(VERIFY_ACCEPTED) {
         anyhow::bail!(

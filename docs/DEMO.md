@@ -14,16 +14,21 @@ glyphs in a terminal.
 
 ## The sequence
 
-1. **Agent hits an unrelated bug** — one command, evidence attached:
+1. **Agent hits an unrelated bug** — one command, ownership declared, evidence
+   attached. Reporter location is NOT ownership; the explicit flag picks the
+   lane that should fix this:
 
    ```bash
    snag report "build reports success but produces no artifact" \
      --kind bug \
+     --owner GauravAlbal/snag \
      --observed "command exited 0; dist/app does not exist" \
      --expected "successful build creates dist/app" \
      --repro "run make release in a fresh clone"
    ```
 
+   For a genuinely environmental observation, use `--unowned` instead of
+   `--owner`. The two are mutually exclusive; one is always required.
 2. **Continues its task** — capture is one command; nothing else changes.
 
 3. **Another worktree inspects the store:**
@@ -66,7 +71,7 @@ glyphs in a terminal.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/GauravAlbal/snag/main/install.sh | bash
-cd "$(mktemp -d)" && git init -q && snag report "try me" && snag list && snag verify --full
+cd "$(mktemp -d)" && git init -q && snag report "try me" --unowned && snag list && snag verify --full
 ```
 
 ## The reliability story (not in the demo)

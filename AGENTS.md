@@ -56,13 +56,32 @@ workaround, or tooling failure **outside the current task**, record it with
 Do not broaden the current task to fix the snag unless explicitly asked.
 Do not report ordinary implementation errors or your own transient mistakes.
 
+Every capture MUST declare exactly one fix owner on the report command —
+either `--owner <repo>` (id, alias, path, or `current`) when the owner is
+known, or `--unowned` when the observation is genuinely ambiguous /
+environmental. Reporter location is NOT ownership; guessing `current` to mean
+"my checkout" recreates the misrouting the explicit flag exists to prevent.
+Empty owner and `unowned: false` do not satisfy the requirement; one of the
+two flags is always required. JSON intake (`--json`) uses schema v2 with
+exactly one of `"owner": "..."` or `"unowned": true`.
+
 ```sh
 snag report "<specific symptom>" \
+  --owner <owner/repo> \
   --kind <bug|tooling|papercut|friction|usability|probe|feature> \
   --severity <blocker|major|medium|minor|low> \
   --observed "<what happened>" \
   --expected "<what should have happened>" \
   --repro "<minimal reproduction, when known>"
+```
+
+For genuinely environmental observations:
+
+```sh
+snag report "<specific symptom>" \
+  --unowned \
+  --kind <...> --severity <...> \
+  --observed "<...>" --expected "<...>" --repro "<...>"
 ```
 
 Run `snag doctor` to see where the store lives; `snag verify --full` checks

@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/GauravAlbal/snag/blob/main/schemas/observation-input-v2.schema.json",
+  "title": "Snag observation input, version 2",
+  "description": "A JSON observation document accepted by `snag report --json` (from stdin or a file path). Unknown top-level fields are ignored by the reader (documented compatibility rule), so wrappers may attach their own keys. Only schema_version, title, and exactly one ownership choice are required; owner values must contain a non-whitespace character.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "title"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "title": { "type": "string" },
+    "summary": { "type": "string" },
+    "kind_assertion": { "type": "string" },
+    "severity_assertion": { "type": "string" },
+    "expected_behavior": { "type": "string" },
+    "observed_behavior": { "type": "string" },
+    "reproduction": { "type": "string" },
+    "workaround": { "type": "string" },
+    "impact": { "type": "string" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "sensitivity": { "enum": ["normal", "sensitive", "restricted"] },
+    "labels": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": { "type": "string" } },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "kind": { "type": "string" },
+        "system": { "type": ["string", "null"] },
+        "reporter_id": { "type": ["string", "null"] },
+        "agent_runtime": { "type": ["string", "null"] },
+        "agent_name": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "detector_id": { "type": ["string", "null"] },
+        "detector_version": { "type": ["string", "null"] }
+      }
+    },
+    "context": {
+      "description": "Context overrides, same shapes as the SNAG_CONTEXT_FILE document (see schemas/snag-context-v1.schema.json).",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "repository": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "repository_id": { "type": ["string", "null"] },
+            "checkout_id": { "type": ["string", "null"] },
+            "worktree_id": { "type": ["string", "null"] },
+            "repository_root": { "type": ["string", "null"] },
+            "git_common_dir": { "type": ["string", "null"] },
+            "git_head": { "type": ["string", "null"] },
+            "git_branch": { "type": ["string", "null"] },
+            "git_remote_aliases": { "type": "array", "items": { "type": "string" } },
+            "relative_cwd": { "type": ["string", "null"] }
+          }
+        },
+        "execution": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "cwd": { "type": ["string", "null"] },
+            "workspace_id": { "type": ["string", "null"] },
+            "program_id": { "type": ["string", "null"] },
+            "session_id": { "type": ["string", "null"] },
+            "task_id": { "type": ["string", "null"] },
+            "attempt_id": { "type": ["string", "null"] },
+            "authority_sequence": { "type": ["integer", "null"], "minimum": 0 },
+            "tool_name": { "type": ["string", "null"] },
+            "tool_invocation_id": { "type": ["string", "null"] },
+            "command_shape": { "type": ["string", "null"] }
+          }
+        },
+        "extra": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "idempotency_key": { "type": "string" },
+    "artifacts": {
+      "description": "Local file paths to attach. Files are copied into the content-addressed object store; the originals are never moved or modified.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "affected_repositories": {
+      "description": "Repository ids, local paths, or remote aliases of affected repositories, resolved by the reader.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "owner": {
+      "description": "Non-empty, non-whitespace repository id, alias, path, or `current`.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "unowned": { "const": true }
+  },
+  "oneOf": [
+    { "required": ["owner"], "not": { "required": ["unowned"] } },
+    { "required": ["unowned"], "not": { "required": ["owner"] } }
+  ]
+}

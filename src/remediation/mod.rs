@@ -15,13 +15,18 @@ pub mod reducer;
 pub mod report_check;
 pub mod verify;
 
+#[cfg(snag_internal)]
+#[rustfmt::skip]
+#[path = "../../src_internal/retro.rs"]
+pub mod retro;
+
 use crate::cli::ReviewCommand;
 use crate::error::SnagError;
 use crate::record::RecordPayload;
 use crate::remediation::events::*;
 use crate::remediation::identity::{RemediationIdentity, lease_expiry, resolve_identity, utc_now};
 use crate::remediation::queue::{NextFilters, agent_packet, render_next_text};
-use crate::remediation::reducer::STATE_VERIFIED_FIXED;
+use crate::remediation::reducer::{STATE_VERIFIED_FIXED, WorkStatus};
 use crate::store::Store;
 use crate::types::generate_id;
 use anyhow::Result;
@@ -36,6 +41,9 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::Heartbeat(args) => heartbeat(args),
         ReviewCommand::List(args) => list(args),
         ReviewCommand::Summary(args) => summary(args),
+        #[cfg(snag_internal)]
+        ReviewCommand::Retro(args) => retro::run(args),
+        ReviewCommand::AssignOwner(args) => assign_owner(args),
         ReviewCommand::Disposition(args) => disposition(args),
         ReviewCommand::Reopen(args) => reopen(args),
         ReviewCommand::Relate(args) => relate(args),
@@ -50,6 +58,76 @@ pub fn handle_review(cmd: ReviewCommand) -> Result<()> {
         ReviewCommand::History(args) => history(args),
         ReviewCommand::VerifyReport(args) => verify_report_cmd(args),
     }
+}
+
+/// `snag review assign-owner <observation-id> <repository>` — append an
+/// authoritative ownership transition and refresh its singular projection.
+fn assign_owner(mut args: crate::cli::ReviewAssignOwnerArgs) -> Result<()> {
+    let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
+    let repository = args.repository.trim();
+    if repository.is_empty() {
+        return Err(SnagError::Validation("owner repository must be non-empty".to_string()).into());
+    }
+    let mut store = Store::open_read_write()?;
+    args.observation_id = resolve_observation_id(&store.conn, &args.observation_id)?;
+    let now = utc_now();
+    let repository_path = std::path::Path::new(repository);
+    let owner_git_ctx = if repository == "current" {
+        Some(crate::git::collect_git_context(&std::env::current_dir()?)?)
+    } else if repository_path.exists() {
+        Some(crate::git::collect_git_context(repository_path)?)
+    } else {
+        None
+    };
+    let store_id = store.store_id.clone();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let owner_repository_id = crate::identity::resolve_assignment_repository(
+        &tx,
+        repository,
+        owner_git_ctx.as_ref(),
+        &now,
+    )?;
+    crate::failpoint::failpoint("remediation_before_tx");
+
+    let appended = append_event(
+        &tx,
+        &store_id,
+        RECORD_OWNER_ASSIGNED,
+        &args.observation_id,
+        RecordPayload::Remediation(RemediationEvent::OwnerAssigned(OwnerAssignedPayload {
+            owner_repository_id: owner_repository_id.clone(),
+            reviewer: identity.reviewer,
+            review_session_id: identity.session_id,
+            created_at: now,
+            idempotency_key: args.idempotency_key,
+        })),
+    )?;
+    let reduced = crate::remediation::reducer::reduce_observation(&tx, &args.observation_id)?;
+    let current_owner = reduced.owner_repository_id.as_deref().ok_or_else(|| {
+        SnagError::Validation("owner assignment event did not reduce to an owner".to_string())
+    })?;
+    tx.execute(
+        "DELETE FROM observation_repositories
+         WHERE observation_id = ?1 AND role = 'owner'",
+        rusqlite::params![&args.observation_id],
+    )?;
+    tx.execute(
+        "INSERT INTO observation_repositories
+         (observation_id, repository_id, role)
+         VALUES (?1, ?2, 'owner')",
+        rusqlite::params![&args.observation_id, current_owner],
+    )?;
+    crate::remediation::reducer::upsert_review_state(&tx, &reduced)?;
+    crate::failpoint::failpoint("remediation_before_commit");
+    tx.commit()?;
+    crate::failpoint::failpoint("remediation_after_commit");
+    println!(
+        "Assigned owner {} -> {} (sequence {})",
+        args.observation_id, current_owner, appended.local_sequence
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,59 +1354,105 @@ fn show(mut args: crate::cli::ReviewShowArgs) -> Result<()> {
     if args.format.as_deref() == Some("json") || args.format.as_deref() == Some("agent") {
         println!("{}", serde_json::to_string_pretty(&packet)?);
     } else {
-        // Observation id first, then the state line and the body fields.
-        let o = packet["observation"].clone();
-        println!("{}", args.observation_id);
-        println!(
-            "title: {}  severity: {}  kind: {}",
-            o["title"].as_str().unwrap_or(""),
-            o["severity_assertion"].as_str().unwrap_or("-"),
-            o["kind_assertion"].as_str().unwrap_or("-")
-        );
-        println!(
-            "state: {}  disposition: {}  handled: {}",
-            packet["current_state"]["remediation_status"]
-                .as_str()
-                .unwrap_or(""),
-            packet["current_state"]["disposition"]
-                .as_str()
-                .unwrap_or("-"),
-            packet["current_state"]["handled"]
-        );
-        if let Some(claim) = packet["current_state"]["active_claim"].as_object() {
-            println!(
-                "claim: {} by {} (session {}) until {}",
-                claim["claim_id"].as_str().unwrap_or("?"),
-                claim["claimed_by"].as_str().unwrap_or("?"),
-                claim["claim_session_id"].as_str().unwrap_or("?"),
-                claim["lease_expires_at"].as_str().unwrap_or("?")
-            );
-        }
-        if let Some(eb) = o["expected_behavior"].as_str() {
-            println!("expected: {eb}");
-        }
-        if let Some(ob) = o["observed_behavior"].as_str() {
-            println!("observed: {ob}");
-        }
-        if let Some(r) = o["reproduction"].as_str() {
-            println!("repro: {r}");
-        }
-        if packet["body_gap"].as_bool() == Some(true) {
-            println!("warning: thin body (severity above minor, no expected/observed/repro)");
-        }
-        let lineage = &packet["lineage"];
-        println!(
-            "lineage: finding={} tasks={} commits={} receipts={}",
-            lineage["finding_id"].as_str().unwrap_or("-"),
-            lineage["task_ids"].as_array().map(|v| v.len()).unwrap_or(0),
-            lineage["commits"].as_array().map(|v| v.len()).unwrap_or(0),
-            lineage["verification_receipts"]
-                .as_array()
-                .map(|v| v.len())
-                .unwrap_or(0)
-        );
+        render_show_text(&args.observation_id, &packet);
     }
     Ok(())
+}
+
+fn render_show_text(observation_id: &str, packet: &serde_json::Value) {
+    // Observation id first, then the state line and the body fields.
+    let observation = &packet["observation"];
+    println!("{}", terminal_safe(observation_id));
+    println!(
+        "title: {}  severity: {}  kind: {}",
+        terminal_safe(observation["title"].as_str().unwrap_or("")),
+        terminal_safe(observation["severity_assertion"].as_str().unwrap_or("-")),
+        terminal_safe(observation["kind_assertion"].as_str().unwrap_or("-"))
+    );
+    println!(
+        "state: {}  disposition: {}  handled: {}",
+        terminal_safe(
+            packet["current_state"]["remediation_status"]
+                .as_str()
+                .unwrap_or("")
+        ),
+        terminal_safe(
+            packet["current_state"]["disposition"]
+                .as_str()
+                .unwrap_or("-")
+        ),
+        packet["current_state"]["handled"]
+    );
+    render_work_status(packet);
+    if let Some(owner) = packet["current_state"]["owner_repository_id"].as_str() {
+        println!("owner: {}", terminal_safe(owner));
+    }
+    if let Some(claim) = packet["current_state"]["active_claim"].as_object() {
+        println!(
+            "claim: {} by {} (session {}) until {}",
+            terminal_safe(claim["claim_id"].as_str().unwrap_or("?")),
+            terminal_safe(claim["claimed_by"].as_str().unwrap_or("?")),
+            terminal_safe(claim["claim_session_id"].as_str().unwrap_or("?")),
+            terminal_safe(claim["lease_expires_at"].as_str().unwrap_or("?"))
+        );
+    }
+    if let Some(expected) = observation["expected_behavior"].as_str() {
+        println!("expected: {}", terminal_safe(expected));
+    }
+    if let Some(observed) = observation["observed_behavior"].as_str() {
+        println!("observed: {}", terminal_safe(observed));
+    }
+    if let Some(reproduction) = observation["reproduction"].as_str() {
+        println!("repro: {}", terminal_safe(reproduction));
+    }
+    if packet["body_gap"].as_bool() == Some(true) {
+        println!("warning: thin body (severity above minor, no expected/observed/repro)");
+    }
+    let lineage = &packet["lineage"];
+    println!(
+        "lineage: finding={} tasks={} commits={} receipts={}",
+        terminal_safe(lineage["finding_id"].as_str().unwrap_or("-")),
+        lineage["task_ids"].as_array().map(|v| v.len()).unwrap_or(0),
+        lineage["commits"].as_array().map(|v| v.len()).unwrap_or(0),
+        lineage["verification_receipts"]
+            .as_array()
+            .map(|v| v.len())
+            .unwrap_or(0)
+    );
+}
+fn render_work_status(packet: &serde_json::Value) {
+    // Canonical current-state line: the one-call agent read answers
+    // "what is the work status and why" without re-deriving it.
+    let work_status = packet["current_state"]["work_status"]
+        .as_str()
+        .unwrap_or("actionable");
+    let reopened = packet["current_state"]["reopened"].as_bool() == Some(true);
+    let redirect = packet["current_state"]["redirect_observation_id"].as_str();
+    let has_claim = packet["current_state"]["active_claim"].is_object();
+    let lineage = &packet["lineage"];
+    let task_n = lineage["task_ids"].as_array().map(|v| v.len()).unwrap_or(0);
+    let commit_n = lineage["commits"].as_array().map(|v| v.len()).unwrap_or(0);
+    let verification = packet["current_state"]["verification"]
+        .as_str()
+        .unwrap_or("none");
+    println!("work: {}", terminal_safe(work_status));
+    match work_status {
+        "terminal" => {
+            if let Some(redirect) = redirect {
+                println!("  → {}", terminal_safe(redirect));
+            } else {
+                println!("  no redirect");
+            }
+        }
+        "resolved" => {
+            println!(
+                "  fixes {commit_n}; tasks {task_n}; verification {}",
+                terminal_safe(verification)
+            )
+        }
+        "active" => println!("  claim {has_claim}; tasks {task_n}; fixes {commit_n}"),
+        _ => println!("  reopened {reopened}; no active claim/task/fix"),
+    }
 }
 
 /// `snag review history <observation-id> [--format json]` — every remediation
@@ -1435,52 +1559,146 @@ pub fn resolve_observation_id(conn: &rusqlite::Connection, input: &str) -> Resul
 // ---------------------------------------------------------------------------
 // Queue retrieval.
 // ---------------------------------------------------------------------------
-fn resolve_repo_filter(store: &mut Store, repo: Option<&str>) -> Result<Option<String>> {
+
+/// Resolve a repository filter without materializing identity state.
+///
+/// Read commands must never create repositories, aliases, checkouts, or
+/// worktrees. Exact canonical ids win; `current` then checks the existing
+/// checkout binding before consulting confirmed remote aliases.
+fn resolve_repo_filter_read(
+    conn: &rusqlite::Connection,
+    repo: Option<&str>,
+) -> Result<Option<String>> {
     let Some(repo) = repo else { return Ok(None) };
-    if repo == "current" {
-        let git_ctx = crate::git::collect_git_context(&std::env::current_dir()?)?;
-        let res = crate::identity::resolve_repository(store, &git_ctx, None)?;
-        if res.repository_id.is_empty() {
-            anyhow::bail!("--repo current resolved no repository (not a git worktree?)");
+
+    if repo != "current" {
+        let exact: Option<String> = conn
+            .query_row(
+                "SELECT repository_id FROM repositories WHERE repository_id = ?1",
+                rusqlite::params![repo],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = exact {
+            return Ok(Some(id));
         }
-        return Ok(Some(res.repository_id));
-    }
-    // id-or-alias resolution: exact id first, then confirmed aliases.
-    let by_id: Option<String> = store
-        .conn
-        .query_row(
-            "SELECT repository_id FROM repositories WHERE repository_id = ?1",
-            rusqlite::params![repo],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(id) = by_id {
-        return Ok(Some(id));
-    }
-    let by_alias: Option<String> = store
-        .conn
-        .query_row(
+
+        let mut stmt = conn.prepare(
             "SELECT repository_id FROM repository_aliases
              WHERE alias = ?1 AND confirmed = 1
-             GROUP BY repository_id HAVING COUNT(*) = 1
-             ORDER BY repository_id LIMIT 1",
-            rusqlite::params![crate::git::normalize_remote_alias(repo)],
+             ORDER BY repository_id",
+        )?;
+        let candidates = stmt
+            .query_map(
+                rusqlite::params![crate::git::normalize_remote_alias(repo)],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        return match candidates.as_slice() {
+            [] => anyhow::bail!(SnagError::RepositoryNotFound(repo.to_string())),
+            [id] => Ok(Some(id.clone())),
+            _ => anyhow::bail!(SnagError::RepositoryAmbiguous(format!(
+                "alias {repo:?} matches multiple repositories: {candidates:?}"
+            ))),
+        };
+    }
+
+    let git_ctx = crate::git::collect_git_context(&std::env::current_dir()?)?;
+    let git_common_dir = git_ctx.git_common_dir.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(SnagError::RepositoryNotFound(
+            "current checkout".to_string()
+        ))
+    })?;
+    let checkout_owner: Option<String> = conn
+        .query_row(
+            "SELECT repository_id FROM checkouts WHERE git_common_dir = ?1",
+            rusqlite::params![git_common_dir],
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(id) = by_alias {
+    if let Some(id) = checkout_owner {
         return Ok(Some(id));
     }
-    anyhow::bail!(SnagError::RepositoryNotFound(repo.to_string()));
+
+    let mut candidates = std::collections::BTreeSet::new();
+    for alias in &git_ctx.git_remote_aliases {
+        let mut stmt = conn.prepare(
+            "SELECT repository_id FROM repository_aliases
+             WHERE alias = ?1 AND confirmed = 1
+             ORDER BY repository_id",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![crate::git::normalize_remote_alias(alias)],
+            |row| row.get::<_, String>(0),
+        )?;
+        for candidate in rows {
+            candidates.insert(candidate?);
+        }
+    }
+    match candidates.into_iter().collect::<Vec<_>>().as_slice() {
+        [id] => Ok(Some(id.clone())),
+        [] => anyhow::bail!(SnagError::RepositoryNotFound(
+            "current checkout".to_string()
+        )),
+        candidates => anyhow::bail!(SnagError::RepositoryAmbiguous(format!(
+            "aliases {:?} match multiple repositories: {candidates:?}",
+            git_ctx.git_remote_aliases
+        ))),
+    }
+}
+
+fn render_empty_queue(
+    format: Option<&str>,
+    store_id: Option<&str>,
+    db_path: &std::path::Path,
+    observation_count: i64,
+) -> Result<()> {
+    if format == Some("agent") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "queue": "empty",
+                "store": {
+                    "store_id": store_id,
+                    "db_path": db_path.display().to_string(),
+                    "observations": observation_count,
+                },
+                "message": "no unhandled observations match the filters",
+            }))?
+        );
+    } else {
+        println!("empty queue: no unhandled observations match the filters");
+        println!(
+            "store: {} ({observation_count} observations)",
+            db_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// `snag review next [filters] [--format agent] [--claim]`
 fn next(args: crate::cli::ReviewNextArgs) -> Result<()> {
     let identity = resolve_identity(args.reviewer.as_deref(), args.session_id.as_deref());
-    let mut store = Store::open_read_write()?;
+    if !args.claim {
+        let (_, db_path) = Store::paths()?;
+        if !db_path.exists() {
+            render_empty_queue(args.format.as_deref(), None, &db_path, 0)?;
+            return Ok(());
+        }
+    }
+    let mut store = if args.claim {
+        Store::open_read_write()?
+    } else {
+        Store::open_read_only()?
+    };
     let now = utc_now();
     let store_id = store.store_id.clone();
-    let repository_id = resolve_repo_filter(&mut store, args.repo.as_deref())?;
+    let repository_id = resolve_repo_filter_read(&store.conn, args.repo.as_deref())?;
+    let work_status_ids = args
+        .work_status
+        .map(|ws| crate::remediation::reducer::work_status_matching_ids(&store.conn, ws.0))
+        .transpose()?;
     let filters = NextFilters {
         repository_id,
         kind: args.kind,
@@ -1489,11 +1707,15 @@ fn next(args: crate::cli::ReviewNextArgs) -> Result<()> {
         include_deferred: args.include_deferred,
         my_session: identity.session_id.clone(),
         now: now.clone(),
+        work_status_ids,
     };
-
-    let tx = store
-        .conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = if args.claim {
+        store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+    } else {
+        store.conn.transaction()?
+    };
     let selected = queue::select_next(&tx, &filters)?;
 
     let Some(observation_id) = selected else {
@@ -1503,27 +1725,12 @@ fn next(args: crate::cli::ReviewNextArgs) -> Result<()> {
         let observation_count: i64 = tx
             .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
             .unwrap_or(0);
-        if args.format.as_deref() == Some("agent") {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "schema_version": 1,
-                    "queue": "empty",
-                    "store": {
-                        "store_id": store.store_id,
-                        "db_path": store.db_path.display().to_string(),
-                        "observations": observation_count,
-                    },
-                    "message": "no unhandled observations match the filters",
-                }))?
-            );
-        } else {
-            println!("empty queue: no unhandled observations match the filters");
-            println!(
-                "store: {} ({observation_count} observations)",
-                store.db_path.display()
-            );
-        }
+        render_empty_queue(
+            args.format.as_deref(),
+            Some(&store.store_id),
+            &store.db_path,
+            observation_count,
+        )?;
         tx.commit()?;
         return Ok(());
     };
@@ -1583,7 +1790,12 @@ fn push_list_scope_clauses(
 ) {
     if let Some(rid) = repository_id {
         sql.push_str(
-            " AND EXISTS (SELECT 1 FROM observation_repositories or2 WHERE or2.observation_id = o.observation_id AND or2.repository_id = ?)",
+            " AND EXISTS (
+                SELECT 1 FROM observation_repositories owner_r
+                WHERE owner_r.observation_id = o.observation_id
+                  AND owner_r.repository_id = ?
+                  AND owner_r.role = 'owner'
+            )",
         );
         params.push(Box::new(rid.to_string()));
     }
@@ -1640,19 +1852,16 @@ fn push_list_handled_clauses(sql: &mut String, args: &crate::cli::ReviewListArgs
 
 /// `snag review list [filters] [--limit N] [--offset N] [--format json]`
 fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
-    // --repo resolution may record checkout bindings for `current`, so a repo
-    // filter needs the write connection (same as `next`).
-    let mut store = if args.repo.is_some() {
-        Store::open_read_write()?
-    } else {
-        Store::open_read_only()?
-    };
-    let repository_id = resolve_repo_filter(&mut store, args.repo.as_deref())?;
+    let store = Store::open_read_only()?;
+    let repository_id = resolve_repo_filter_read(&store.conn, args.repo.as_deref())?;
     let mut sql = String::from(
         "SELECT o.observation_id, o.title, o.severity_assertion, o.kind_assertion,
                 COALESCE(rs.state, 'unreviewed') AS state,
                 rs.disposition, COALESCE(rs.handled, 0) AS handled, rs.active_claim_id,
-                c.claim_session_id, c.claimed_by
+                c.claim_session_id, c.claimed_by,
+                (SELECT owner_r.repository_id FROM observation_repositories owner_r
+                 WHERE owner_r.observation_id = o.observation_id AND owner_r.role = 'owner')
+                 AS owner_repository_id
          FROM observations o
          LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
          LEFT JOIN remediation_claims c ON c.claim_id = rs.active_claim_id
@@ -1662,6 +1871,20 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
     push_list_scope_clauses(&mut sql, &mut params, repository_id.as_deref(), &args);
     push_list_state_clauses(&mut sql, &mut params, &args);
     push_list_handled_clauses(&mut sql, &args);
+    // Canonical work-status filter: ids derived by the reducer, injected as
+    // a json_each IN-clause — the filter runs against the canonical
+    // derivation, never a parallel SQL re-implementation.
+    let reduced = if args.format.as_deref() == Some("json") {
+        Some(crate::remediation::reducer::replay_all(&store.conn)?)
+    } else {
+        None
+    };
+    if let Some(ws) = args.work_status {
+        let ids = crate::remediation::reducer::work_status_matching_ids(&store.conn, ws.0)?;
+        let ids_json = serde_json::to_string(&ids)?;
+        sql.push_str(" AND o.observation_id IN (SELECT value FROM json_each(?))");
+        params.push(Box::new(ids_json));
+    }
     sql.push_str(" ORDER BY o.captured_at ASC, o.local_sequence ASC");
     if args.limit > 0 {
         sql.push_str(" LIMIT ? OFFSET ?");
@@ -1683,11 +1906,32 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
         ))
     })?;
     let mut out = Vec::new();
+    // Canonical current-state per row comes from the reducer (single stream
+    // pass, computed above), never a parallel SQL derivation — the parity
+    // invariant: every read surface answers "what is current" identically.
     for r in rows {
-        let (id, title, sev, kind, state, disp, handled, claim, claim_session, claimed_by) = r?;
+        let (id, title, sev, kind, state, disp, handled, claim, claim_session, claimed_by, owner) =
+            r?;
+        let reduced_row = reduced.as_ref().and_then(|m| m.get(&id));
+        let work_status = reduced_row
+            .map(|r| r.work_status.as_str())
+            .unwrap_or(WorkStatus::Actionable.as_str());
+        let reopened = reduced_row.map(|r| r.reopened).unwrap_or(false);
+        let redirect = reduced_row.and_then(|r| r.disposition_target.clone());
+        let task_ids = reduced_row.map(|r| r.task_ids.clone()).unwrap_or_default();
+        let commits: Vec<String> = reduced_row
+            .map(|r| {
+                r.commits
+                    .iter()
+                    .map(|c| c.commit_sha.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let verification = reduced_row.and_then(|r| r.latest_verification_status.clone());
         if args.format.as_deref() == Some("json") {
             out.push(serde_json::json!({
                 "observation_id": id,
@@ -1696,20 +1940,28 @@ fn list(args: crate::cli::ReviewListArgs) -> Result<()> {
                 "kind": kind,
                 "state": state,
                 "disposition": disp,
+                "work_status": work_status,
+                "reopened": reopened,
+                "redirect_observation_id": redirect,
                 "handled": handled == 1,
                 "active_claim_id": claim,
                 "active_claim_session_id": claim_session,
                 "active_claim_claimed_by": claimed_by,
+                "owner_repository_id": owner,
+                "task_ids": task_ids,
+                "commits": commits,
+                "verification": verification,
             }));
         } else {
             // Observation ids first: they became the cross-session language.
-            println!("{}  {}", id, title);
+            println!("{}  {}", terminal_safe(&id), terminal_safe(&title));
             println!(
-                "  state: {}  disposition: {}  severity: {}  handled: {}",
-                state,
-                disp.as_deref().unwrap_or("-"),
-                sev.as_deref().unwrap_or("-"),
-                handled == 1
+                "  state: {}  disposition: {}  severity: {}  handled: {}  owner: {}",
+                terminal_safe(&state),
+                terminal_safe(disp.as_deref().unwrap_or("-")),
+                terminal_safe(sev.as_deref().unwrap_or("-")),
+                handled == 1,
+                terminal_safe(owner.as_deref().unwrap_or("-")),
             );
         }
     }
@@ -1734,9 +1986,9 @@ const MATERIALITY_WEIGHTS: &[(&str, f64)] = &[
     (crate::parser::SEV_LOW, 0.5),
 ];
 
-/// In-flight states excluded from threshold counts: someone already attached a
-/// commit or a task, so dispatching a fresh agent on that obs is wasteful.
-/// (Still shown in `open`.)
+/// In-flight states excluded from threshold counts: someone has an active
+/// claim, attached commit, or attached task, so dispatching a fresh agent on
+/// that obs is wasteful. (Still shown in `open`.)
 const INFLIGHT_STATES: &[&str] = &[
     crate::remediation::reducer::STATE_CANDIDATE_FIX,
     crate::remediation::reducer::STATE_REMEDIATION_IN_PROGRESS,
@@ -1759,12 +2011,37 @@ fn push_lane_aggregate_columns(sql: &mut String) {
          COALESCE(SUM(CASE WHEN o.severity_assertion = 'medium' THEN 1 ELSE 0 END), 0) AS sev_medium,
          COALESCE(SUM(CASE WHEN o.severity_assertion = 'minor' THEN 1 ELSE 0 END), 0) AS sev_minor,
          COALESCE(SUM(CASE WHEN o.severity_assertion = 'low' THEN 1 ELSE 0 END), 0) AS sev_low,
-         COALESCE(SUM(CASE WHEN o.severity_assertion = 'blocker' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_blocker,
-         COALESCE(SUM(CASE WHEN o.severity_assertion = 'major' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_major,
-         COALESCE(SUM(CASE WHEN o.severity_assertion = 'medium' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_medium,
-         COALESCE(SUM(CASE WHEN o.severity_assertion = 'minor' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_minor,
-         COALESCE(SUM(CASE WHEN o.severity_assertion = 'low' AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight}) THEN 1 ELSE 0 END), 0) AS act_low,
-         COALESCE(SUM(CASE WHEN COALESCE(rs.state, 'unreviewed') = 'unreviewed' THEN 1 ELSE 0 END), 0) AS unreviewed,
+         COALESCE(SUM(CASE WHEN o.severity_assertion IS NULL
+                                OR o.severity_assertion NOT IN ('blocker', 'major', 'medium', 'minor', 'low')
+                           THEN 1 ELSE 0 END), 0) AS sev_unknown,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'blocker'
+                                AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight})
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS act_blocker,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'major'
+                                AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight})
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS act_major,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'medium'
+                                AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight})
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS act_medium,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'minor'
+                                AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight})
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS act_minor,
+         COALESCE(SUM(CASE WHEN o.severity_assertion = 'low'
+                                AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight})
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS act_low,
+         COALESCE(SUM(CASE WHEN (o.severity_assertion IS NULL
+                                  OR o.severity_assertion NOT IN ('blocker', 'major', 'medium', 'minor', 'low'))
+                                AND COALESCE(rs.state, 'unreviewed') NOT IN ({inflight})
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS act_unknown,
+         COALESCE(SUM(CASE WHEN COALESCE(rs.state, 'unreviewed') = 'unreviewed'
+                                AND ac.observation_id IS NULL
+                           THEN 1 ELSE 0 END), 0) AS unreviewed,
          MIN(o.captured_at) AS oldest_open",
         )
     );
@@ -1774,11 +2051,16 @@ fn push_lane_aggregate_columns(sql: &mut String) {
 struct LaneAggregate {
     repo_id: Option<String>,
     display: String,
+    /// How the human label relates to repository identities.
+    identity_status: String,
+    /// Number of repository ids represented by the selected label, including
+    /// this explicit id when it has no alias row of its own.
+    label_repository_count: i64,
     open_count: i64,
-    /// Open severity counts, indexed by SEVERITIES order.
-    severity_counts: [i64; 5],
-    /// Actionable severity counts (open, not in-flight), SEVERITIES order.
-    actionable_counts: [i64; 5],
+    /// Open severity counts, indexed by SEVERITIES order plus unknown.
+    severity_counts: [i64; 6],
+    /// Actionable severity counts (open, not in-flight), SEVERITIES order plus unknown.
+    actionable_counts: [i64; 6],
     unreviewed: i64,
     oldest_open: Option<String>,
     materiality: f64,
@@ -1789,7 +2071,7 @@ impl LaneAggregate {
         crate::parser::SEVERITIES
             .iter()
             .position(|s| *s == sev)
-            .unwrap_or(4)
+            .unwrap_or(5)
     }
 
     fn crossed(&self, thresholds: &[(String, i64)]) -> bool {
@@ -1798,6 +2080,13 @@ impl LaneAggregate {
             self.actionable_counts[idx] >= *count
         })
     }
+    fn actionable(&self) -> i64 {
+        self.actionable_counts.iter().sum()
+    }
+
+    fn in_flight(&self) -> i64 {
+        self.open_count - self.actionable()
+    }
 }
 
 fn read_lane_row(
@@ -1805,33 +2094,44 @@ fn read_lane_row(
     repo_id: Option<String>,
     display: String,
 ) -> rusqlite::Result<LaneAggregate> {
-    let sev: [i64; 5] = [
+    let sev: [i64; 6] = [
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
-    ];
-    let act: [i64; 5] = [
         row.get(7)?,
+    ];
+    let act: [i64; 6] = [
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
     ];
     let materiality = MATERIALITY_WEIGHTS
         .iter()
         .zip(act.iter())
         .map(|((_, w), n)| w * (*n as f64))
         .sum();
+    let identity_status = match repo_id.as_deref() {
+        Some(id) if id.starts_with("repo_") => "id-only",
+        Some(_) => "explicit-id",
+        None => "unowned",
+    }
+    .to_string();
+    let label_repository_count = i64::from(repo_id.is_some());
     Ok(LaneAggregate {
         repo_id,
         display,
+        identity_status,
+        label_repository_count,
         open_count: row.get(1)?,
         severity_counts: sev,
         actionable_counts: act,
-        unreviewed: row.get(12)?,
-        oldest_open: row.get(13)?,
+        unreviewed: row.get(14)?,
+        oldest_open: row.get(15)?,
         materiality,
     })
 }
@@ -1864,57 +2164,82 @@ fn parse_thresholds(raw: &[String]) -> Result<Vec<(String, i64)>> {
     Ok(thresholds)
 }
 
-/// Query per-repo lanes (fix owner when set, else filing reporter), open (not
-/// handled) obs only. Optional `repository_id` narrows to one lane.
+/// Query fix-owner lanes, open (not handled) observations only. A filing
+/// reporter never defines a lane. Optional `repository_id` narrows to one
+/// owner lane.
 fn query_repo_lanes(
     conn: &rusqlite::Connection,
     repository_id: Option<&str>,
 ) -> Result<Vec<LaneAggregate>> {
-    let mut sql = String::from(
-        "SELECT COALESCE(owner_r.repository_id, reporter_r.repository_id) AS lane_id, ",
-    );
+    let mut sql = String::from("SELECT owner_r.repository_id AS lane_id, ");
     push_lane_aggregate_columns(&mut sql);
     sql.push_str(
         " FROM observations o
-         LEFT JOIN observation_repositories owner_r
+         JOIN observation_repositories owner_r
            ON owner_r.observation_id = o.observation_id AND owner_r.role = 'owner'
-         LEFT JOIN observation_repositories reporter_r
-           ON reporter_r.observation_id = o.observation_id AND reporter_r.role = 'reporter'
          LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         LEFT JOIN (SELECT DISTINCT observation_id FROM active_claims) ac
+           ON ac.observation_id = o.observation_id
          WHERE COALESCE(rs.handled, 0) = 0
-           AND (owner_r.repository_id IS NOT NULL OR reporter_r.repository_id IS NOT NULL)",
+           AND NOT EXISTS (
+               SELECT 1 FROM records retracted
+               WHERE retracted.entity_id = o.observation_id
+                 AND retracted.record_type = 'observation_retracted'
+           )",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(rid) = repository_id {
-        sql.push_str(" AND COALESCE(owner_r.repository_id, reporter_r.repository_id) = ?");
+        sql.push_str(" AND owner_r.repository_id = ?");
         params.push(Box::new(rid.to_string()));
     }
-    sql.push_str(" GROUP BY COALESCE(owner_r.repository_id, reporter_r.repository_id)");
+    sql.push_str(" GROUP BY owner_r.repository_id");
 
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let lanes = stmt
+    let mut lanes = stmt
         .query_map(param_refs.as_slice(), |row| {
             let rid: String = row.get(0)?;
-            let display = display_name(conn, &rid);
-            read_lane_row(row, Some(rid), display)
+            read_lane_row(row, Some(rid), String::new())
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let repo_ids: Vec<String> = lanes
+        .iter()
+        .filter_map(|lane| lane.repo_id.clone())
+        .collect();
+    let display_names = bulk_display_names(conn, &repo_ids)?;
+    for lane in &mut lanes {
+        if let Some(repo_id) = lane.repo_id.as_deref() {
+            lane.display = display_names
+                .get(repo_id)
+                .cloned()
+                .unwrap_or_else(|| abbreviated_repo_id(repo_id));
+            apply_identity_evidence(conn, lane);
+        }
+    }
     Ok(lanes)
 }
 
-/// Query the unowned bucket (open obs with neither a fix owner nor a filing
-/// reporter); None when empty.
+/// Query the unowned bucket (open observations without a fix owner), including
+/// observations that have a filing reporter; None when empty.
 fn query_unowned_lane(conn: &rusqlite::Connection) -> Result<Option<LaneAggregate>> {
     let mut usql = String::from("SELECT NULL, ");
     push_lane_aggregate_columns(&mut usql);
     usql.push_str(
         " FROM observations o
          LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
+         LEFT JOIN (SELECT DISTINCT observation_id FROM active_claims) ac
+           ON ac.observation_id = o.observation_id
          WHERE COALESCE(rs.handled, 0) = 0
            AND NOT EXISTS (
+               SELECT 1 FROM records retracted
+               WHERE retracted.entity_id = o.observation_id
+                 AND retracted.record_type = 'observation_retracted'
+           )
+           AND NOT EXISTS (
                SELECT 1 FROM observation_repositories r
-               WHERE r.observation_id = o.observation_id AND r.role IN ('owner', 'reporter')
+               WHERE r.observation_id = o.observation_id AND r.role = 'owner'
            )",
     );
     let mut ustmt = conn.prepare(&usql)?;
@@ -1950,14 +2275,15 @@ fn summary_exit_code(
     }
 }
 
-/// Severity-count map in SEVERITIES order, as a JSON object.
-fn severity_counts_json(counts: &[i64; 5]) -> serde_json::Value {
+/// Severity-count map in SEVERITIES order plus an additive unknown bucket.
+fn severity_counts_json(counts: &[i64; 6]) -> serde_json::Value {
     serde_json::json!({
         "blocker": counts[0],
         "major": counts[1],
         "medium": counts[2],
         "minor": counts[3],
         "low": counts[4],
+        "unknown": counts[5],
     })
 }
 
@@ -1966,15 +2292,26 @@ fn render_summary_json(
     unowned: &Option<LaneAggregate>,
     thresholds: &[(String, i64)],
     exit_code: i32,
+    limit: usize,
 ) -> Result<()> {
-    let repos_json: Vec<serde_json::Value> = lanes
+    let visible = lanes
         .iter()
+        .take(if limit > 0 { limit } else { lanes.len() });
+    let repos_json: Vec<serde_json::Value> = visible
         .map(|l| {
             serde_json::json!({
                 "repo_id": l.repo_id,
                 "display": l.display,
+                "identity": {
+                    "status": l.identity_status,
+                    "label_repository_count": l.label_repository_count,
+                    "ambiguous_label": l.identity_status == "ambiguous-label",
+                },
                 "open": l.open_count,
                 "severity_counts": severity_counts_json(&l.severity_counts),
+                "actionable": l.actionable(),
+                "actionable_severity_counts": severity_counts_json(&l.actionable_counts),
+                "in_flight": l.in_flight(),
                 "unreviewed": l.unreviewed,
                 "oldest_open": l.oldest_open,
                 "materiality": l.materiality,
@@ -1995,6 +2332,9 @@ fn render_summary_json(
         envelope["unowned"] = serde_json::json!({
             "open": u.open_count,
             "severity_counts": severity_counts_json(&u.severity_counts),
+            "actionable": u.actionable(),
+            "actionable_severity_counts": severity_counts_json(&u.actionable_counts),
+            "in_flight": u.in_flight(),
             "unreviewed": u.unreviewed,
             "oldest_open": u.oldest_open,
             "materiality": u.materiality,
@@ -2015,6 +2355,30 @@ fn verdict_label(crossed: bool, thresholds_empty: bool) -> String {
     }
 }
 
+/// Render text for a terminal without allowing stored values to control it.
+///
+/// Human output is the only place this is applied: callers keep the original
+/// string for persistence and JSON. Escaping every control character (rather
+/// than trying to parse terminal grammars) also neutralizes OSC, ANSI, and C1
+/// sequences, since their introducers cannot reach the terminal.
+pub(crate) fn terminal_safe(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| {
+            let code = ch as u32;
+            let bidi = matches!(
+                code,
+                0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+            );
+            if ch.is_control() || bidi || matches!(ch, '\u{2028}' | '\u{2029}') {
+                format!("\\u{{{code:04x}}}").chars().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
+}
+
 /// Column alignment for [`render_table`].
 #[derive(Clone, Copy)]
 pub(crate) enum TableAlign {
@@ -2023,25 +2387,23 @@ pub(crate) enum TableAlign {
 }
 
 /// Measured-width text table. Each column's width is the max of the header
-/// and every row cell (computed from the ACTUAL data, never hardcoded), and
-/// the header is generated through the same format machinery as the rows —
-/// so alignment can never drift from content. Cells are the caller's
-/// responsibility (already formatted strings); `align` is per column.
-///
-/// This is the single table renderer for the CLI: any future table routes
-/// through it instead of hand-padded `println!` format strings, which
-/// silently misalign the moment a cell exceeds a fixed width (e.g. a long
-/// lane name or a full RFC3339 timestamp).
+/// and every row cell (computed from the sanitized data, never hardcoded).
 pub(crate) fn render_table(headers: &[&str], align: &[TableAlign], rows: &[Vec<String>]) {
     debug_assert_eq!(headers.len(), align.len());
     let col_count = headers.len();
+    let safe_headers: Vec<String> = headers.iter().map(|h| terminal_safe(h)).collect();
+    let safe_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| terminal_safe(cell)).collect())
+        .collect();
     let widths: Vec<usize> = (0..col_count)
         .map(|c| {
-            headers[c]
+            safe_headers[c]
                 .chars()
                 .count()
                 .max(
-                    rows.iter()
+                    safe_rows
+                        .iter()
                         .map(|r| r.get(c).map(|s| s.chars().count()).unwrap_or(0))
                         .max()
                         .unwrap_or(0),
@@ -2063,38 +2425,119 @@ pub(crate) fn render_table(headers: &[&str], align: &[TableAlign], rows: &[Vec<S
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let header: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
-    println!("{}", line(&header));
-    for row in rows {
+    println!("{}", line(&safe_headers));
+    for row in &safe_rows {
         println!("{}", line(row));
     }
 }
 
-/// Display name for a lane: the most-confirmed alias when one exists, else
-/// the opaque id abbreviated (repo_01kz…bpr0k) so the table stays narrow —
-/// the full id is always available in the JSON envelope.
-fn display_name(conn: &rusqlite::Connection, repo_id: &str) -> String {
-    // Most-recently-seen alias wins: record_aliases bumps last_seen_at on
-    // re-seen aliases, so a fleet rename (owner org change) makes the new
-    // org's alias the live display after the first post-rename filing — the
-    // old handle (e.g. a pre-rename org) stops winning the tie.
-    let alias = conn
-        .query_row(
-            "SELECT alias FROM repository_aliases WHERE repository_id = ?1
-             ORDER BY last_seen_at DESC, alias DESC LIMIT 1",
-            rusqlite::params![repo_id],
-            |r| r.get::<_, String>(0),
-        )
-        .ok();
-    match alias {
-        Some(a) => a,
-        None if repo_id.len() > 16 => {
-            let head = &repo_id[..12];
-            let tail = &repo_id[repo_id.len() - 4..];
-            format!("{head}…{tail}")
+/// Resolve all displayed owner names in one query. Confirmed aliases observed
+/// on a checkout bound to the same canonical repository win; otherwise the
+/// most recently seen confirmed alias wins. Explicit ids remain readable ids.
+fn bulk_display_names(
+    conn: &rusqlite::Connection,
+    repo_ids: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut names = std::collections::HashMap::new();
+    let generated_ids: Vec<String> = repo_ids
+        .iter()
+        .filter(|id| id.starts_with("repo_"))
+        .cloned()
+        .collect();
+    for repo_id in repo_ids {
+        if !repo_id.starts_with("repo_") {
+            names.insert(repo_id.clone(), repo_id.clone());
         }
-        None => repo_id.to_string(),
     }
+    if generated_ids.is_empty() {
+        return Ok(names);
+    }
+
+    let placeholders = (0..generated_ids.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH observed_aliases AS (
+             SELECT DISTINCT c.repository_id, context_alias.value AS alias
+             FROM observations o
+             JOIN checkouts c
+               ON c.checkout_id =
+                  json_extract(o.context_json, '$.repository.checkout_id')
+             JOIN json_each(
+                  json_extract(o.context_json, '$.repository.git_remote_aliases')
+             ) context_alias
+         )
+         SELECT ra.repository_id, ra.alias
+         FROM repository_aliases ra
+         LEFT JOIN observed_aliases oa
+           ON oa.repository_id = ra.repository_id AND oa.alias = ra.alias
+         WHERE ra.confirmed = 1
+           AND ra.repository_id IN ({placeholders})
+         ORDER BY ra.repository_id,
+                  CASE WHEN oa.repository_id IS NOT NULL THEN 1 ELSE 0 END DESC,
+                  ra.last_seen_at DESC, ra.alias DESC"
+    );
+    let params: Vec<Box<dyn rusqlite::ToSql>> = generated_ids
+        .iter()
+        .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let aliases = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (repo_id, alias) in aliases {
+        names.entry(repo_id).or_insert(alias);
+    }
+    for repo_id in &generated_ids {
+        names
+            .entry(repo_id.clone())
+            .or_insert_with(|| abbreviated_repo_id(repo_id));
+    }
+    Ok(names)
+}
+
+fn abbreviated_repo_id(repo_id: &str) -> String {
+    if repo_id.len() > 16 {
+        let head = &repo_id[..12];
+        let tail = &repo_id[repo_id.len() - 4..];
+        format!("{head}…{tail}")
+    } else {
+        repo_id.to_string()
+    }
+}
+
+/// Attach provenance for the selected human label. Labels are intentionally
+/// many-to-many and are never merge keys; this metadata makes ambiguity
+/// visible while the lane remains keyed by its exact repository id.
+fn apply_identity_evidence(conn: &rusqlite::Connection, lane: &mut LaneAggregate) {
+    let Some(repo_id) = lane.repo_id.as_deref() else {
+        return;
+    };
+    let evidence = conn.query_row(
+        "SELECT COUNT(DISTINCT repository_id),
+                COALESCE(MAX(CASE WHEN repository_id = ?2 THEN 1 ELSE 0 END), 0)
+         FROM repository_aliases
+         WHERE alias = ?1 AND confirmed = 1",
+        rusqlite::params![&lane.display, repo_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    );
+    let Ok((mapped_ids, includes_lane)) = evidence else {
+        return;
+    };
+    if mapped_ids == 0 {
+        return;
+    }
+    lane.label_repository_count = mapped_ids + i64::from(includes_lane == 0);
+    lane.identity_status = if lane.label_repository_count > 1 {
+        "ambiguous-label"
+    } else {
+        "alias-bound"
+    }
+    .to_string();
 }
 
 fn render_summary_text(
@@ -2115,12 +2558,24 @@ fn render_summary_text(
         Vec::with_capacity(visible.len() + usize::from(unowned.is_some()));
     for lane in visible.iter().copied().chain(unowned.iter()) {
         rows.push(vec![
+            lane.repo_id.as_deref().unwrap_or("-").to_string(),
             lane.display.clone(),
+            match lane.identity_status.as_str() {
+                "ambiguous-label" => format!("AMBIG:{}", lane.label_repository_count),
+                "explicit-id" => "EXPLICIT".to_string(),
+                "alias-bound" => "BOUND".to_string(),
+                "id-only" => "ID-ONLY".to_string(),
+                _ => "-".to_string(),
+            },
             lane.open_count.to_string(),
-            lane.severity_counts[0].to_string(),
-            lane.severity_counts[1].to_string(),
-            lane.severity_counts[2].to_string(),
-            lane.severity_counts[3].to_string(),
+            lane.actionable().to_string(),
+            lane.in_flight().to_string(),
+            lane.actionable_counts[0].to_string(),
+            lane.actionable_counts[1].to_string(),
+            lane.actionable_counts[2].to_string(),
+            lane.actionable_counts[3].to_string(),
+            lane.actionable_counts[4].to_string(),
+            lane.actionable_counts[5].to_string(),
             lane.unreviewed.to_string(),
             lane.oldest_open.as_deref().unwrap_or("-").to_string(),
             format!("{:.1}", lane.materiality),
@@ -2129,10 +2584,17 @@ fn render_summary_text(
     }
     render_table(
         &[
-            "LANE", "OPEN", "B", "M", "MED", "MIN", "UNREV", "OLDEST", "MAT", "VERDICT",
+            "OWNER_ID", "LABEL", "IDENTITY", "OPEN", "READY", "INFLT", "R:B", "R:M", "R:MED",
+            "R:MIN", "R:LOW", "R:U", "UNREV", "OLDEST", "MAT", "VERDICT",
         ],
         &[
             TableAlign::Left,
+            TableAlign::Left,
+            TableAlign::Left,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
+            TableAlign::Right,
             TableAlign::Right,
             TableAlign::Right,
             TableAlign::Right,
@@ -2145,26 +2607,38 @@ fn render_summary_text(
         ],
         &rows,
     );
+    println!();
+    println!(
+        "READY=open and not in-flight; R:=READY by severity (B/M/MED/MIN/LOW/U); \
+UNREV=not adjudicated; MAT=weighted READY."
+    );
+    println!("Work: snag review next --repo <OWNER_ID>; then snag review claim <OBSERVATION_ID>");
+    if visible.iter().any(|lane| {
+        matches!(
+            lane.identity_status.as_str(),
+            "ambiguous-label" | "explicit-id" | "id-only"
+        )
+    }) {
+        println!(
+            "Identity: counts are never merged by LABEL. AMBIG:N maps to N ids; \
+EXPLICIT is a literal id; ID-ONLY has no alias evidence."
+        );
+        println!("Inspect: snag review list --repo <OWNER_ID> --unhandled");
+    }
 }
 
 /// `snag review summary [--repo X] [--at-least severity=count]… [--limit N]
 /// [--format text|json]`
 ///
-/// Per-lane (fix owner when set, else filing reporter) open-observation
-/// materiality: a text table
+/// Per-owner-lane open-observation materiality: a text table
 /// ranked by materiality desc (severity mix, unreviewed, oldest, unowned
 /// bucket) or a `review_summary_v1` JSON envelope. With `--at-least`
 /// thresholds, exits 1 when ANY evaluated lane crosses one (actionable open
-/// obs only), 0 otherwise; `--repo` narrows the evaluated set to that lane.
+/// obs without a live claim), 0 otherwise; `--repo` narrows the evaluated set
+/// to that lane.
 fn summary(args: crate::cli::ReviewSummaryArgs) -> Result<()> {
-    // --repo resolution may record checkout bindings for `current`, so a repo
-    // filter needs the write connection (same as `list`/`next`).
-    let mut store = if args.repo.is_some() {
-        Store::open_read_write()?
-    } else {
-        Store::open_read_only()?
-    };
-    let repository_id = resolve_repo_filter(&mut store, args.repo.as_deref())?;
+    let store = Store::open_read_only()?;
+    let repository_id = resolve_repo_filter_read(&store.conn, args.repo.as_deref())?;
     let thresholds = parse_thresholds(&args.at_least)?;
 
     let mut lanes = query_repo_lanes(&store.conn, repository_id.as_deref())?;
@@ -2172,6 +2646,7 @@ fn summary(args: crate::cli::ReviewSummaryArgs) -> Result<()> {
         b.materiality
             .partial_cmp(&a.materiality)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.repo_id.cmp(&b.repo_id))
     });
 
     // Unowned bucket (open obs with no primary row) — only without `--repo`.
@@ -2183,7 +2658,7 @@ fn summary(args: crate::cli::ReviewSummaryArgs) -> Result<()> {
 
     let exit_code = summary_exit_code(&lanes, &unowned, &thresholds);
     if args.format.as_deref() == Some("json") {
-        render_summary_json(&lanes, &unowned, &thresholds, exit_code)?;
+        render_summary_json(&lanes, &unowned, &thresholds, exit_code, args.limit)?;
     } else {
         render_summary_text(&lanes, &unowned, &thresholds, args.limit);
     }

@@ -1,12 +1,12 @@
 //! `snag review summary` — per-repo open-observation materiality (Pearl 2 of
 //! the summary intent).
 //!
-//! Owner lane = fix owner (role='owner') when set, else filing reporter (role='reporter'). Threshold exit code:
-//! exit 1 when ANY evaluated lane has >= count open ACTIONABLE obs at the
-//! given severity (actionable = open AND state NOT IN candidate_fix /
-//! remediation_in_progress); `--repo` narrows the evaluated set. Unowned obs
-//! (no primary row) form their own bucket and participate under the same
-//! rules. Rebuild-primary preservation is covered by tests/rebuild_primary_test.rs.
+//! A repository lane exists only for an explicit fix owner (role='owner').
+//! Threshold exit code: exit 1 when ANY evaluated lane has >= count open
+//! ACTIONABLE obs at the given severity (actionable = open AND state NOT IN
+//! candidate_fix / remediation_in_progress AND without a live claim);
+//! `--repo` narrows the evaluated owner lane. Observations without an owner
+//! form the unowned bucket and participate under the same rules.
 
 use assert_cmd::Command;
 use rusqlite::Connection;
@@ -34,7 +34,7 @@ impl TestContext {
     }
 }
 
-/// File an observation pinned to a repository (the primary/owner lane).
+/// File an observation assigned to a fix-owner lane.
 fn report_in(ctx: &TestContext, title: &str, repo_id: &str, severity: &str) -> String {
     ctx.cmd()
         .arg("report")
@@ -43,7 +43,7 @@ fn report_in(ctx: &TestContext, title: &str, repo_id: &str, severity: &str) -> S
         .arg("bug")
         .arg("--severity")
         .arg(severity)
-        .arg("--repo-id")
+        .arg("--owner")
         .arg(repo_id)
         .assert()
         .success();
@@ -57,7 +57,7 @@ fn report_in(ctx: &TestContext, title: &str, repo_id: &str, severity: &str) -> S
 }
 
 /// File an unowned observation (non-git cwd so no primary auto-resolves).
-fn report_unowned(ctx: &TestContext, title: &str, severity: &str) {
+fn report_unowned(ctx: &TestContext, title: &str, severity: &str) -> String {
     let outside = tempfile::tempdir().unwrap();
     ctx.cmd()
         .current_dir(outside.path())
@@ -67,8 +67,17 @@ fn report_unowned(ctx: &TestContext, title: &str, severity: &str) {
         .arg("bug")
         .arg("--severity")
         .arg(severity)
+        .arg("--unowned")
         .assert()
         .success();
+
+    ctx.conn()
+        .query_row(
+            "SELECT observation_id FROM observations WHERE title = ?1 ORDER BY local_sequence DESC LIMIT 1",
+            [title],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 fn summary_cmd(ctx: &TestContext) -> Command {
@@ -100,6 +109,12 @@ fn t1_summary_groups_by_primary_ranked_by_materiality() {
         "summary must exit 0 without thresholds"
     );
     let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.lines()
+            .next()
+            .is_some_and(|line| line.starts_with("OWNER")),
+        "text summary names the grouping authority: {text}"
+    );
 
     // Both repo lanes present; the higher-materiality lane (alpha: 2 majors +
     // 1 minor = 7.0) must rank above beta (1 major = 3.0). Lane display names
@@ -444,7 +459,7 @@ fn t8_long_lane_names_keep_columns_aligned() {
         .arg("bug")
         .arg("--severity")
         .arg("major")
-        .arg("--repo-id")
+        .arg("--owner")
         .arg(long_id)
         .assert()
         .success();
@@ -466,7 +481,7 @@ fn t8_long_lane_names_keep_columns_aligned() {
     let mut data_rows = 0;
     for line in lines {
         if line.trim().is_empty() {
-            continue;
+            break;
         }
         data_rows += 1;
         let chars: Vec<char> = line.chars().collect();
@@ -508,12 +523,12 @@ fn t8_long_lane_names_keep_columns_aligned() {
 }
 
 // ---------------------------------------------------------------------------
-// t9: owner attribution — an obs filed from lane A with --owner lane B groups
-// under B (the fix owner), not A (the filing reporter).
+// t9: owner attribution — only the fix owner defines a lane. A filing
+// reporter without an owner belongs to the unowned bucket.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn t9_owner_groups_by_fix_owner_not_reporter() {
+fn t9_only_owner_defines_lane_reporter_falls_unowned() {
     let ctx = TestContext::new();
     // Filed from repo_alpha (reporter), fix owned by repo_beta.
     ctx.cmd()
@@ -529,8 +544,19 @@ fn t9_owner_groups_by_fix_owner_not_reporter() {
         .arg("repo_beta")
         .assert()
         .success();
-    // A plain obs in repo_alpha with no owner groups under alpha (reporter).
-    report_in(&ctx, "alpha-plain", "repo_alpha", "minor");
+    // A plain observation has a reporter but no fix owner.
+    ctx.cmd()
+        .arg("report")
+        .arg("alpha-plain")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("minor")
+        .arg("--unowned")
+        .arg("--repo-id")
+        .arg("repo_alpha")
+        .assert()
+        .success();
 
     let out = summary_cmd(&ctx)
         .arg("--format")
@@ -553,17 +579,974 @@ fn t9_owner_groups_by_fix_owner_not_reporter() {
         beta["severity_counts"]["major"], 1,
         "the major owned obs counts in beta"
     );
+    assert!(
+        repos.iter().all(|r| r["repo_id"] != "repo_alpha"),
+        "a reporter without an owner must not become a lane: {v}"
+    );
 
-    let alpha = repos
+    let unowned = &v["unowned"];
+    assert_eq!(
+        unowned["open"], 1,
+        "the reporter-only observation belongs to unowned: {v}"
+    );
+    assert_eq!(
+        unowned["severity_counts"]["minor"], 1,
+        "the reporter-only minor counts in unowned"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// t10: distinct repository identities that share an alias remain distinct and
+// receive unambiguous text labels. Alias ambiguity is valid identity state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t10_shared_alias_lanes_are_disambiguated_without_merging() {
+    let ctx = TestContext::new();
+    report_in(&ctx, "alpha-shared-alias", "repo_alpha", "major");
+    report_in(&ctx, "beta-shared-alias", "repo_beta", "minor");
+
+    let conn = ctx.conn();
+    for repo_id in ["repo_alpha", "repo_beta"] {
+        conn.execute(
+            "INSERT INTO repository_aliases
+             (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+             VALUES ('example/shared', ?1, 1, '9999-01-01T00:00:00Z', '9999-01-01T00:00:00Z')
+             ON CONFLICT(alias, repository_id) DO UPDATE SET
+                confirmed = 1,
+                last_seen_at = excluded.last_seen_at",
+            [repo_id],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let out = summary_cmd(&ctx).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let shared_labels: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("example/shared"))
+        .collect();
+    assert_eq!(
+        shared_labels.len(),
+        2,
+        "both repository identities remain visible: {text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.starts_with("repo_alpha")
+                && line.contains("example/shared")
+                && line.contains("AMBIG:2")
+        }) && text.lines().any(|line| {
+            line.starts_with("repo_beta")
+                && line.contains("example/shared")
+                && line.contains("AMBIG:2")
+        }),
+        "each ambiguous label exposes its exact owner id and ambiguity: {text}"
+    );
+    assert!(
+        text.contains("counts are never merged by LABEL")
+            && text.contains("snag review list --repo <OWNER_ID> --unhandled"),
+        "identity ambiguity must explain the safe next action: {text}"
+    );
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let repo_ids: std::collections::BTreeSet<&str> = value["repos"]
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|r| r["repo_id"] == "repo_alpha")
-        .expect("reporter lane repo_alpha present");
+        .filter_map(|lane| lane["repo_id"].as_str())
+        .collect();
     assert_eq!(
-        alpha["open"], 1,
-        "alpha holds only its own plain obs, not the owned one: {v}"
+        repo_ids,
+        std::collections::BTreeSet::from(["repo_alpha", "repo_beta"]),
+        "JSON preserves one lane per canonical repository id"
     );
+    for lane in value["repos"].as_array().unwrap() {
+        assert_eq!(lane["identity"]["status"], "ambiguous-label");
+        assert_eq!(lane["identity"]["label_repository_count"], 2);
+        assert_eq!(lane["identity"]["ambiguous_label"], true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// t11: display aliases must be backed by a checkout bound to the same
+// repository. A newer unsupported alias is historical identity contamination,
+// not a better owner label.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t11_display_prefers_alias_supported_by_bound_checkout() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("supported-owner-alias")
+        .arg("--kind")
+        .arg("bug")
+        .arg("--severity")
+        .arg("major")
+        .arg("--repo-id")
+        .arg("repo_owner")
+        .arg("--owner")
+        .arg("repo_owner")
+        .assert()
+        .success();
+
+    let conn = ctx.conn();
+    let supported_alias: String = conn
+        .query_row(
+            "SELECT alias FROM repository_aliases
+             WHERE repository_id = 'repo_owner'
+             ORDER BY last_seen_at DESC, alias DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO repository_aliases
+         (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+         VALUES ('zzz/unsupported', 'repo_owner', 1,
+                 '9999-01-01T00:00:00Z', '9999-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let owner = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["repo_id"] == "repo_owner")
+        .expect("repo_owner lane present");
     assert_eq!(
-        alpha["severity_counts"]["minor"], 1,
-        "alpha has the minor plain obs"
+        owner["display"], supported_alias,
+        "unsupported historical alias must not replace a checkout-backed owner label"
     );
+}
+
+// ---------------------------------------------------------------------------
+// t12: a readable explicit owner id is authoritative. Historical aliases from
+// a different checkout must never relabel that owner as the reporter repository.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t12_explicit_owner_id_is_not_replaced_by_unrelated_alias() {
+    let ctx = TestContext::new();
+    report_in(&ctx, "foreign-owned", "foreign-owner", "major");
+
+    let conn = ctx.conn();
+    conn.execute(
+        "INSERT INTO repository_aliases
+         (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+         VALUES ('example/reporter', 'foreign-owner', 1,
+                 '9999-01-01T00:00:00Z', '9999-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let foreign = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["repo_id"] == "foreign-owner")
+        .expect("explicit owner lane present");
+    assert_eq!(
+        foreign["display"], "foreign-owner",
+        "unrelated alias must not relabel the explicit owner"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// t13: owner assignment is an append-only transition from the unowned bucket
+// into exactly one owner lane. Replaying the same command is idempotent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t13_assign_owner_moves_unowned_observation_once() {
+    let ctx = TestContext::new();
+    let observation_id = report_unowned(&ctx, "assign-me", "major");
+
+    for _ in 0..2 {
+        ctx.cmd()
+            .arg("review")
+            .arg("assign-owner")
+            .arg(&observation_id)
+            .arg("repo_owner")
+            .arg("--reviewer")
+            .arg("reviewer-a")
+            .arg("--session-id")
+            .arg("session-a")
+            .arg("--idempotency-key")
+            .arg("assign-owner-once")
+            .assert()
+            .success();
+    }
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let owner = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["repo_id"] == "repo_owner")
+        .expect("assigned owner lane present");
+    assert_eq!(owner["open"], 1);
+    assert!(
+        value["unowned"].is_null(),
+        "assigned observation must leave the unowned bucket: {value}"
+    );
+
+    let list = ctx
+        .cmd()
+        .arg("review")
+        .arg("list")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let listed = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["observation_id"] == observation_id)
+        .unwrap();
+    assert_eq!(listed["owner_repository_id"], "repo_owner");
+
+    let show = ctx
+        .cmd()
+        .arg("review")
+        .arg("show")
+        .arg(&observation_id)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let show: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(show["current_state"]["owner_repository_id"], "repo_owner");
+
+    let conn = ctx.conn();
+    let owner_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner' AND repository_id = 'repo_owner'",
+            [&observation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_rows, 1, "owner projection is singular");
+    let owner_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM records
+             WHERE entity_id = ?1 AND record_type = 'observation_owner_assigned'",
+            [&observation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_events, 1, "idempotent replay appends no second event");
+}
+
+#[test]
+fn t14_assign_owner_rejects_ambiguous_alias() {
+    let ctx = TestContext::new();
+    let observation_id = report_unowned(&ctx, "ambiguous-owner", "major");
+    let conn = ctx.conn();
+    for repo_id in ["repo_alpha", "repo_beta"] {
+        conn.execute(
+            "INSERT INTO repositories (repository_id, created_at)
+             VALUES (?1, '2026-08-08T00:00:00Z')",
+            [repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repository_aliases
+             (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+             VALUES ('example/shared', ?1, 1,
+                     '2026-08-08T00:00:00Z', '2026-08-08T00:00:00Z')",
+            [repo_id],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg("example/shared")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Repository ambiguous"));
+    summary_cmd(&ctx)
+        .arg("--repo")
+        .arg("example/shared")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Repository ambiguous"));
+
+    let owner_rows: i64 = ctx
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+            [&observation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_rows, 0, "failed assignment must not mutate ownership");
+}
+
+#[test]
+fn t14_report_rejects_ambiguous_owner_alias_without_writes() {
+    let ctx = TestContext::new();
+    report_unowned(&ctx, "existing observation", "minor");
+    let conn = ctx.conn();
+    for repo_id in ["repo_alpha", "repo_beta"] {
+        conn.execute(
+            "INSERT INTO repositories (repository_id, created_at)
+             VALUES (?1, '2026-08-08T00:00:00Z')",
+            [repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repository_aliases
+             (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+             VALUES ('example/shared', ?1, 1,
+                     '2026-08-08T00:00:00Z', '2026-08-08T00:00:00Z')",
+            [repo_id],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    ctx.cmd()
+        .arg("report")
+        .arg("must not create a duplicate owner")
+        .arg("--owner")
+        .arg("example/shared")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("Repository ambiguous"));
+
+    let conn = ctx.conn();
+    let observations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        observations, 1,
+        "failed report must not append an observation"
+    );
+    let literal_owner: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM repositories WHERE repository_id = 'example/shared'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        literal_owner, 0,
+        "ambiguous alias must not become a literal repository id"
+    );
+}
+
+#[test]
+fn t15_verify_detects_owner_projection_drift() {
+    let ctx = TestContext::new();
+    let observation_id = report_unowned(&ctx, "owner-drift", "major");
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg("repo_owner")
+        .assert()
+        .success();
+
+    ctx.conn()
+        .execute(
+            "DELETE FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+            [&observation_id],
+        )
+        .unwrap();
+
+    let verify = ctx.cmd().arg("verify").arg("--full").output().unwrap();
+    assert!(
+        !verify.status.success(),
+        "owner projection drift must fail full verification"
+    );
+    assert!(
+        String::from_utf8_lossy(&verify.stderr).contains("owner mismatch"),
+        "verification must diagnose owner drift: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+}
+
+#[test]
+fn t16_replaying_old_assignment_does_not_undo_newer_owner() {
+    let ctx = TestContext::new();
+    let observation_id = report_unowned(&ctx, "reassign-me", "major");
+    for (owner, key) in [("repo_a", "assign-a"), ("repo_b", "assign-b")] {
+        ctx.cmd()
+            .arg("review")
+            .arg("assign-owner")
+            .arg(&observation_id)
+            .arg(owner)
+            .arg("--idempotency-key")
+            .arg(key)
+            .assert()
+            .success();
+    }
+
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg("repo_a")
+        .arg("--idempotency-key")
+        .arg("assign-a")
+        .assert()
+        .success();
+
+    let owners: Vec<String> = {
+        let conn = ctx.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT repository_id FROM observation_repositories
+                 WHERE observation_id = ?1 AND role = 'owner'
+                 ORDER BY repository_id",
+            )
+            .unwrap();
+        stmt.query_map([&observation_id], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        owners,
+        vec!["repo_b"],
+        "replaying an older idempotency key must preserve the latest event"
+    );
+}
+
+#[test]
+fn t17_exact_owner_id_wins_over_colliding_alias() {
+    let ctx = TestContext::new();
+    let observation_id = report_unowned(&ctx, "canonical-owner", "major");
+    let conn = ctx.conn();
+    for repo_id in ["repo_a", "repo_b"] {
+        conn.execute(
+            "INSERT INTO repositories (repository_id, created_at)
+             VALUES (?1, '2026-08-08T00:00:00Z')",
+            [repo_id],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO repository_aliases
+         (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+         VALUES ('repo_a', 'repo_b', 1,
+                 '2026-08-08T00:00:00Z', '2026-08-08T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg("repo_a")
+        .assert()
+        .success();
+    let owner: String = ctx
+        .conn()
+        .query_row(
+            "SELECT repository_id FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+            [&observation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, "repo_a");
+}
+
+#[test]
+fn t18_verify_checks_report_time_and_absent_owners() {
+    let initial_ctx = TestContext::new();
+    let initial_id = report_in(&initial_ctx, "initial-owner", "repo_initial", "major");
+    initial_ctx
+        .conn()
+        .execute(
+            "DELETE FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+            [&initial_id],
+        )
+        .unwrap();
+    let initial_verify = initial_ctx
+        .cmd()
+        .arg("verify")
+        .arg("--full")
+        .output()
+        .unwrap();
+    assert!(
+        !initial_verify.status.success(),
+        "missing report-time owner must fail full verification"
+    );
+    assert!(
+        String::from_utf8_lossy(&initial_verify.stderr).contains("owner mismatch"),
+        "verification must diagnose the missing report-time owner: {}",
+        String::from_utf8_lossy(&initial_verify.stderr)
+    );
+
+    let absent_ctx = TestContext::new();
+    let absent_id = report_unowned(&absent_ctx, "absent-owner", "major");
+    let conn = absent_ctx.conn();
+    conn.execute(
+        "INSERT INTO repositories (repository_id, created_at)
+         VALUES ('repo_stale', '2026-08-08T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO observation_repositories
+         (observation_id, repository_id, role)
+         VALUES (?1, 'repo_stale', 'owner')",
+        [&absent_id],
+    )
+    .unwrap();
+    drop(conn);
+    let absent_verify = absent_ctx
+        .cmd()
+        .arg("verify")
+        .arg("--full")
+        .output()
+        .unwrap();
+    assert!(
+        !absent_verify.status.success(),
+        "unexpected projected owner must fail full verification"
+    );
+    assert!(
+        String::from_utf8_lossy(&absent_verify.stderr).contains("owner mismatch"),
+        "verification must diagnose the unexpected projected owner: {}",
+        String::from_utf8_lossy(&absent_verify.stderr)
+    );
+}
+
+#[test]
+fn t19_assignment_identity_writes_roll_back_with_event() {
+    let ctx = TestContext::new();
+    let observation_id = report_unowned(&ctx, "atomic-owner", "major");
+    let repository = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let before: (i64, i64, i64, i64) = ctx
+        .conn()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM repositories),
+                (SELECT COUNT(*) FROM repository_aliases),
+                (SELECT COUNT(*) FROM checkouts),
+                (SELECT COUNT(*) FROM worktrees)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg(repository.path())
+        .env("SNAG_FAILPOINT", "remediation_before_tx")
+        .assert()
+        .failure();
+
+    let after: (i64, i64, i64, i64) = ctx
+        .conn()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM repositories),
+                (SELECT COUNT(*) FROM repository_aliases),
+                (SELECT COUNT(*) FROM checkouts),
+                (SELECT COUNT(*) FROM worktrees)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "failed assignment must leave no identity rows"
+    );
+}
+// ---------------------------------------------------------------------------
+// t20: JSON keeps the v1 envelope additive while exposing actionable and
+// in-flight projections. An in-flight major remains open but is not ready.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t20_json_exposes_additive_actionable_projection() {
+    let ctx = TestContext::new();
+    let in_flight = report_in(&ctx, "in-flight-major", "repo_actionable", "major");
+    report_in(&ctx, "ready-blocker", "repo_actionable", "blocker");
+    report_in(&ctx, "ready-medium", "repo_actionable", "medium");
+    report_in(&ctx, "ready-minor", "repo_actionable", "minor");
+    report_in(&ctx, "ready-low", "repo_actionable", "low");
+
+    ctx.cmd()
+        .arg("review")
+        .arg("disposition")
+        .arg(&in_flight)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd()
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&in_flight)
+        .arg("--commit")
+        .arg("sha-in-flight")
+        .arg("--repo")
+        .arg("repo_actionable")
+        .assert()
+        .success();
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["schema"], "review_summary_v1");
+    let lane = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["repo_id"] == "repo_actionable")
+        .expect("actionable lane present");
+
+    // Existing fields retain their meanings.
+    assert_eq!(lane["open"], 5);
+    assert_eq!(lane["severity_counts"]["major"], 1);
+    assert_eq!(lane["severity_counts"]["blocker"], 1);
+    // New fields reconcile: 4 ready observations, one in flight.
+    assert_eq!(lane["actionable"], 4);
+    assert_eq!(lane["in_flight"], 1);
+    assert_eq!(lane["actionable_severity_counts"]["blocker"], 1);
+    assert_eq!(lane["actionable_severity_counts"]["major"], 0);
+    assert_eq!(lane["actionable_severity_counts"]["medium"], 1);
+    assert_eq!(lane["actionable_severity_counts"]["minor"], 1);
+    assert_eq!(lane["actionable_severity_counts"]["low"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// t21: text labels actionable readiness explicitly, including all five
+// severities, while retaining the existing dispatch columns.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t21_text_exposes_ready_inflight_and_actionable_severity_mix() {
+    let ctx = TestContext::new();
+    let in_flight = report_in(&ctx, "text-in-flight-major", "repo_text", "major");
+    report_in(&ctx, "text-ready-blocker", "repo_text", "blocker");
+    report_in(&ctx, "text-ready-medium", "repo_text", "medium");
+    report_in(&ctx, "text-ready-minor", "repo_text", "minor");
+    report_in(&ctx, "text-ready-low", "repo_text", "low");
+
+    ctx.cmd()
+        .arg("review")
+        .arg("disposition")
+        .arg(&in_flight)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd()
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&in_flight)
+        .arg("--commit")
+        .arg("sha-text")
+        .arg("--repo")
+        .arg("repo_text")
+        .assert()
+        .success();
+
+    let out = summary_cmd(&ctx).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let header = text.lines().next().unwrap();
+    for column in [
+        "OPEN", "READY", "INFLT", "R:B", "R:M", "R:MED", "R:MIN", "R:LOW", "UNREV", "OLDEST",
+        "MAT", "VERDICT",
+    ] {
+        assert!(header.contains(column), "missing {column} header: {text}");
+    }
+    assert!(
+        !header.contains("INFLIGHT") && !header.contains("READY_"),
+        "summary header regressed to the wide form: {header}"
+    );
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("repo_text"))
+        .expect("repo_text row present");
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(cells[0], "repo_text");
+    assert_eq!(
+        cells[1], "repo_text",
+        "LABEL remains visible beside OWNER_ID"
+    );
+    assert_eq!(cells[2], "ID-ONLY");
+    assert_eq!(cells[3], "5", "OPEN includes the in-flight major");
+    assert_eq!(cells[4], "4", "READY excludes the in-flight major");
+    assert_eq!(cells[5], "1", "INFLT is open minus ready");
+    assert_eq!(&cells[6..11], ["1", "0", "1", "1", "1"]);
+    assert!(text.contains("UNREV") && text.contains("OLDEST"));
+    assert!(text.contains("MAT") && text.contains("VERDICT"));
+}
+
+// ---------------------------------------------------------------------------
+// t22: JSON --limit controls rendered owner lanes only; threshold evaluation
+// still sees a hidden lane, and unowned remains a separate bucket.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t22_json_limit_hides_lanes_without_hiding_thresholds_or_unowned() {
+    let ctx = TestContext::new();
+    report_in(&ctx, "visible-blocker-1", "repo_visible", "blocker");
+    report_in(&ctx, "visible-blocker-2", "repo_visible", "blocker");
+    report_in(&ctx, "hidden-major-1", "repo_hidden", "major");
+    report_in(&ctx, "hidden-major-2", "repo_hidden", "major");
+    report_unowned(&ctx, "still-unowned", "low");
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .arg("--limit")
+        .arg("1")
+        .arg("--at-least")
+        .arg("major=2")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "hidden repo_hidden lane still drives threshold exit"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let repos = value["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1, "--limit applies to rendered owner lanes");
+    assert_eq!(repos[0]["repo_id"], "repo_visible");
+    assert!(
+        repos.iter().all(|lane| lane["repo_id"] != "repo_hidden"),
+        "hidden lane must not be rendered: {value}"
+    );
+    assert_eq!(value["unowned"]["open"], 1);
+    assert_eq!(value["unowned"]["actionable"], 1);
+    assert_eq!(value["unowned"]["actionable_severity_counts"]["low"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// t23: equal materiality uses canonical repository id as a stable tie-break.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t23_equal_materiality_sorts_by_canonical_repo_id() {
+    let ctx = TestContext::new();
+    report_in(&ctx, "tie-beta", "repo_beta", "major");
+    report_in(&ctx, "tie-alpha", "repo_alpha", "major");
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|lane| lane["repo_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["repo_alpha", "repo_beta"]);
+}
+
+// ---------------------------------------------------------------------------
+// t24: retracted observations are absent from every summary lane.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t24_retracted_observation_is_excluded() {
+    let ctx = TestContext::new();
+    let observation_id = report_in(&ctx, "retract-me", "repo_retracted", "major");
+    ctx.cmd()
+        .arg("retract")
+        .arg(&observation_id)
+        .assert()
+        .success();
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        value["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|lane| lane["repo_id"] != "repo_retracted"),
+        "retracted observations must not populate owner lanes: {value}"
+    );
+    assert!(
+        value["unowned"].is_null(),
+        "retracted observations must not populate unowned: {value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// t25: a live active_claims row is in-flight even while the reduced state is
+// otherwise actionable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t25_live_claim_is_in_flight() {
+    let ctx = TestContext::new();
+    let observation_id = report_in(&ctx, "claimed-now", "repo_claimed", "major");
+    ctx.cmd()
+        .arg("review")
+        .arg("claim")
+        .arg(&observation_id)
+        .assert()
+        .success();
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let lane = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["repo_id"] == "repo_claimed")
+        .expect("claimed lane present");
+    assert_eq!(lane["open"], 1);
+    assert_eq!(lane["actionable"], 0);
+    assert_eq!(lane["in_flight"], 1);
+    assert_eq!(lane["severity_counts"]["major"], 1);
+}
+// ---------------------------------------------------------------------------
+// t26: summary attribution follows the latest canonical owner projection.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t26_reassignment_appears_only_in_latest_owner_lane() {
+    let ctx = TestContext::new();
+    let observation_id = report_in(&ctx, "reassigned", "repo_owner_old", "major");
+    ctx.cmd()
+        .arg("review")
+        .arg("assign-owner")
+        .arg(&observation_id)
+        .arg("repo_owner_new")
+        .assert()
+        .success();
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let repos = value["repos"].as_array().unwrap();
+    assert!(
+        repos.iter().all(|lane| lane["repo_id"] != "repo_owner_old"),
+        "historical owner must not retain the observation: {value}"
+    );
+    let new_lane = repos
+        .iter()
+        .find(|lane| lane["repo_id"] == "repo_owner_new")
+        .expect("latest owner lane present");
+    assert_eq!(new_lane["open"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// t27: unknown severities reconcile across OPEN, READY, INFLT, materiality,
+// compact text, and additive JSON fields without changing threshold parsing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t27_unknown_severity_is_an_additive_ready_bucket() {
+    let ctx = TestContext::new();
+    report_in(&ctx, "unknown-severity", "repo_unknown", "major");
+    ctx.conn()
+        .execute(
+            "UPDATE observations SET severity_assertion = 'new-severity'
+             WHERE title = 'unknown-severity'",
+            [],
+        )
+        .unwrap();
+
+    let out = summary_cmd(&ctx)
+        .arg("--format")
+        .arg("json")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let lane = value["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["repo_id"] == "repo_unknown")
+        .expect("unknown severity lane present");
+    assert_eq!(lane["open"], 1);
+    assert_eq!(lane["actionable"], 1);
+    assert_eq!(lane["in_flight"], 0);
+    assert_eq!(lane["severity_counts"]["unknown"], 1);
+    assert_eq!(lane["actionable_severity_counts"]["unknown"], 1);
+    assert_eq!(lane["materiality"], 0.0);
+
+    let text = String::from_utf8(summary_cmd(&ctx).output().unwrap().stdout).unwrap();
+    assert!(text.lines().next().unwrap().contains("R:U"));
 }

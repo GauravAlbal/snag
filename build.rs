@@ -64,6 +64,7 @@ fn main() {
 
     // Internal lanes set SNAG_BUILD_FLAVOR (e.g. "internal") at build time so
     // the public release binary never carries the marker.
+    println!("cargo:rustc-check-cfg=cfg(snag_internal)");
     let flavor = env::var("SNAG_BUILD_FLAVOR").unwrap_or_default();
     let flavor_suffix = if flavor.is_empty() {
         String::new()

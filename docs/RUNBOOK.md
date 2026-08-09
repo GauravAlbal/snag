@@ -74,23 +74,42 @@ snag init --agent claude-code --file CLAUDE.md
 Fast path:
 
 ```sh
-snag "title"
+snag "title" --owner owner/repository
 ```
 
 Structured report (flags also work on the fast path):
 
 ```sh
-snag report "<title>" --kind bug --severity minor \
+snag report "<title>" --owner owner/repository --kind bug --severity minor \
   --observed "what happened" --expected "what should have happened" \
   --repro "minimal repro" --workaround "workaround" \
   --idempotency-key "attempt-local-key"
 ```
 
-JSON intake:
+For genuinely ambiguous / environmental observations, swap `--owner` for
+`--unowned`:
 
 ```sh
-snag report --json < input.json          # stdin
-snag report --json ./input.json          # file
+snag report "<title>" --unowned --kind friction --severity minor \
+  --observed "what happened" --expected "what should have happened" \
+  --repro "minimal repro"
+```
+
+Every capture MUST declare exactly one fix owner. Reporter location is not
+ownership — `--owner current` means the repository bound to the cwd checkout,
+not "wherever I happen to be filing from." Empty `--owner ""` and JSON/prose
+`unowned: false` are rejected; the error names `--owner <repository>` or
+`--unowned` as the escape hatch. JSON intake (`--json <file>`) accepts schema
+v2 with exactly one of `"owner": "..."` or `"unowned": true`.
+
+JSON intake (ownership must be declared — schema v2 with exactly one of
+`"owner"` or `"unowned"`; v1 is accepted only when the CLI supplies
+`--owner` or `--unowned`):
+
+```sh
+snag report --json < input.json          # JSON v2 from stdin
+snag report --json ./input.json          # JSON v2 from a file
+snag report --stdin < report.txt         # prose with Owner: or Unowned: section
 ```
 
 Reporting rubric: report when **unexpected + materially costly/risky +
@@ -109,6 +128,25 @@ snag show <observation-id>                   # immutable payload + context
 snag retract <observation-id>                # retract without deleting
 snag doctor                                  # paths, context source, health
 ```
+
+### Dispatch review work
+
+```sh
+snag review summary --at-least blocker=1 --at-least major=3
+snag review summary --at-least blocker=1 --at-least major=3 \
+  --format json --limit 10
+```
+
+Thresholds are ORed and count only ready observations; work already in
+`candidate_fix` or `remediation_in_progress` remains open but is reported as
+in-flight. Exit 1 means at least one evaluated owner lane or the unowned bucket
+crossed a threshold. `--limit` truncates rendered owner lanes in either format
+but never narrows threshold evaluation.
+
+For remediation commands, `snag review next/list/summary --repo` selects the
+canonical fix-owner repository lane. This is distinct from top-level
+`snag list --repo`, which filters broader reporter/affected repository
+relationships and does not select remediation ownership.
 
 ### Export (the downstream API)
 

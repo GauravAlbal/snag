@@ -14,15 +14,97 @@ pub fn handle(args: VerifyArgs) -> Result<()> {
 
     let mut store = Store::open_read_only()?;
     if args.quick {
-        println!("Running quick verification...");
-        quick_verify(&mut store)?;
-        crate::remediation::verify::verify_remediation(&store.conn, true)?;
+        if !args.json {
+            println!("Running quick verification...");
+        }
+        verify_quietly(
+            || {
+                quick_verify(&mut store)?;
+                crate::remediation::verify::verify_remediation(&store.conn, true)
+            },
+            args.json,
+        )?;
     } else {
-        println!("Running full verification...");
-        full_verify(&mut store)?;
-        crate::remediation::verify::verify_remediation(&store.conn, false)?;
+        if !args.json {
+            println!("Running full verification...");
+        }
+        verify_quietly(
+            || {
+                full_verify(&mut store)?;
+                crate::remediation::verify::verify_remediation(&store.conn, false)
+            },
+            args.json,
+        )?;
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&store_fingerprint(&store)?)?
+        );
     }
     Ok(())
+}
+
+fn verify_quietly<F>(f: F, quiet: bool) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    if !quiet {
+        return f();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+        let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if saved < 0 {
+            anyhow::bail!("dup stdout failed");
+        }
+        unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO) };
+        let result = f();
+        unsafe { libc::dup2(saved, libc::STDOUT_FILENO) };
+        unsafe { libc::close(saved) };
+        result
+    }
+    #[cfg(not(unix))]
+    {
+        f()
+    }
+}
+
+pub fn store_fingerprint(store: &Store) -> Result<Value> {
+    let store_id: String = store
+        .conn
+        .query_row("SELECT store_id FROM store_metadata LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .or_else(|_| Ok::<_, rusqlite::Error>(store.store_id.clone()))?;
+    let through_sequence: i64 = store
+        .conn
+        .query_row(
+            "SELECT COALESCE(MAX(local_sequence),0) FROM records",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let head_hash: String = store
+        .conn
+        .query_row(
+            "SELECT COALESCE((SELECT record_hash FROM records ORDER BY local_sequence DESC LIMIT 1), '')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    let record_count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM records", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(serde_json::json!({
+        "store_id": store_id,
+        "through_sequence": through_sequence,
+        "head_hash": head_hash,
+        "record_count": record_count,
+    }))
 }
 
 /// One record row of the verified suffix, in the column order selected by
@@ -445,24 +527,23 @@ struct BundleManifest {
 /// modified manifest, modified object manifest, missing/modified artifact,
 /// swapped components, mismatched store ID, and incorrect head metadata.
 pub fn verify_backup(backup_path: &Path) -> Result<()> {
-    let bundle_dir = crate::backup::resolve_bundle(backup_path)?;
+    let snapshot = crate::backup::resolve_bundle(backup_path)?;
+    verify_bundle_dir(snapshot.path())
+}
 
-    bundle_files_check(&bundle_dir)?;
-    let manifest = manifest_validate(&bundle_dir)?;
-    let obj_manifest = object_manifest_verify(&bundle_dir, &manifest.artifact_manifest_digest)?;
+/// Verify an already-resolved private snapshot without resolving/extracting it
+/// again. Restore uses this to make verification and cutover share one view.
+pub(crate) fn verify_bundle_dir(bundle_dir: &Path) -> Result<()> {
+    bundle_files_check(bundle_dir)?;
+    let manifest = manifest_validate(bundle_dir)?;
+    let obj_manifest = object_manifest_verify(bundle_dir, &manifest.artifact_manifest_digest)?;
 
-    // Open the bundled DB read-only and run full verification against the
-    // bundle's objects/ directory.
     let db_path = bundle_dir.join("snag.sqlite");
-    let store_id = bundled_db_verify(&bundle_dir, &db_path)?;
-
-    // Database digest.
+    let store_id = bundled_db_verify(bundle_dir, &db_path)?;
     let db_digest = crate::backup::file_digest(&db_path)?;
     if db_digest != manifest.database_digest {
         anyhow::bail!("Database digest mismatch (modified snag.sqlite)");
     }
-
-    // Store ID agreement.
     if store_id != manifest.store_id {
         anyhow::bail!(
             "Store ID mismatch: db {} vs manifest {}",
@@ -470,10 +551,8 @@ pub fn verify_backup(backup_path: &Path) -> Result<()> {
             manifest.store_id
         );
     }
-
     let head_seq = head_agreement(&db_path, &manifest)?;
-    let verified_artifacts = artifact_manifest_agreement(&bundle_dir, &db_path, &obj_manifest)?;
-
+    let verified_artifacts = artifact_manifest_agreement(bundle_dir, &db_path, &obj_manifest)?;
     println!(
         "Backup verification passed ({} artifacts, through seq {}).",
         verified_artifacts, head_seq
@@ -484,8 +563,11 @@ pub fn verify_backup(backup_path: &Path) -> Result<()> {
 /// Every required bundle file is present.
 fn bundle_files_check(bundle_dir: &Path) -> Result<()> {
     for required in crate::backup::BUNDLE_FILES {
-        if !bundle_dir.join(required).exists() {
-            anyhow::bail!("Backup missing required file: {}", required);
+        let path = bundle_dir.join(required);
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("Backup missing required file: {}", required))?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!("Backup required entry is not regular: {}", required);
         }
     }
     Ok(())
@@ -557,6 +639,7 @@ fn bundled_db_verify(bundle_dir: &Path, db_path: &Path) -> Result<String> {
         store_id: store_id.clone(),
         data_dir: bundle_dir.to_path_buf(),
         db_path: db_path.to_path_buf(),
+        _lease: None,
     };
     full_verify(&mut store).context("bundled database failed full verification")?;
     Ok(store_id)
@@ -604,12 +687,18 @@ fn artifact_manifest_agreement(
         .as_array()
         .context("objects-manifest missing artifacts")?;
     let mut expected_map = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for e in expected {
         let digest = e["digest"].as_str().context("entry missing digest")?;
         let byte_length = e["byte_length"]
             .as_u64()
             .context("entry missing byte_length")?;
         let path = e["path"].as_str().context("entry missing path")?;
+        let canonical =
+            crate::backup::artifact_rel_path(digest).context("entry has malformed digest")?;
+        if path != canonical || !seen.insert(digest.to_string()) {
+            anyhow::bail!("objects-manifest contains non-canonical or duplicate entry");
+        }
         expected_map.insert(digest.to_string(), (byte_length, path.to_string()));
     }
     let db_artifacts = conn_query(db_path, |c| {
@@ -652,11 +741,18 @@ fn bundle_artifact_verify(
     if expected_len != byte_length {
         anyhow::bail!("Artifact {} length mismatch in objects-manifest", digest);
     }
-    let abs = bundle_dir.join(rel_path);
-    if !abs.exists() {
-        anyhow::bail!("Missing artifact on disk: {}", digest);
+    let canonical =
+        crate::backup::artifact_rel_path(digest).context("artifact digest is malformed")?;
+    if rel_path != canonical {
+        anyhow::bail!("Artifact {} path is not canonical", digest);
     }
-    if std::fs::metadata(&abs)?.len() != byte_length {
+    let abs = bundle_dir.join(rel_path);
+    let meta = std::fs::symlink_metadata(&abs)
+        .with_context(|| format!("Missing artifact on disk: {}", digest))?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("Artifact {} is not a regular file", digest);
+    }
+    if meta.len() != byte_length {
         anyhow::bail!("Artifact {} length mismatch on disk", digest);
     }
     let d = crate::backup::file_digest(&abs)?;

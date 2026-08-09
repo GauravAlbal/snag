@@ -1,6 +1,10 @@
 use crate::cli::ReportArgs;
 use crate::error::SnagError;
 use crate::git::collect_git_context;
+use crate::parser::{
+    MAX_INTAKE_BYTES, read_bounded, validate_context_parts, validate_json_nesting, validate_source,
+    validate_string,
+};
 use crate::types::{ContextInfo, ExecutionContext, RepositoryContext, SourceInfo};
 use anyhow::Result;
 use serde::Deserialize;
@@ -166,11 +170,23 @@ fn merge_context_file(
     extra: &mut Option<serde_json::Value>,
     idempotency_key: &mut Option<String>,
 ) -> Result<()> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
+    let file = std::fs::File::open(path).map_err(|e| {
         SnagError::ContextFileInvalid(format!("Could not read context file: {}", e))
     })?;
+    let content = read_bounded(file, MAX_INTAKE_BYTES, "context file")
+        .map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
+    validate_json_nesting(&content).map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
     let parsed: ContextFile = serde_json::from_str(&content)
         .map_err(|e| SnagError::ContextFileInvalid(format!("Invalid context file JSON: {}", e)))?;
+    if let Some(src) = &parsed.source {
+        validate_source(src).map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
+    }
+    validate_context_parts(
+        parsed.repository.as_ref(),
+        parsed.execution.as_ref(),
+        parsed.extra.as_ref(),
+    )
+    .map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
 
     if let Some(sv) = parsed.schema_version
         && sv != 1
@@ -254,6 +270,17 @@ pub fn gather_context(args: &ReportArgs) -> Result<(SourceInfo, ContextInfo, Opt
         execution: Some(exec_ctx),
         extra,
     };
+    validate_source(&source).map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
+    validate_context_parts(
+        ctx_info.repository.as_ref(),
+        ctx_info.execution.as_ref(),
+        ctx_info.extra.as_ref(),
+    )
+    .map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
+    if let Some(key) = &idempotency_key {
+        validate_string("idempotency_key", key)
+            .map_err(|e| SnagError::ContextFileInvalid(e.to_string()))?;
+    }
 
     Ok((source, ctx_info, idempotency_key))
 }
@@ -273,6 +300,7 @@ pub fn handle(args: crate::cli::ContextArgs) -> anyhow::Result<()> {
         idempotency_key: None,
         repo_id: None,
         owner: None,
+        unowned: false,
         session_id: None,
         task_id: None,
         attempt_id: None,
@@ -327,5 +355,76 @@ mod tests {
         assert_eq!(base.agent_runtime.as_deref(), Some("test_runtime"));
         // Unrelated base fields survive.
         assert_eq!(base.system, None);
+    }
+
+    #[test]
+    fn context_file_rejects_limit_plus_one_before_json_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.json");
+        std::fs::write(&path, vec![b'x'; MAX_INTAKE_BYTES + 1]).unwrap();
+        let mut source = build_source();
+        let mut repository = RepositoryContext {
+            repository_id: None,
+            checkout_id: None,
+            worktree_id: None,
+            repository_root: None,
+            git_common_dir: None,
+            git_head: None,
+            git_branch: None,
+            git_remote_aliases: Vec::new(),
+            relative_cwd: None,
+        };
+        let mut execution = ExecutionContext::default();
+        let mut extra = None;
+        let mut idempotency_key = None;
+        let err = merge_context_file(
+            path.to_str().unwrap(),
+            &mut source,
+            &mut repository,
+            &mut execution,
+            &mut extra,
+            &mut idempotency_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SnagError>(),
+            Some(SnagError::ContextFileInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn context_file_accepts_byte_boundary_before_json_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.json");
+        std::fs::write(&path, vec![b'x'; MAX_INTAKE_BYTES]).unwrap();
+        let mut source = build_source();
+        let mut repository = RepositoryContext {
+            repository_id: None,
+            checkout_id: None,
+            worktree_id: None,
+            repository_root: None,
+            git_common_dir: None,
+            git_head: None,
+            git_branch: None,
+            git_remote_aliases: Vec::new(),
+            relative_cwd: None,
+        };
+        let mut execution = ExecutionContext::default();
+        let mut extra = None;
+        let mut idempotency_key = None;
+        let err = merge_context_file(
+            path.to_str().unwrap(),
+            &mut source,
+            &mut repository,
+            &mut execution,
+            &mut extra,
+            &mut idempotency_key,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SnagError>(),
+            Some(SnagError::ContextFileInvalid(message))
+                if message.contains("Invalid context file JSON")
+        ));
     }
 }

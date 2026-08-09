@@ -5,6 +5,11 @@
 //! evidence has authority). The validator reports ALL mismatches in one pass
 //! so the agent can repair once, not iterate.
 
+use crate::error::SnagError;
+use crate::parser::{
+    MAX_COMPLETION_COMMITS, MAX_COMPLETION_ITEMS, MAX_COMPLETION_RELATIONSHIPS,
+    MAX_COMPLETION_TASKS, MAX_INTAKE_BYTES, read_bounded, validate_string, validate_yaml_nesting,
+};
 use crate::remediation::events::*;
 use crate::remediation::reducer;
 use crate::remediation::reducer::STATE_VERIFIED_FIXED;
@@ -65,23 +70,114 @@ pub struct ReportFailure {
     pub message: String,
 }
 
-/// Number of reviewed items in the report (for the success summary).
-pub fn item_count(report_path: &std::path::Path) -> Result<usize> {
-    let content = std::fs::read_to_string(report_path)
+fn load_report(report_path: &std::path::Path) -> Result<CompletionReport> {
+    let file = std::fs::File::open(report_path)
         .map_err(|e| anyhow::anyhow!("cannot read report {}: {e}", report_path.display()))?;
+    let content =
+        read_bounded(file, MAX_INTAKE_BYTES, "completion report").map_err(anyhow::Error::from)?;
+    validate_yaml_nesting(&content).map_err(anyhow::Error::from)?;
     let report: CompletionReport = serde_yaml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("cannot parse report (YAML or JSON): {e}"))?;
-    Ok(report.snag_remediation.reviewed.len())
+    validate_report(&report).map_err(anyhow::Error::from)?;
+    Ok(report)
+}
+
+fn validate_report(report: &CompletionReport) -> Result<(), SnagError> {
+    let reviewed = &report.snag_remediation.reviewed;
+    if reviewed.len() > MAX_COMPLETION_ITEMS {
+        return Err(SnagError::Validation(format!(
+            "completion report reviewed items exceed the {MAX_COMPLETION_ITEMS}-item limit"
+        )));
+    }
+    for item in reviewed {
+        validate_item(item)?;
+    }
+    Ok(())
+}
+
+fn validate_item(item: &ReviewedItem) -> Result<(), SnagError> {
+    validate_item_strings(item)?;
+    validate_relationships(item)?;
+    validate_tasks(item)?;
+    validate_commits(item)?;
+    validate_verification(item)
+}
+
+fn validate_item_strings(item: &ReviewedItem) -> Result<(), SnagError> {
+    for (name, value) in [
+        ("observation_id", &item.observation_id),
+        ("disposition", &item.disposition),
+    ] {
+        validate_string(name, value)?;
+    }
+    for (name, value) in [
+        ("finding_id", item.finding_id.as_ref()),
+        ("result", item.result.as_ref()),
+        ("duplicate_of", item.duplicate_of.as_ref()),
+        ("rationale", item.rationale.as_ref()),
+    ] {
+        if let Some(value) = value {
+            validate_string(name, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_relationships(item: &ReviewedItem) -> Result<(), SnagError> {
+    if item.relationships.len() > MAX_COMPLETION_RELATIONSHIPS {
+        return Err(SnagError::Validation(format!(
+            "completion report relationships exceed the {MAX_COMPLETION_RELATIONSHIPS}-item limit"
+        )));
+    }
+    for relationship in &item.relationships {
+        validate_string("relationship", &relationship.relation)?;
+        validate_string("relationship observation_id", &relationship.observation_id)?;
+    }
+    Ok(())
+}
+
+fn validate_tasks(item: &ReviewedItem) -> Result<(), SnagError> {
+    if item.task_ids.len() > MAX_COMPLETION_TASKS {
+        return Err(SnagError::Validation(format!(
+            "completion report task_ids exceed the {MAX_COMPLETION_TASKS}-item limit"
+        )));
+    }
+    for task in &item.task_ids {
+        validate_string("task_id", task)?;
+    }
+    Ok(())
+}
+
+fn validate_commits(item: &ReviewedItem) -> Result<(), SnagError> {
+    if item.commits.len() > MAX_COMPLETION_COMMITS {
+        return Err(SnagError::Validation(format!(
+            "completion report commits exceed the {MAX_COMPLETION_COMMITS}-item limit"
+        )));
+    }
+    for commit in &item.commits {
+        validate_string("commit repository_id", &commit.repository_id)?;
+        validate_string("commit sha", &commit.sha)?;
+    }
+    Ok(())
+}
+
+fn validate_verification(item: &ReviewedItem) -> Result<(), SnagError> {
+    if let Some(verification) = &item.verification {
+        validate_string("verification receipt", &verification.receipt)?;
+        validate_string("verification status", &verification.status)?;
+    }
+    Ok(())
+}
+
+/// Number of reviewed items in the report (for the success summary).
+pub fn item_count(report_path: &std::path::Path) -> Result<usize> {
+    Ok(load_report(report_path)?.snag_remediation.reviewed.len())
 }
 
 /// Load and validate a completion report. Returns the list of failures (empty
 /// means the report is consistent with the recorded events).
 pub fn verify_report(store: &Store, report_path: &std::path::Path) -> Result<Vec<ReportFailure>> {
-    let content = std::fs::read_to_string(report_path)
-        .map_err(|e| anyhow::anyhow!("cannot read report {}: {e}", report_path.display()))?;
-    let report: CompletionReport = serde_yaml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("cannot parse report (YAML or JSON): {e}"))?;
-
+    let report = load_report(report_path)?;
     let mut failures = Vec::new();
     for item in &report.snag_remediation.reviewed {
         check_item(store, item, &mut failures);
@@ -376,5 +472,67 @@ fn check_relationships(store: &Store, item: &ReviewedItem, failures: &mut Vec<Re
                 ),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item() -> ReviewedItem {
+        ReviewedItem {
+            observation_id: "obs".to_string(),
+            disposition: "fixed".to_string(),
+            relationships: Vec::new(),
+            finding_id: None,
+            task_ids: Vec::new(),
+            commits: Vec::new(),
+            verification: None,
+            result: None,
+            duplicate_of: None,
+            rationale: None,
+        }
+    }
+
+    #[test]
+    fn completion_report_rejects_item_limit_plus_one() {
+        let report = CompletionReport {
+            snag_remediation: RemediationSection {
+                reviewed: std::iter::repeat_with(item)
+                    .take(MAX_COMPLETION_ITEMS + 1)
+                    .collect(),
+            },
+        };
+        assert!(matches!(
+            validate_report(&report),
+            Err(SnagError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn completion_report_accepts_item_boundary() {
+        let report = CompletionReport {
+            snag_remediation: RemediationSection {
+                reviewed: std::iter::repeat_with(item)
+                    .take(MAX_COMPLETION_ITEMS)
+                    .collect(),
+            },
+        };
+        assert!(validate_report(&report).is_ok());
+    }
+
+    #[test]
+    fn completion_report_rejects_oversized_string() {
+        let mut oversized = item();
+        oversized.rationale = Some("x".repeat(crate::parser::MAX_STRING_BYTES + 1));
+        let report = CompletionReport {
+            snag_remediation: RemediationSection {
+                reviewed: vec![oversized],
+            },
+        };
+        assert!(matches!(
+            validate_report(&report),
+            Err(SnagError::Validation(_))
+        ));
     }
 }

@@ -10,6 +10,59 @@ the release process.
 > (Apache-2.0); the prior MIT release `v0.1.0` is retired (release and tag
 > removed). All versions from v0.1.1 onward are Apache-2.0.
 
+## [Unreleased]
+
+### Changed
+- **Capture ownership is mandatory on every report.** Every `snag report` must
+  declare exactly one fix owner: `--owner <id|alias|path|current>` when the
+  lane is known, or `--unowned` when the observation is genuinely ambiguous
+  or purely environmental. Reporter location (cwd checkout) is no longer
+  treated as ownership — `--owner current` means the repository bound to the
+  cwd, not "wherever I happen to be filing from," and guessing `current`
+  recreates the misrouting the explicit flag exists to prevent. Empty
+  `--owner ""` and JSON/prose `unowned: false` are rejected with a typed error that names
+  the escape hatch. CLI flags override JSON/prose declarations as one
+  complete choice. JSON intake accepts a new schema v2 with exactly one of
+  `"owner": "..."` or `"unowned": true`; v1 is still accepted only when the
+  CLI supplies `--owner` or `--unowned`. The v2 schema is published as
+  `schemas/observation-input-v2.schema.json`. Persisted explicit-unowned
+  observations keep `owner_repository_id = None` and can be reassigned later
+  via the append-only `snag review assign-owner` event without rewriting the
+  original capture. Documentation (`README.md`, `AGENTS.md`, `docs/SCHEMAS.md`,
+  `docs/STABILITY.md`, `docs/RUNBOOK.md`, `docs/DEMO.md`,
+  `examples/agents/*.md`) and the `INSTRUCTION_BLOCK` installed by `snag init`
+  now require the explicit ownership choice.
+- Ambiguous `--owner` aliases now fail with `REPOSITORY_AMBIGUOUS` instead of
+  being materialized as duplicate literal repository identities.
+- Make `review summary` dispatch signals self-explaining: text now separates
+  ready and in-flight work and shows the full actionable severity mix,
+  including low; JSON adds `actionable`, `actionable_severity_counts`, and
+  `in_flight` while retaining the existing open counts. `--limit` now applies
+  to JSON owner lanes without narrowing threshold evaluation, and equal-score
+  lanes sort deterministically by canonical repository ID.
+
+### Added
+- Add append-only `review assign-owner` for moving ownerless observations into
+  fix-owner lanes without rewriting report provenance. Repository resolution,
+  event append, and projection update commit atomically; exact canonical IDs
+  beat aliases; list/show expose the singular owner; the export schema and
+  rebuild projection recognize the event; and `verify --full` detects missing,
+  stale, or conflicting owner projections.
+
+### Fixed
+- Prevent a conflicting explicit repository ID from acquiring the current
+  checkout's worktree and remote-alias identity while preserving explicit
+  reporter attribution.
+- Make `review summary` lanes owner-only: filing reporters no longer create
+  lanes, ownerless observations aggregate under `(unowned)`, and the text
+  column is labeled `OWNER`.
+- Prefer checkout-backed aliases for opaque owner IDs and render readable
+  explicit IDs verbatim, preventing stale foreign aliases from making `arq`
+  appear as `GauravAlbal/snag`.
+- Keep `review list` and `review summary` read-pure under `--repo current`:
+  repository filters now resolve from existing checkout and confirmed-alias
+  state without creating repository, alias, checkout, or worktree rows.
+
 ## [0.1.1] - 2026-08-05
 
 ### Changed

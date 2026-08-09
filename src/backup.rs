@@ -7,9 +7,12 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use rusqlite::Connection;
 use serde_json::json;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 
 /// Manifest schema version for the self-contained v0 backup bundle.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -53,7 +56,6 @@ fn build_objects_manifest(
 ) -> Result<(Vec<String>, Vec<serde_json::Value>)> {
     let mut stmt = conn.prepare("SELECT digest, byte_length FROM artifacts ORDER BY digest")?;
     let mut rows = stmt.query([])?;
-
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     while let Some(row) = rows.next()? {
@@ -67,9 +69,9 @@ fn build_objects_manifest(
             }
         };
         let abs_path = bundle_root.join(&rel_path);
-        let ok = if let Ok(meta) = fs::metadata(&abs_path) {
-            let len_ok = meta.len() as i64 == byte_length;
-            let digest_ok = file_digest(&abs_path).map(|d| d == digest).unwrap_or(false);
+        let ok = if let Ok(meta) = fs::symlink_metadata(&abs_path) {
+            let len_ok = meta.file_type().is_file() && meta.len() as i64 == byte_length;
+            let digest_ok = len_ok && file_digest(&abs_path).map(|d| d == digest).unwrap_or(false);
             len_ok && digest_ok
         } else {
             false
@@ -86,21 +88,85 @@ fn build_objects_manifest(
             "path": rel_path,
         }));
     }
-
     Ok((errors, entries))
 }
 
+fn open_regular(path: &Path) -> Result<File> {
+    let path_meta =
+        fs::symlink_metadata(path).with_context(|| format!("cannot inspect {}", path.display()))?;
+    if !path_meta.file_type().is_file() {
+        anyhow::bail!(
+            "expected regular file, found non-regular entry: {}",
+            path.display()
+        );
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let fd_meta = file.metadata()?;
+    if !fd_meta.file_type().is_file() {
+        anyhow::bail!(
+            "expected regular file, found non-regular entry: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
+        anyhow::bail!("file changed while opening: {}", path.display());
+    }
+    Ok(file)
+}
+
+/// Copy a regular file without following a source symlink, checking that the
+/// opened inode was not replaced while it was read.
+pub fn copy_regular_file(src: &Path, dst: &Path) -> Result<()> {
+    let before = fs::symlink_metadata(src)?;
+    let mut input = open_regular(src)?;
+    let input_meta = input.metadata()?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .with_context(|| format!("cannot create {}", dst.display()))?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    crate::store::ensure_private_file(dst)?;
+    let after = fs::symlink_metadata(src)?;
+    let final_input = input.metadata()?;
+    if before.len() != input_meta.len()
+        || input_meta.len() != final_input.len()
+        || after.len() != final_input.len()
+    {
+        anyhow::bail!("source file changed while copying: {}", src.display());
+    }
+    #[cfg(unix)]
+    if after.dev() != input_meta.dev() || after.ino() != input_meta.ino() {
+        anyhow::bail!("source file replaced while copying: {}", src.display());
+    }
+    Ok(())
+}
+
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
+    let meta = fs::symlink_metadata(src)?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!("snapshot source is not a directory: {}", src.display());
+    }
+    crate::store::ensure_private_dir(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let s = entry.path();
         let d = dst.join(entry.file_name());
-        if s.is_dir() {
+        let entry_meta = fs::symlink_metadata(&s)?;
+        if entry_meta.file_type().is_symlink() {
+            anyhow::bail!("symlink is not allowed in bundle: {}", s.display());
+        } else if entry_meta.file_type().is_dir() {
             copy_tree(&s, &d)?;
-        } else if s.is_file() {
-            fs::copy(&s, &d)?;
-            File::open(&d)?.sync_all()?;
+        } else if entry_meta.file_type().is_file() {
+            copy_regular_file(&s, &d)?;
+        } else {
+            anyhow::bail!("non-regular bundle entry: {}", s.display());
         }
     }
     Ok(())
@@ -210,7 +276,7 @@ fn stage_online_copy(store: &Store, stage_root: &Path) -> Result<PathBuf> {
         }
         dest.execute_batch("PRAGMA journal_mode = DELETE; PRAGMA wal_checkpoint(TRUNCATE);")?;
     }
-    failpoint("backup_after_db_copy");
+    crate::store::ensure_private_file(&staged_db)?;
     Ok(staged_db)
 }
 
@@ -248,6 +314,7 @@ fn write_objects_manifest(conn: &Connection, stage_root: &Path) -> Result<(PathB
             "artifacts": object_manifest_entries,
         }))?,
     )?;
+    crate::store::ensure_private_file(&objects_manifest_path)?;
     let artifact_manifest_digest = file_digest(&objects_manifest_path)?;
     Ok((objects_manifest_path, artifact_manifest_digest))
 }
@@ -281,6 +348,7 @@ fn write_manifest(
     });
     let manifest_path = stage_root.join("manifest.json");
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+    crate::store::ensure_private_file(&manifest_path)?;
     failpoint("backup_after_manifest_write");
     Ok((manifest_path, created_at))
 }
@@ -329,8 +397,10 @@ fn durable_publish(
         let raw = enc.finish()?;
         raw.sync_all()?;
     }
+    crate::store::ensure_private_file(&tmp_archive)?;
     File::open(&tmp_archive)?.sync_all()?;
     fs::rename(&tmp_archive, &final_archive)?;
+    crate::store::ensure_private_file(&final_archive)?;
     sync_dir(backups_dir)?;
     failpoint("backup_after_publish");
     Ok(final_archive)
@@ -338,13 +408,13 @@ fn durable_publish(
 
 /// Record the backup checkpoint ONLY after publication succeeded.
 fn record_checkpoint(
+    store: &mut Store,
     stats: &ManifestStats,
     database_digest: &str,
     artifact_manifest_digest: &str,
     created_at: &str,
 ) -> Result<()> {
-    let mut rw = Store::open_read_write()?;
-    let tx = rw.conn.transaction()?;
+    let tx = store.conn.transaction()?;
     tx.execute(
         "INSERT INTO backup_checkpoints (backup_id, store_id, created_at, through_sequence, head_record_hash, database_digest, manifest_digest)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -363,15 +433,16 @@ fn record_checkpoint(
 }
 
 pub fn handle(_args: BackupArgs) -> Result<()> {
-    let store = Store::open_read_only()?;
+    let mut store = Store::open_read_write()?;
     let backups_dir = store.data_dir.join("backups");
-    fs::create_dir_all(&backups_dir)?;
+    crate::store::ensure_private_dir(&backups_dir)?;
 
     // Stage the bundle in a temp dir so publication can be an atomic rename.
     let staging = tempfile::tempdir_in(&backups_dir).context("failed to create staging dir")?;
+    crate::store::ensure_private_dir(staging.path())?;
     let stage_root = staging.path();
-
     let staged_db = stage_online_copy(&store, stage_root)?;
+    failpoint("backup_after_db_copy");
     let src_objects = store.data_dir.join("objects");
     let dst_objects = stage_root.join("objects");
     copy_objects_if_present(&src_objects, &dst_objects)?;
@@ -402,6 +473,7 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
         durable_publish(&backups_dir, &bundle, &stats.head_record_hash, &created_at)?;
 
     record_checkpoint(
+        &mut store,
         &stats,
         &database_digest,
         &artifact_manifest_digest,
@@ -412,24 +484,242 @@ pub fn handle(_args: BackupArgs) -> Result<()> {
     Ok(())
 }
 
-/// Low-level helpers needed by restore/verify. A backup is a directory (or an
-/// extracted archive) whose layout is {snag.sqlite, manifest.json,
-/// objects-manifest.json, objects/}. `prepare_backup_dir` resolves an on-disk
-/// archive or directory to a verified-on-disk directory containing these.
-pub fn resolve_bundle(path: &Path) -> Result<PathBuf> {
-    if path.is_dir() {
-        return Ok(path.to_path_buf());
+/// Hard limits applied before any archive payload is written.
+pub const MAX_ARCHIVE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_ARCHIVE_ENTRY_COUNT: usize = 100_000;
+pub const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_ARCHIVE_PATH_DEPTH: usize = 16;
+
+/// An owned, private bundle snapshot. The temporary directory is removed when
+/// this value is dropped; callers must not retain paths after it is dropped.
+pub struct BundleSnapshot {
+    temp: tempfile::TempDir,
+}
+
+impl BundleSnapshot {
+    pub fn path(&self) -> &Path {
+        self.temp.path()
     }
-    // Assume a tar.gz archive; extract into a temp dir and validate layout.
-    let tmp = tempfile::tempdir()?;
-    let f = File::open(path)?;
-    let dec = flate2::read::GzDecoder::new(f);
-    let mut archive = tar::Archive::new(dec);
-    archive.unpack(tmp.path())?;
-    for required in BUNDLE_FILES {
-        if !tmp.path().join(required).exists() {
-            anyhow::bail!("backup bundle missing required file: {}", required);
+}
+
+fn validate_relative_bundle_path(path: &Path) -> Result<usize> {
+    let mut depth = 0;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                anyhow::bail!("unsafe archive path: {}", path.display())
+            }
         }
     }
-    Ok(tmp.keep().to_path_buf())
+    if depth == 0
+        || depth
+            > configured_archive_limit("SNAG_ARCHIVE_MAX_DEPTH", MAX_ARCHIVE_PATH_DEPTH as u64)
+                as usize
+    {
+        anyhow::bail!("archive path depth exceeds limit: {}", path.display());
+    }
+    Ok(depth)
+}
+fn configured_archive_limit(name: &str, hard: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(hard))
+        .unwrap_or(hard)
+}
+
+fn validate_required_files(root: &Path) -> Result<()> {
+    for required in BUNDLE_FILES {
+        let path = root.join(required);
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("backup bundle missing required file: {}", required))?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!("required bundle entry is not regular: {}", required);
+        }
+    }
+    Ok(())
+}
+fn validate_archive_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    seen: &mut HashSet<PathBuf>,
+    entries: &mut usize,
+    max_entries: usize,
+) -> Result<(PathBuf, bool)> {
+    *entries += 1;
+    if *entries > max_entries {
+        anyhow::bail!("archive entry count exceeds limit");
+    }
+    let rel = entry.path()?.into_owned();
+    validate_relative_bundle_path(&rel)?;
+    if !seen.insert(rel.clone()) {
+        anyhow::bail!("duplicate archive entry: {}", rel.display());
+    }
+    let kind = entry.header().entry_type();
+    if kind.is_symlink() || kind.is_hard_link() || !kind.is_file() && !kind.is_dir() {
+        anyhow::bail!("archive contains forbidden entry type: {}", rel.display());
+    }
+    Ok((rel, kind.is_dir()))
+}
+
+fn extract_archive_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    root: &Path,
+    rel: &Path,
+    is_dir: bool,
+    expanded: &mut u64,
+    max_entry: u64,
+    max_total: u64,
+) -> Result<()> {
+    let out = root.join(rel);
+    if is_dir {
+        fs::create_dir_all(&out)?;
+        crate::store::ensure_private_dir(&out)?;
+        return Ok(());
+    }
+    let size = entry.size();
+    if size > max_entry {
+        anyhow::bail!(
+            "archive entry exceeds per-entry byte limit: {}",
+            rel.display()
+        );
+    }
+    *expanded = expanded
+        .checked_add(size)
+        .context("archive expanded byte limit overflow")?;
+    if *expanded > max_total {
+        anyhow::bail!("archive expanded byte limit exceeded");
+    }
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+        crate::store::ensure_private_dir(parent)?;
+    }
+    let mut output = OpenOptions::new().write(true).create_new(true).open(&out)?;
+    let copied = io::copy(entry, &mut output)?;
+    if copied != size {
+        anyhow::bail!(
+            "archive entry size changed while extracting: {}",
+            rel.display()
+        );
+    }
+    output.sync_all()?;
+    crate::store::ensure_private_file(&out)?;
+    Ok(())
+}
+
+fn extract_archive(path: &Path, root: &Path) -> Result<()> {
+    let f = open_regular(path)?;
+    let dec = flate2::read::GzDecoder::new(f);
+    let mut archive = tar::Archive::new(dec);
+    let mut seen = HashSet::new();
+    let mut entries = 0usize;
+    let mut expanded = 0u64;
+    let max_entries =
+        configured_archive_limit("SNAG_ARCHIVE_MAX_ENTRIES", MAX_ARCHIVE_ENTRY_COUNT as u64)
+            as usize;
+    let max_total =
+        configured_archive_limit("SNAG_ARCHIVE_MAX_TOTAL_BYTES", MAX_ARCHIVE_EXPANDED_BYTES);
+    let max_entry =
+        configured_archive_limit("SNAG_ARCHIVE_MAX_ENTRY_BYTES", MAX_ARCHIVE_ENTRY_BYTES);
+    for item in archive.entries()? {
+        let mut entry = item?;
+        let (rel, is_dir) =
+            validate_archive_entry(&mut entry, &mut seen, &mut entries, max_entries)?;
+        extract_archive_entry(
+            &mut entry,
+            root,
+            &rel,
+            is_dir,
+            &mut expanded,
+            max_entry,
+            max_total,
+        )?;
+    }
+    validate_required_files(root)?;
+    Ok(())
+}
+
+pub fn resolve_bundle(path: &Path) -> Result<BundleSnapshot> {
+    let temp = tempfile::tempdir()?;
+    let source_meta = fs::symlink_metadata(path)?;
+    crate::store::ensure_private_dir(temp.path())?;
+    if source_meta.file_type().is_symlink() {
+        anyhow::bail!("bundle path may not be a symlink");
+    }
+    if source_meta.file_type().is_dir() {
+        copy_tree(path, temp.path())?;
+    } else if source_meta.file_type().is_file() {
+        extract_archive(path, temp.path())?;
+    } else {
+        anyhow::bail!("bundle path is not a regular file or directory");
+    }
+    validate_required_files(temp.path())?;
+    Ok(BundleSnapshot { temp })
+}
+
+fn copy_verified_object_entry(
+    bundle_dir: &Path,
+    dst: &Path,
+    entry: &serde_json::Value,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
+    let digest = entry["digest"].as_str().context("entry missing digest")?;
+    let rel = artifact_rel_path(digest).context("entry has malformed digest")?;
+    let declared = entry["path"].as_str().context("entry missing path")?;
+    if declared != rel || !seen.insert(rel.clone()) {
+        anyhow::bail!("object manifest contains non-canonical or duplicate path");
+    }
+    let src = bundle_dir.join(&rel);
+    let src_meta = fs::symlink_metadata(&src)?;
+    if !src_meta.file_type().is_file() {
+        anyhow::bail!("manifest object is not regular: {}", rel);
+    }
+    let out = dst.join(format!("blake3/{}/{}", &digest[7..9], &digest[7..]));
+    if let Some(parent) = out.parent() {
+        if let Ok(meta) = fs::symlink_metadata(parent) {
+            if !meta.file_type().is_dir() {
+                anyhow::bail!("active object parent is not a directory");
+            }
+            crate::store::ensure_private_dir(parent)?;
+        } else {
+            fs::create_dir_all(parent)?;
+            crate::store::ensure_private_dir(parent)?;
+        }
+    }
+    match copy_regular_file(&src, &out) {
+        Ok(()) => {}
+        Err(err) if out.exists() && fs::symlink_metadata(&out)?.file_type().is_file() => {
+            crate::store::ensure_private_file(&out)?;
+            let _ = err;
+        }
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+/// Copy only canonical objects enumerated by objects-manifest.json.
+pub fn copy_verified_objects(bundle_dir: &Path, dst: &Path) -> Result<()> {
+    let raw = fs::read_to_string(bundle_dir.join("objects-manifest.json"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    let entries = value["artifacts"]
+        .as_array()
+        .context("objects-manifest missing artifacts")?;
+    let dst_meta = fs::symlink_metadata(dst);
+    if let Ok(meta) = dst_meta {
+        if !meta.file_type().is_dir() {
+            anyhow::bail!("active objects path is not a directory");
+        }
+        crate::store::ensure_private_dir(dst)?;
+    }
+    crate::store::ensure_private_dir(dst)?;
+    crate::store::ensure_private_dir(&dst.join("blake3"))?;
+    let mut seen = HashSet::new();
+    for entry in entries {
+        copy_verified_object_entry(bundle_dir, dst, entry, &mut seen)?;
+    }
+    Ok(())
 }

@@ -76,6 +76,10 @@ pub struct Cli {
     #[arg(long)]
     pub owner: Option<String>,
 
+    /// declare that no repository owner is currently known
+    #[arg(long, conflicts_with = "owner")]
+    pub unowned: bool,
+
     /// session identifier recorded with the observation
     #[arg(long)]
     pub session_id: Option<String>,
@@ -104,6 +108,8 @@ impl Cli {
                 ReviewCommand::Next(args) => args.format.as_deref() == Some("agent"),
                 ReviewCommand::List(args) => args.format.as_deref() == Some("json"),
                 ReviewCommand::Summary(args) => args.format.as_deref() == Some("json"),
+                #[cfg(snag_internal)]
+                ReviewCommand::Retro(args) => args.format.as_deref() == Some("json"),
                 _ => false,
             },
             Some(_) => false,
@@ -200,6 +206,10 @@ pub struct ReportArgs {
     #[arg(long)]
     pub owner: Option<String>,
 
+    /// declare that no repository owner is currently known
+    #[arg(long, conflicts_with = "owner")]
+    pub unowned: bool,
+
     /// session identifier recorded with the observation
     #[arg(long)]
     pub session_id: Option<String>,
@@ -278,6 +288,11 @@ pub struct VerifyArgs {
 
     #[arg(long)]
     pub backup: Option<PathBuf>,
+
+    /// Emit a machine-readable store fingerprint (store_id, through_sequence,
+    /// head_hash, record_count) after verification
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -310,9 +325,13 @@ pub struct RestoreArgs {
 
 #[derive(Args)]
 pub struct RebuildArgs {
+    /// Path to the export stream to rebuild from
     #[arg(long = "from-export")]
     pub from_export: PathBuf,
 
+    /// Snag data directory to rebuild into (a fresh snag.sqlite is created
+    /// inside it; the directory must not already contain a store). This is a
+    /// directory, NOT a database file path — see `snag rebuild` docs.
     #[arg(long)]
     pub destination: PathBuf,
 }
@@ -335,8 +354,13 @@ pub enum ReviewCommand {
     Heartbeat(ReviewHeartbeatArgs),
     /// List observations with their review state
     List(ReviewListArgs),
-    /// Per-repo open-observation materiality summary (dispatch aid)
+    /// Per-owner open-observation materiality summary (dispatch aid)
     Summary(ReviewSummaryArgs),
+    /// Show remediation-health metrics over a bounded historical window
+    #[cfg(snag_internal)]
+    Retro(ReviewRetroArgs),
+    /// Assign or reassign the repository that owns the fix (append-only)
+    AssignOwner(ReviewAssignOwnerArgs),
     /// Adjudicate an observation with a disposition
     ///
     /// Negative dispositions are first-class outcomes. `confirmed` commits
@@ -369,10 +393,43 @@ pub enum ReviewCommand {
     /// Validate a completion report against the recorded events
     VerifyReport(ReviewVerifyReportArgs),
 }
+#[cfg(snag_internal)]
+#[derive(Args)]
+pub struct ReviewRetroArgs {
+    /// Restrict to a repository (id, alias, or `current`)
+    #[arg(long)]
+    pub repo: Option<String>,
+
+    /// Restrict to an asserted severity
+    #[arg(long)]
+    pub severity: Option<String>,
+
+    /// Inclusive UTC window start (RFC 3339 date or timestamp)
+    #[arg(long = "from")]
+    pub from: Option<String>,
+
+    /// Exclusive UTC window end (RFC 3339 date or timestamp)
+    #[arg(long = "to")]
+    pub to: Option<String>,
+
+    /// Time bucket: day or week
+    #[arg(long, default_value = "day")]
+    pub bucket: String,
+
+    /// Add the JSON detail object; for text, add severity and trend drilldowns
+    #[arg(long)]
+    pub detail: bool,
+
+    /// Output format: text (default) or json (review_retro_v1 envelope)
+    #[arg(long, value_parser = ["text", "json"])]
+    pub format: Option<String>,
+}
 
 #[derive(Args)]
 pub struct ReviewNextArgs {
-    /// Restrict to a repository (id, alias, or `current`)
+    /// Restrict to a fix-owner repository/lane (id, alias, or `current`).
+    /// Unlike top-level `snag list --repo`, this never filters broader
+    /// reporter/affected repository relationships.
     #[arg(long)]
     pub repo: Option<String>,
 
@@ -390,6 +447,10 @@ pub struct ReviewNextArgs {
     /// Only observations with no review activity yet
     #[arg(long)]
     pub unreviewed: bool,
+
+    /// Restrict to the canonical current work status (actionable|active|resolved|terminal)
+    #[arg(long, value_parser = clap::value_parser!(crate::cli::WorkStatusArg))]
+    pub work_status: Option<crate::cli::WorkStatusArg>,
 
     /// Include observations deferred by a prior disposition
     #[arg(long)]
@@ -462,7 +523,9 @@ pub struct ReviewHeartbeatArgs {
 
 #[derive(Args)]
 pub struct ReviewListArgs {
-    /// Restrict to a repository (id, alias, or `current`)
+    /// Restrict to a fix-owner repository/lane (id, alias, or `current`).
+    /// Unlike top-level `snag list --repo`, this never filters broader
+    /// reporter/affected repository relationships.
     #[arg(long)]
     pub repo: Option<String>,
 
@@ -474,6 +537,9 @@ pub struct ReviewListArgs {
     #[arg(long)]
     pub severity: Option<String>,
 
+    /// Restrict to the canonical current work status (actionable|active|resolved|terminal)
+    #[arg(long, value_parser = clap::value_parser!(crate::cli::WorkStatusArg))]
+    pub work_status: Option<crate::cli::WorkStatusArg>,
     /// Only observations with no review activity yet
     #[arg(long)]
     pub unreviewed: bool,
@@ -514,24 +580,43 @@ pub struct ReviewListArgs {
 
 #[derive(Args)]
 pub struct ReviewSummaryArgs {
-    /// Restrict to a repository (id, alias, or `current`); narrows the
-    /// threshold evaluation to this lane (other lanes cannot flip the exit code)
+    /// Restrict to a fix-owner repository/lane (id, alias, or `current`);
+    /// unlike top-level `snag list --repo`, this evaluates only the fix-owner
+    /// lane and never broader reporter/affected relationships.
     #[arg(long)]
     pub repo: Option<String>,
 
-    /// Dispatch threshold: exit 1 when any evaluated lane has at least COUNT
-    /// open actionable observations at SEVERITY (repeatable; e.g. major=3)
+    /// Dispatch threshold: exit 1 when any evaluated owner lane or the unowned
+    /// bucket has at least COUNT open actionable observations at SEVERITY
+    /// (repeatable; e.g. major=3)
     #[arg(long = "at-least", value_name = "severity=count")]
     pub at_least: Vec<String>,
 
-    /// Maximum lanes to print; 0 (default) = unbounded. The exit code always
-    /// evaluates every lane regardless of this limit.
+    /// Maximum owner lanes to print; 0 (default) = unbounded. The exit code
+    /// always evaluates every owner lane regardless of this limit.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
     /// Output format: text (default) or json (review_summary_v1 envelope)
     #[arg(long)]
     pub format: Option<String>,
+}
+
+#[derive(Args)]
+pub struct ReviewAssignOwnerArgs {
+    pub observation_id: String,
+
+    /// Fix-owner repository (id, alias, local path, or `current`)
+    pub repository: String,
+
+    #[arg(long)]
+    pub reviewer: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -757,4 +842,34 @@ pub struct ReviewHistoryArgs {
 pub struct ReviewVerifyReportArgs {
     /// Path to the completion report (YAML or JSON)
     pub report: std::path::PathBuf,
+}
+
+/// CLI value for the canonical `--work-status` filter. Parses to the
+/// reducer's `WorkStatus`; invalid values are rejected at the argument
+/// boundary so filters never silently match nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkStatusArg(pub crate::remediation::reducer::WorkStatus);
+
+impl std::str::FromStr for WorkStatusArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "actionable" => Ok(WorkStatusArg(
+                crate::remediation::reducer::WorkStatus::Actionable,
+            )),
+            "active" => Ok(WorkStatusArg(
+                crate::remediation::reducer::WorkStatus::Active,
+            )),
+            "resolved" => Ok(WorkStatusArg(
+                crate::remediation::reducer::WorkStatus::Resolved,
+            )),
+            "terminal" => Ok(WorkStatusArg(
+                crate::remediation::reducer::WorkStatus::Terminal,
+            )),
+            other => Err(format!(
+                "invalid work status {other:?} (expected actionable|active|resolved|terminal)"
+            )),
+        }
+    }
 }

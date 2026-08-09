@@ -23,6 +23,10 @@ pub struct NextFilters {
     pub include_deferred: bool,
     pub my_session: String,
     pub now: String,
+    /// Observation ids matching the canonical work-status filter, or None
+    /// when unfiltered. Derived by the reducer; injected as a json_each
+    /// IN-clause so filtering never re-implements currentness in SQL.
+    pub work_status_ids: Option<Vec<String>>,
 }
 
 /// The selected observation id, or None for an empty queue.
@@ -30,6 +34,9 @@ pub fn select_next(conn: &rusqlite::Connection, f: &NextFilters) -> Result<Optio
     let mut stmt = conn.prepare(
         "SELECT o.observation_id
          FROM observations o
+         LEFT JOIN observation_repositories owner_r
+           ON owner_r.observation_id = o.observation_id
+          AND owner_r.role = 'owner'
          LEFT JOIN observation_review_state rs ON rs.observation_id = o.observation_id
          WHERE NOT EXISTS (
              SELECT 1 FROM records r
@@ -47,13 +54,13 @@ pub fn select_next(conn: &rusqlite::Connection, f: &NextFilters) -> Result<Optio
                AND c.lease_expires_at > ?2
                AND c.claim_session_id != ?3
          )
-         AND (?4 IS NULL OR EXISTS (
-             SELECT 1 FROM observation_repositories or2
-             WHERE or2.observation_id = o.observation_id AND or2.repository_id = ?4
-         ))
+         AND (?4 IS NULL OR owner_r.repository_id = ?4)
          AND (?5 IS NULL OR o.kind_assertion = ?5)
          AND (?6 IS NULL OR o.severity_assertion = ?6)
          AND (?7 = 0 OR rs.observation_id IS NULL OR rs.state = 'unreviewed')
+         AND (?8 IS NULL OR o.observation_id IN (
+             SELECT value FROM json_each(?8)
+         ))
          ORDER BY
            CASE o.severity_assertion
              WHEN 'blocker' THEN 5 WHEN 'major' THEN 4 WHEN 'medium' THEN 3
@@ -62,6 +69,7 @@ pub fn select_next(conn: &rusqlite::Connection, f: &NextFilters) -> Result<Optio
            o.local_sequence ASC
          LIMIT 1",
     )?;
+
     let row = stmt
         .query_row(
             rusqlite::params![
@@ -72,6 +80,9 @@ pub fn select_next(conn: &rusqlite::Connection, f: &NextFilters) -> Result<Optio
                 f.kind,
                 f.severity,
                 f.unreviewed as i64,
+                f.work_status_ids
+                    .as_ref()
+                    .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string())),
             ],
             |row| row.get::<_, String>(0),
         )
@@ -130,7 +141,7 @@ pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::V
 
     let repositories: Vec<String> = {
         let mut stmt = store.conn.prepare(
-            "SELECT repository_id FROM observation_repositories WHERE observation_id = ?1 ORDER BY role, repository_id",
+            "SELECT DISTINCT repository_id FROM observation_repositories WHERE observation_id = ?1 ORDER BY repository_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![observation_id], |row| {
             row.get::<_, String>(0)
@@ -141,6 +152,16 @@ pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::V
         }
         v
     };
+
+    let owner_repository_id: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT repository_id FROM observation_repositories
+             WHERE observation_id = ?1 AND role = 'owner'",
+            rusqlite::params![observation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
 
     let history: Vec<serde_json::Value> = {
         let mut stmt = store.conn.prepare(
@@ -178,15 +199,20 @@ pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::V
         },
         "observation": observation,
         "current_state": {
+            "work_status": reduced.work_status.as_str(),
+            "remediation_status": reduced.state,
             "disposition": reduced.disposition,
+            "redirect_observation_id": reduced.disposition_target,
             "handled": reduced.handled,
+            "reopened": reduced.reopened,
+            "verification": reduced.latest_verification_status,
+            "owner_repository_id": owner_repository_id,
             "active_claim": reduced.active_claim.as_ref().map(|c| json!({
                 "claim_id": c.claim_id,
                 "claimed_by": c.claimed_by,
                 "claim_session_id": c.claim_session_id,
                 "lease_expires_at": c.lease_expires_at,
             })),
-            "remediation_status": reduced.state,
         },
         "relationships": [],
         "remediation_history": history,
@@ -213,11 +239,11 @@ pub fn render_next_text(
     observation_id: &str,
     reduced: &crate::remediation::reducer::ReducedObservation,
 ) {
-    println!("{}", observation_id);
+    println!("{}", crate::remediation::terminal_safe(observation_id));
     println!(
         "state: {}  disposition: {}  handled: {}",
-        reduced.state,
-        reduced.disposition.as_deref().unwrap_or("-"),
+        crate::remediation::terminal_safe(&reduced.state),
+        crate::remediation::terminal_safe(reduced.disposition.as_deref().unwrap_or("-")),
         reduced.handled
     );
 }

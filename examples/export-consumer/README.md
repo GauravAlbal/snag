@@ -79,12 +79,17 @@ it to get visibility quickly on a small repo; do not build your pipeline on
 it. It does not look at existing issues — re-running without a checkpoint
 files duplicates.
 
+The adapter includes persisted ownership in each issue body (`Fix owner`, or
+`explicitly unowned`) rather than silently dropping it.
+
 ## Writing your own
 
 The contract you must implement is small and stable:
 
 1. Read the header; refuse streams with `export_schema_version != 1` or
-   `minimum_reader_version > 1`.
+   `minimum_reader_version > 3`. Version 3 is required when ownership fields
+   or owner-assignment records are present; preserve those fields when
+   transforming observations.
 2. Iterate records; enforce sequence contiguity and hash shape.
 3. Persist `{last_sequence, last_record_hash}` after each successful pass.
 4. Resume with `snag export --after-sequence N`.

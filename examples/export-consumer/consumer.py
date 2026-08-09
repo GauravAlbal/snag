@@ -53,10 +53,10 @@ def parse_stream(stream, after_sequence: int):
         raise ValueError(
             f"unsupported export_schema_version {header.get('export_schema_version')}"
         )
-    if header.get("minimum_reader_version", 1) > 1:
+    if header.get("minimum_reader_version", 1) > 3:
         raise ValueError(
             f"stream requires reader version {header.get('minimum_reader_version')}; "
-            "this consumer supports <= 1"
+            "this consumer supports <= 3"
         )
     validate_hash("previous_checkpoint_hash", header["previous_checkpoint_hash"])
     validate_hash("head_record_hash", header["head_record_hash"])

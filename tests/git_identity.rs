@@ -73,12 +73,14 @@ fn test_linked_worktrees_share_repository() {
     ctx.cmd()
         .current_dir(&main)
         .arg("report")
+        .arg("--unowned")
         .arg("in main")
         .assert()
         .success();
     ctx.cmd()
         .current_dir(&wt1)
         .arg("report")
+        .arg("--unowned")
         .arg("in wt1")
         .assert()
         .success();
@@ -137,6 +139,7 @@ fn test_ambiguous_remote_aliases() {
     ctx.cmd()
         .current_dir(&a)
         .arg("report")
+        .arg("--unowned")
         .arg("in a")
         .arg("--repo-id")
         .arg("repoA")
@@ -145,6 +148,7 @@ fn test_ambiguous_remote_aliases() {
     ctx.cmd()
         .current_dir(&b)
         .arg("report")
+        .arg("--unowned")
         .arg("in b")
         .arg("--repo-id")
         .arg("repoB")
@@ -161,6 +165,7 @@ fn test_ambiguous_remote_aliases() {
     ctx.cmd()
         .current_dir(&c)
         .arg("report")
+        .arg("--unowned")
         .arg("in c")
         .assert()
         .failure()
@@ -174,16 +179,22 @@ fn test_ambiguous_remote_aliases() {
     );
 }
 
-/// An explicit --repo-id is honored and linked (G28).
+/// An explicit --repo-id is honored and linked when it establishes the
+/// checkout identity (G28).
 #[test]
 fn test_explicit_repo_id() {
     let ctx = TestContext::new();
     let repo = ctx.home_dir.path().join("repo");
     init_repo(&repo);
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
 
     ctx.cmd()
         .current_dir(&repo)
         .arg("report")
+        .arg("--unowned")
         .arg("explicit")
         .arg("--repo-id")
         .arg("repo_corp_backend")
@@ -194,6 +205,122 @@ fn test_explicit_repo_id() {
     assert!(
         repos.iter().any(|(id, _)| id == "repo_corp_backend"),
         "explicit repository id not present: {repos:?}"
+    );
+    let checkouts = store_rows(
+        &ctx,
+        "SELECT checkout_id, repository_id FROM checkouts ORDER BY checkout_id",
+    );
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(checkouts[0].1, "repo_corp_backend");
+    let worktrees = store_rows(
+        &ctx,
+        "SELECT worktree_id, checkout_id FROM worktrees ORDER BY worktree_id",
+    );
+    assert_eq!(worktrees.len(), 1);
+    assert_eq!(worktrees[0].1, checkouts[0].0);
+    let aliases = store_rows(
+        &ctx,
+        "SELECT alias, repository_id FROM repository_aliases ORDER BY alias",
+    );
+    assert_eq!(
+        aliases,
+        vec![("acme/widgets".to_string(), "repo_corp_backend".to_string())]
+    );
+}
+
+/// A foreign explicit ID still owns the report, but cannot relabel a checkout
+/// that already has a different canonical repository identity.
+#[test]
+fn test_conflicting_explicit_repo_id_does_not_link_ambient_git_identity() {
+    let ctx = TestContext::new();
+    let repo = ctx.home_dir.path().join("repo");
+    init_repo(&repo);
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+
+    ctx.cmd()
+        .current_dir(&repo)
+        .arg("report")
+        .arg("--unowned")
+        .arg("canonical checkout")
+        .assert()
+        .success();
+    let repos_before = store_rows(
+        &ctx,
+        "SELECT repository_id, created_at FROM repositories ORDER BY repository_id",
+    );
+    assert_eq!(repos_before.len(), 1);
+    let canonical_repo_id = repos_before[0].0.clone();
+
+    ctx.cmd()
+        .current_dir(&repo)
+        .arg("report")
+        .arg("--unowned")
+        .arg("foreign reporter")
+        .arg("--repo-id")
+        .arg("foreign_lane")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "ambient Git identity was not linked",
+        ));
+
+    let repos = store_rows(
+        &ctx,
+        "SELECT repository_id, created_at FROM repositories ORDER BY repository_id",
+    );
+    assert!(
+        repos.iter().any(|(id, _)| id == "foreign_lane"),
+        "explicit reporter identity must still be honored: {repos:?}"
+    );
+    let reporter = store_rows(
+        &ctx,
+        "SELECT r.role, r.repository_id
+         FROM observation_repositories r
+         JOIN observations o ON o.observation_id = r.observation_id
+         WHERE o.title = 'foreign reporter'",
+    );
+    assert_eq!(
+        reporter,
+        vec![("reporter".to_string(), "foreign_lane".to_string())]
+    );
+
+    let aliases = store_rows(
+        &ctx,
+        "SELECT alias, repository_id FROM repository_aliases ORDER BY alias, repository_id",
+    );
+    assert_eq!(
+        aliases,
+        vec![("acme/widgets".to_string(), canonical_repo_id.clone())],
+        "a conflicting explicit ID must not acquire ambient remote aliases"
+    );
+    let checkout_repos = store_rows(
+        &ctx,
+        "SELECT checkout_id, repository_id FROM checkouts ORDER BY checkout_id",
+    );
+    assert_eq!(checkout_repos.len(), 1);
+    assert_eq!(checkout_repos[0].1, canonical_repo_id);
+    let worktrees = store_rows(
+        &ctx,
+        "SELECT worktree_id, checkout_id FROM worktrees ORDER BY worktree_id",
+    );
+    assert_eq!(worktrees.len(), 1);
+    assert_eq!(worktrees[0].1, checkout_repos[0].0);
+
+    let context_links = store_rows(
+        &ctx,
+        "SELECT
+             COALESCE(json_extract(context_json, '$.repository.checkout_id'), ''),
+             COALESCE(json_extract(context_json, '$.repository.worktree_id'), '')
+         FROM observations
+         WHERE title = 'foreign reporter'",
+    );
+    assert_eq!(
+        context_links,
+        vec![(String::new(), String::new())],
+        "the conflicting report must not claim the ambient checkout or worktree"
     );
 }
 
@@ -209,6 +336,7 @@ fn test_affected_repo_by_id() {
     ctx.cmd()
         .current_dir(&other)
         .arg("report")
+        .arg("--unowned")
         .arg("bind other")
         .assert()
         .success();
@@ -222,6 +350,7 @@ fn test_affected_repo_by_id() {
     ctx.cmd()
         .current_dir(&main)
         .arg("report")
+        .arg("--unowned")
         .arg("affects other")
         .arg("--repo-id")
         .arg("repo_main")
