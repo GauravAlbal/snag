@@ -203,97 +203,79 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
         )?;
     }
 
-    if current_version < 2 {
-        crate::migrations::migrate_v1_to_v2(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'))",
-            [],
-        )?;
-    }
+    apply_incremental_migrations(&tx, current_version)?;
 
-    if current_version < 3 {
-        crate::migrations::migrate_v2_to_v3(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (3, datetime('now'))",
-            [],
-        )?;
-    }
+    tx.commit()?;
+    Ok(())
+}
 
-    if current_version < 4 {
-        crate::migrations::migrate_v3_to_v4(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (4, datetime('now'))",
-            [],
-        )?;
-    }
-
-    if current_version < 5 {
-        crate::migrations::migrate_v4_to_v5(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (5, datetime('now'))",
-            [],
-        )?;
-    }
-
+/// Apply every pending migration in version order. Bare-marker versions (v6,
+/// v10) record the marker without running a migration; see the comments there.
+fn apply_incremental_migrations(
+    tx: &rusqlite::Transaction<'_>,
+    current_version: i64,
+) -> anyhow::Result<()> {
+    apply_migration_if_needed(tx, current_version, 2, crate::migrations::migrate_v1_to_v2)?;
+    apply_migration_if_needed(tx, current_version, 3, crate::migrations::migrate_v2_to_v3)?;
+    apply_migration_if_needed(tx, current_version, 4, crate::migrations::migrate_v3_to_v4)?;
+    apply_migration_if_needed(tx, current_version, 5, crate::migrations::migrate_v4_to_v5)?;
     // v6 is a lane-local migration in the internal lane (legacy payload
     // chain repair). The shared store may already carry it; the public chain
     // has no v6 of its own, so a store at v6 simply proceeds — record it as
     // applied only when absent.
-    if current_version < 6 {
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (6, datetime('now'))",
-            [],
-        )?;
-    }
-
-    if current_version < 7 {
-        crate::migrations::migrate_v6_to_v7(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (7, datetime('now'))",
-            [],
-        )?;
-    }
-
-    if current_version < 8 {
-        crate::migrations::migrate_v7_to_v8(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (8, datetime('now'))",
-            [],
-        )?;
-    }
-    if current_version < 9 {
-        crate::migrations::migrate_v8_to_v9(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (9, datetime('now'))",
-            [],
-        )?;
-    }
+    record_migration_if_needed(tx, current_version, 6)?;
+    apply_migration_if_needed(tx, current_version, 7, crate::migrations::migrate_v6_to_v7)?;
+    apply_migration_if_needed(tx, current_version, 8, crate::migrations::migrate_v7_to_v8)?;
+    apply_migration_if_needed(tx, current_version, 9, crate::migrations::migrate_v8_to_v9)?;
     // v10 is a compatibility marker: the internal lane already uses it for
     // the same record lookup index installed by public v9.
-    if current_version < 10 {
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (10, datetime('now'))",
-            [],
-        )?;
-    }
-    if current_version < 11 {
-        crate::migrations::migrate_v10_to_v11(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (11, datetime('now'))",
-            [],
-        )?;
-    }
+    record_migration_if_needed(tx, current_version, 10)?;
+    apply_migration_if_needed(
+        tx,
+        current_version,
+        11,
+        crate::migrations::migrate_v10_to_v11,
+    )?;
     // v13 is lane-convergent: the record-lookup index may be absent despite
     // older markers (v9/v10) that created it in a later binary. `IF NOT
     // EXISTS` makes it safe on any store; see migrations::migrate_v12_to_v13.
-    if current_version < 13 {
-        crate::migrations::migrate_v12_to_v13(&tx)?;
+    apply_migration_if_needed(
+        tx,
+        current_version,
+        13,
+        crate::migrations::migrate_v12_to_v13,
+    )?;
+    Ok(())
+}
+
+/// Run `migration` and record its marker when `current_version` predates it.
+fn apply_migration_if_needed<F>(
+    tx: &rusqlite::Transaction<'_>,
+    current_version: i64,
+    version: i64,
+    migration: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<()>,
+{
+    if current_version < version {
+        migration(tx)?;
+        record_migration_if_needed(tx, current_version, version)?;
+    }
+    Ok(())
+}
+
+/// Record a bare migration marker (no migration body) when absent.
+fn record_migration_if_needed(
+    tx: &rusqlite::Transaction<'_>,
+    current_version: i64,
+    version: i64,
+) -> anyhow::Result<()> {
+    if current_version < version {
         tx.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (13, datetime('now'))",
-            [],
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, datetime('now'))",
+            [version],
         )?;
     }
-
-    tx.commit()?;
     Ok(())
 }
