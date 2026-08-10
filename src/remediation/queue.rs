@@ -131,6 +131,33 @@ fn load_observation(store: &Store, observation_id: &str) -> Result<crate::types:
 /// relationships come from the materialized remediation tables. The packet
 /// identifies its store so a fresh agent can never mistake a scratch store's
 /// empty queue for the real one.
+fn relationship_rows(conn: &rusqlite::Connection, observation_id: &str) -> Result<Vec<serde_json::Value>> {
+    // Project the persisted relationship edges (both directions) — a recorded
+    // relationship_added must appear here, not just in remediation_history
+    // (obs: review show omits recorded observation relationships).
+    let mut stmt = conn.prepare(
+        "SELECT relation, left_observation_id, right_observation_id, created_at
+         FROM observation_relationships
+         WHERE (left_observation_id = ?1 OR right_observation_id = ?1)
+           AND retracted_by_record_sequence IS NULL
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![observation_id], |row| {
+        Ok(json!({
+            "relation": row.get::<_, String>(0)?,
+            "left_observation_id": row.get::<_, String>(1)?,
+            "right_observation_id": row.get::<_, String>(2)?,
+            "recorded_at": row.get::<_, String>(3)?,
+        }))
+    })?;
+    let mut v = Vec::new();
+    for r in rows {
+        v.push(r?);
+    }
+    Ok(v)
+}
+
+
 pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::Value> {
     let observation = load_observation(store, observation_id)?;
     let reduced = crate::remediation::reducer::reduce_observation(&store.conn, observation_id)?;
@@ -214,7 +241,7 @@ pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::V
                 "lease_expires_at": c.lease_expires_at,
             })),
         },
-        "relationships": [],
+        "relationships": relationship_rows(&store.conn, observation_id)?,
         "remediation_history": history,
         "repositories": repositories,
         "artifacts": observation
