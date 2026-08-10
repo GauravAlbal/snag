@@ -2445,3 +2445,43 @@ fn verify_rejects_projected_owner_drift() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("owner mismatch"), "{err}");
 }
+
+#[test]
+fn review_show_projects_persisted_relationships() -> anyhow::Result<()> {
+    // A recorded relationship must appear in the show packet's relationships
+    // array, not just remediation_history (obs: review show omits recorded
+    // observation relationships).
+    let ctx = TestContext::new();
+    let left = report_owned(&ctx, "rel left", "bug", "major", "repo_alpha");
+    let right = report_owned(&ctx, "rel right", "bug", "major", "repo_alpha");
+    let out = ctx
+        .cmd()
+        .arg("review")
+        .arg("relate")
+        .arg("--relation")
+        .arg("related")
+        .arg(&left)
+        .arg(&right)
+        .output()?;
+    assert!(out.status.success(), "relate must succeed: {:?}", out);
+    let show_out = ctx
+        .cmd()
+        .arg("review")
+        .arg("show")
+        .arg(&left)
+        .arg("--format")
+        .arg("agent")
+        .output()?;
+    assert!(
+        show_out.status.success(),
+        "show failed: {}",
+        String::from_utf8_lossy(&show_out.stderr)
+    );
+    let packet: serde_json::Value =
+        serde_json::from_slice(&show_out.stdout).expect("show stdout must be JSON");
+    let rels = packet["relationships"].as_array().cloned().unwrap_or_default();
+    assert_eq!(rels.len(), 1, "relationship must be projected: {packet}");
+    assert_eq!(rels[0]["relation"], "related");
+    assert_eq!(rels[0]["right_observation_id"], right);
+    Ok(())
+}
