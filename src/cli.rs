@@ -375,12 +375,20 @@ pub enum ReviewCommand {
     /// Retract a relationship assertion (append-only)
     Unrelate(ReviewUnrelateArgs),
     /// Promote a confirmed observation to a finding
+    ///
+    /// Requires the observation to have disposition `confirmed`.
     Promote(ReviewPromoteArgs),
     /// Attach owned work (multiple task ids supported)
+    ///
+    /// Requires the observation to have disposition `confirmed`.
     AttachTask(ReviewAttachTaskArgs),
     /// Attach a candidate fixing commit
+    ///
+    /// Requires the observation to have disposition `confirmed`.
     AttachFix(ReviewAttachFixArgs),
     /// Attach verification evidence (accepted is the only verifying status)
+    ///
+    /// Requires the observation to have disposition `confirmed`.
     AttachVerification(ReviewAttachVerificationArgs),
     /// Declare an observation durably handled
     MarkHandled(ReviewMarkHandledArgs),

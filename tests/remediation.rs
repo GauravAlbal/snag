@@ -453,6 +453,29 @@ fn t1b_review_repo_help_names_fix_owner_lane() {
 }
 
 #[test]
+fn t1b_review_remediation_help_requires_confirmed_disposition() {
+    let ctx = TestContext::new();
+    for subcommand in [
+        "attach-task",
+        "promote",
+        "attach-fix",
+        "attach-verification",
+    ] {
+        let out = ctx
+            .cmd()
+            .args(["review", subcommand, "--help"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            help.contains("Requires the observation to have disposition `confirmed`."),
+            "{subcommand} help: {help}"
+        );
+    }
+}
+
+#[test]
 fn t1b_list_filters_kind_and_severity() {
     let ctx = TestContext::new();
     let bug = report(&ctx, "a bug", "bug", "major");
@@ -1730,6 +1753,119 @@ fn t5_reopen_after_verification_is_append_only() {
         )
         .unwrap();
     assert_eq!(events_after, events_before + 1, "reopening is append-only");
+}
+
+#[test]
+fn t5_full_verify_waits_for_remediation_failure() {
+    let ctx = TestContext::new();
+    let observation = report(&ctx, "verify-ordering", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&observation)
+        .arg("confirmed")
+        .assert()
+        .success();
+
+    // Corrupt only the derived remediation projection. Store integrity and
+    // the record chain remain valid, so the failure comes after full store
+    // verification reaches the remediation replay.
+    ctx.conn()
+        .execute(
+            "UPDATE observation_review_state
+             SET commits_json = '[{\"commit_sha\":\"stale\",\"repository_id\":\"repo\"}]'
+             WHERE observation_id = ?1",
+            [&observation],
+        )
+        .unwrap();
+    let output = ctx.cmd().arg("verify").arg("--full").output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "stale remediation state must fail"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("commit lineage mismatch"),
+        "failure must identify the remediation projection mismatch: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Full verification passed"),
+        "a remediation failure must not emit a success claim: {stdout}"
+    );
+}
+
+#[test]
+fn t5_reopened_negative_disposition_clears_stale_lineage() {
+    let ctx = TestContext::new();
+    let observation = report(&ctx, "reopened-negative-lineage", "bug", "major");
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&observation)
+        .arg("confirmed")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-fix")
+        .arg(&observation)
+        .arg("--commit")
+        .arg("old-sha")
+        .arg("--repo")
+        .arg("repo")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("attach-verification")
+        .arg(&observation)
+        .arg("--receipt")
+        .arg("old-receipt")
+        .arg("--status")
+        .arg("accepted")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("reopen-remediation")
+        .arg(&observation)
+        .arg("--rationale")
+        .arg("recheck")
+        .assert()
+        .success();
+    ctx.cmd_as("alice")
+        .arg("review")
+        .arg("disposition")
+        .arg(&observation)
+        .arg("expected_behavior")
+        .assert()
+        .success();
+
+    let (commits, receipts, latest): (String, String, Option<String>) = ctx
+        .conn()
+        .query_row(
+            "SELECT commits_json, verification_receipts_json,
+                    latest_verification_status
+             FROM observation_review_state
+             WHERE observation_id = ?1",
+            [&observation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(commits, "[]");
+    assert_eq!(receipts, "[]");
+    assert_eq!(latest, None);
+
+    let output = ctx.cmd().arg("verify").arg("--full").output().unwrap();
+    assert!(output.status.success(), "reopened sequence must verify");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout.matches("Full verification passed").count(),
+        1,
+        "healthy full verification emits one success line: {stdout}"
+    );
 }
 
 #[test]

@@ -57,8 +57,8 @@ the release process.
   lanes, ownerless observations aggregate under `(unowned)`, and the text
   column is labeled `OWNER`.
 - Prefer checkout-backed aliases for opaque owner IDs and render readable
-  explicit IDs verbatim, preventing stale foreign aliases from making `arq`
-  appear as `GauravAlbal/snag`.
+  explicit IDs verbatim, preventing stale foreign aliases from making one
+  repository appear as another.
 - Keep `review list` and `review summary` read-pure under `--repo current`:
   repository filters now resolve from existing checkout and confirmed-alias
   state without creating repository, alias, checkout, or worktree rows.

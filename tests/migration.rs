@@ -616,7 +616,7 @@ fn test_v11_rebuilds_stale_review_projection_after_legacy_markers() {
     // Exercise the original v7 -> v8 replay path and continue through the
     // current migration head.
     conn.execute(
-        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11)",
+        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13)",
         [],
     )
     .unwrap();
@@ -683,8 +683,11 @@ fn test_v11_rebuilds_stale_review_projection_after_legacy_markers() {
         [&observation_id],
     )
     .unwrap();
-    conn.execute("DELETE FROM schema_migrations WHERE version = 11", [])
-        .unwrap();
+    conn.execute(
+        "DELETE FROM schema_migrations WHERE version IN (11, 12, 13)",
+        [],
+    )
+    .unwrap();
     drop(conn);
     ctx.cmd()
         .arg("report")
@@ -782,7 +785,7 @@ fn test_record_lookup_index_fresh_upgraded_and_rerun_safe() {
     // Re-run the forward migration marker while the index already exists.
     let conn = Connection::open(fresh.data_dir.join("snag.sqlite")).unwrap();
     conn.execute(
-        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11)",
+        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13)",
         [],
     )
     .unwrap();

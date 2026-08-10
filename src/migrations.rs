@@ -423,3 +423,18 @@ pub fn migrate_v8_to_v9(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
 pub fn migrate_v10_to_v11(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
     migrate_v7_to_v8(tx)
 }
+
+/// v12 -> v13: guarantee the record-lookup index regardless of lane history.
+/// The index was introduced under v9 in the public lane and v10 in the
+/// internal lane after lane markers had already collided, so stores migrated
+/// by an earlier binary can carry the marker without the index. Same
+/// idempotent statement in both lanes, so whichever binary runs next heals
+/// the store. This version must stay semantically identical across lanes.
+pub fn migrate_v12_to_v13(tx: &rusqlite::Transaction) -> anyhow::Result<()> {
+    tx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_records_entity_type_sequence
+         ON records(entity_id, record_type, local_sequence)",
+        [],
+    )?;
+    Ok(())
+}

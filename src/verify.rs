@@ -2,13 +2,19 @@ use crate::cli::VerifyArgs;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 
 pub fn handle(args: VerifyArgs) -> Result<()> {
     if let Some(backup_path) = args.backup {
-        println!("Verifying backup at {:?}", backup_path);
-        verify_backup(&backup_path)?;
+        if !args.json {
+            println!("Verifying backup at {:?}", backup_path);
+        }
+        let verification = verify_quietly(|| verify_backup_report(&backup_path), args.json)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&verification)?);
+        }
         return Ok(());
     }
 
@@ -28,13 +34,27 @@ pub fn handle(args: VerifyArgs) -> Result<()> {
         if !args.json {
             println!("Running full verification...");
         }
-        verify_quietly(
+        let summary = verify_quietly(
             || {
-                full_verify(&mut store)?;
-                crate::remediation::verify::verify_remediation(&store.conn, false)
+                let summary = full_verify_facts(&mut store)?;
+                crate::remediation::verify::verify_remediation(&store.conn, false)?;
+                Ok(summary)
             },
             args.json,
         )?;
+        if !args.json {
+            if summary.orphan_objects > 0 {
+                println!(
+                    "Full verification passed ({} records checked; {} orphan objects reported).",
+                    summary.records_checked, summary.orphan_objects
+                );
+            } else {
+                println!(
+                    "Full verification passed ({} records checked).",
+                    summary.records_checked
+                );
+            }
+        }
     }
     if args.json {
         println!(
@@ -45,9 +65,9 @@ pub fn handle(args: VerifyArgs) -> Result<()> {
     Ok(())
 }
 
-fn verify_quietly<F>(f: F, quiet: bool) -> Result<()>
+fn verify_quietly<F, T>(f: F, quiet: bool) -> Result<T>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<T>,
 {
     if !quiet {
         return f();
@@ -62,6 +82,8 @@ where
         }
         unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO) };
         let result = f();
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
         unsafe { libc::dup2(saved, libc::STDOUT_FILENO) };
         unsafe { libc::close(saved) };
         result
@@ -245,12 +267,22 @@ fn verify_suffix_artifacts(store: &Store) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FullVerifySummary {
+    records_checked: i64,
+    orphan_objects: i64,
+}
+
 /// Full verification: integrity, foreign keys, sequence base + contiguity,
 /// complete record hash chain, canonical binding, records-agree-with-
 /// observations/actions, action targets exist, repository/checkout/worktree
 /// relationships, artifact length + digest, orphan objects, store metadata
 /// vs head, idempotency key contract, and head-sequence/hash agreement.
 pub fn full_verify(store: &mut Store) -> Result<()> {
+    full_verify_facts(store).map(|_| ())
+}
+
+fn full_verify_facts(store: &mut Store) -> Result<FullVerifySummary> {
     integrity_and_fk_check(&store.conn)?;
     seq_contiguity_check(&store.conn)?;
     let (last_hash, chain_count) = record_chain_verify(store)?;
@@ -260,18 +292,10 @@ pub fn full_verify(store: &mut Store) -> Result<()> {
     store_head_check(&store.conn, &last_hash, chain_count)?;
     idempotency_dup_check(&store.conn)?;
 
-    if orphan > 0 {
-        println!(
-            "Full verification passed ({} records checked; {} orphan objects reported).",
-            chain_count, orphan
-        );
-    } else {
-        println!(
-            "Full verification passed ({} records checked).",
-            chain_count
-        );
-    }
-    Ok(())
+    Ok(FullVerifySummary {
+        records_checked: chain_count,
+        orphan_objects: orphan,
+    })
 }
 
 /// SQLite integrity check plus foreign-key violation scan.
@@ -514,6 +538,20 @@ struct BundleManifest {
     store_id: String,
     head_record_hash: String,
     through_sequence: u64,
+    record_count: u64,
+    artifact_count: u64,
+    database_digest: String,
+    artifact_manifest_digest: String,
+}
+
+#[derive(Serialize)]
+struct BackupVerification {
+    verified: bool,
+    store_id: String,
+    through_sequence: u64,
+    head_hash: String,
+    record_count: u64,
+    artifact_count: u64,
     database_digest: String,
     artifact_manifest_digest: String,
 }
@@ -527,13 +565,21 @@ struct BundleManifest {
 /// modified manifest, modified object manifest, missing/modified artifact,
 /// swapped components, mismatched store ID, and incorrect head metadata.
 pub fn verify_backup(backup_path: &Path) -> Result<()> {
+    verify_backup_report(backup_path).map(|_| ())
+}
+
+fn verify_backup_report(backup_path: &Path) -> Result<BackupVerification> {
     let snapshot = crate::backup::resolve_bundle(backup_path)?;
-    verify_bundle_dir(snapshot.path())
+    verify_bundle_dir_report(snapshot.path())
 }
 
 /// Verify an already-resolved private snapshot without resolving/extracting it
 /// again. Restore uses this to make verification and cutover share one view.
 pub(crate) fn verify_bundle_dir(bundle_dir: &Path) -> Result<()> {
+    verify_bundle_dir_report(bundle_dir).map(|_| ())
+}
+
+fn verify_bundle_dir_report(bundle_dir: &Path) -> Result<BackupVerification> {
     bundle_files_check(bundle_dir)?;
     let manifest = manifest_validate(bundle_dir)?;
     let obj_manifest = object_manifest_verify(bundle_dir, &manifest.artifact_manifest_digest)?;
@@ -557,7 +603,16 @@ pub(crate) fn verify_bundle_dir(bundle_dir: &Path) -> Result<()> {
         "Backup verification passed ({} artifacts, through seq {}).",
         verified_artifacts, head_seq
     );
-    Ok(())
+    Ok(BackupVerification {
+        verified: true,
+        store_id: manifest.store_id,
+        through_sequence: manifest.through_sequence,
+        head_hash: manifest.head_record_hash,
+        record_count: manifest.record_count,
+        artifact_count: manifest.artifact_count,
+        database_digest: manifest.database_digest,
+        artifact_manifest_digest: manifest.artifact_manifest_digest,
+    })
 }
 
 /// Every required bundle file is present.
@@ -601,6 +656,12 @@ fn manifest_validate(bundle_dir: &Path) -> Result<BundleManifest> {
         through_sequence: manifest["through_sequence"]
             .as_u64()
             .context("manifest missing through_sequence")?,
+        record_count: manifest["record_count"]
+            .as_u64()
+            .context("manifest missing record_count")?,
+        artifact_count: manifest["artifact_count"]
+            .as_u64()
+            .context("manifest missing artifact_count")?,
         database_digest: manifest["database_digest"]
             .as_str()
             .context("manifest missing database_digest")?

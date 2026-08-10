@@ -2467,6 +2467,12 @@ fn bulk_display_names(
              JOIN json_each(
                   json_extract(o.context_json, '$.repository.git_remote_aliases')
              ) context_alias
+             -- Alias evidence only matters for lanes shown here: the outer
+             -- LEFT JOIN requires oa.repository_id = ra.repository_id with ra
+             -- already restricted to the lane set, so rows outside it can
+             -- never contribute. Bounding the CTE keeps this O(lanes) instead
+             -- of a full-store scan of observation context JSON.
+             WHERE c.repository_id IN ({placeholders})
          )
          SELECT ra.repository_id, ra.alias
          FROM repository_aliases ra
@@ -2478,8 +2484,11 @@ fn bulk_display_names(
                   CASE WHEN oa.repository_id IS NOT NULL THEN 1 ELSE 0 END DESC,
                   ra.last_seen_at DESC, ra.alias DESC"
     );
+    // One value per placeholder: the CTE and the outer WHERE each bind the
+    // lane set.
     let params: Vec<Box<dyn rusqlite::ToSql>> = generated_ids
         .iter()
+        .chain(generated_ids.iter())
         .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>)
         .collect();
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();

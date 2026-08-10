@@ -283,6 +283,16 @@ pub fn apply_migrations(conn: &mut Connection) -> anyhow::Result<()> {
             [],
         )?;
     }
+    // v13 is lane-convergent: the record-lookup index may be absent despite
+    // older markers (v9/v10) that created it in a later binary. `IF NOT
+    // EXISTS` makes it safe on any store; see migrations::migrate_v12_to_v13.
+    if current_version < 13 {
+        crate::migrations::migrate_v12_to_v13(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (13, datetime('now'))",
+            [],
+        )?;
+    }
 
     tx.commit()?;
     Ok(())
