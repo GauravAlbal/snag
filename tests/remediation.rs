@@ -2479,7 +2479,10 @@ fn review_show_projects_persisted_relationships() -> anyhow::Result<()> {
     );
     let packet: serde_json::Value =
         serde_json::from_slice(&show_out.stdout).expect("show stdout must be JSON");
-    let rels = packet["relationships"].as_array().cloned().unwrap_or_default();
+    let rels = packet["relationships"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert_eq!(rels.len(), 1, "relationship must be projected: {packet}");
     assert_eq!(rels[0]["relation"], "related");
     assert_eq!(rels[0]["right_observation_id"], right);

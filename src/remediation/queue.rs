@@ -131,7 +131,10 @@ fn load_observation(store: &Store, observation_id: &str) -> Result<crate::types:
 /// relationships come from the materialized remediation tables. The packet
 /// identifies its store so a fresh agent can never mistake a scratch store's
 /// empty queue for the real one.
-fn relationship_rows(conn: &rusqlite::Connection, observation_id: &str) -> Result<Vec<serde_json::Value>> {
+fn relationship_rows(
+    conn: &rusqlite::Connection,
+    observation_id: &str,
+) -> Result<Vec<serde_json::Value>> {
     // Project the persisted relationship edges (both directions) — a recorded
     // relationship_added must appear here, not just in remediation_history
     // (obs: review show omits recorded observation relationships).
@@ -156,7 +159,6 @@ fn relationship_rows(conn: &rusqlite::Connection, observation_id: &str) -> Resul
     }
     Ok(v)
 }
-
 
 pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::Value> {
     let observation = load_observation(store, observation_id)?;
