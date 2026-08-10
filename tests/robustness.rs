@@ -705,16 +705,21 @@ fn test_restore_lock_blocks_writer_until_cutover_then_releases() {
         .env("XDG_DATA_HOME", dst.home_dir.path())
         .env("HOME", dst.home_dir.path())
         .env("SNAG_FAILPOINT_HOLD", "restore_before_active_switch")
-        .env("SNAG_FAILPOINT_HOLD_MS", "3000")
+        .env("SNAG_FAILPOINT_HOLD_MS", "5000")
         .spawn()
         .unwrap();
-    for _ in 0..100 {
+    // Poll for the held phase (exclusive lock taken, forensic copy staged)
+    // instead of assuming a fixed sleep; the restore cannot release the lock
+    // before the observation window below ends.
+    let mut reached_hold = false;
+    for _ in 0..200 {
         if dst.data_dir.join("forensics").exists() {
+            reached_hold = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(reached_hold, "restore must reach the held cutover phase");
 
     let mut writer = Proc::new(dst.bin())
         .args(["report", "barrier writer", "--unowned"])
@@ -728,9 +733,23 @@ fn test_restore_lock_blocks_writer_until_cutover_then_releases() {
         .env("HOME", dst.home_dir.path())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    assert!(writer.try_wait().unwrap().is_none());
-    assert!(reader.try_wait().unwrap().is_none());
+    // Both must stay blocked (alive) across the ENTIRE observation window
+    // while the restore holds the exclusive maintenance lock. The previous
+    // fixed 250 ms sample raced on slow runners (deterministic failure on
+    // ubuntu-24.04-arm); a sustained window proves the block rather than
+    // sampling one instant.
+    let mut blocked_ticks = 0u32;
+    for _ in 0..40 {
+        if writer.try_wait().unwrap().is_some() || reader.try_wait().unwrap().is_some() {
+            break;
+        }
+        blocked_ticks += 1;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(
+        blocked_ticks, 40,
+        "writer and reader must remain blocked while the restore holds the cutover"
+    );
     assert!(dst.data_dir.join("snag.sqlite").exists());
 
     assert!(restore.wait().unwrap().success());
