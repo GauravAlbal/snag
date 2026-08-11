@@ -708,12 +708,19 @@ fn test_restore_lock_blocks_writer_until_cutover_then_releases() {
         .env("SNAG_FAILPOINT_HOLD_MS", "5000")
         .spawn()
         .unwrap();
-    // Poll for the held phase (exclusive lock taken, forensic copy staged)
-    // instead of assuming a fixed sleep; the restore cannot release the lock
-    // before the observation window below ends.
+    // Poll for the restore's held phase instead of assuming a fixed sleep:
+    // the restore acquires its exclusive lock, then writes forensics/pre-restore-*.
+    // The plain `forensics` dir is NOT a reliable marker — the dst store's own
+    // migration also creates it (pre-v2-migration-*) before the restore even
+    // starts, so a bare-directory poll can spawn the writer/reader ahead of the
+    // restore's lock and the shared flock is not a fair queue on Linux.
     let mut reached_hold = false;
     for _ in 0..200 {
-        if dst.data_dir.join("forensics").exists() {
+        if let Ok(entries) = std::fs::read_dir(dst.data_dir.join("forensics"))
+            && entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        {
             reached_hold = true;
             break;
         }
@@ -783,11 +790,15 @@ fn test_killed_restore_releases_lock_for_writer() {
         .env("SNAG_FAILPOINT_HOLD_MS", "5000")
         .spawn()
         .unwrap();
-    for _ in 0..100 {
-        if dst.data_dir.join("forensics").exists() {
+    for _ in 0..200 {
+        if let Ok(entries) = std::fs::read_dir(dst.data_dir.join("forensics"))
+            && entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("pre-restore-"))
+        {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     std::thread::sleep(std::time::Duration::from_millis(250));
 
