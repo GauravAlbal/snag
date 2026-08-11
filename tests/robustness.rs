@@ -23,7 +23,8 @@ impl TestContext {
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("snag").unwrap();
         c.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         c
     }
     fn bin(&self) -> PathBuf {
@@ -517,6 +518,7 @@ fn test_git_timeout_kills_child_and_returns_bounded() {
         .current_dir(&repo)
         .env("XDG_DATA_HOME", ctx.home_dir.path())
         .env("HOME", ctx.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .env("PATH", path)
         .status()
         .unwrap();
@@ -555,6 +557,7 @@ fn run_abort(ctx: &TestContext, args: &[&str], failpoint: &str) -> std::process:
         .args(args)
         .env("XDG_DATA_HOME", ctx.home_dir.path())
         .env("HOME", ctx.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .env("SNAG_FAILPOINT", failpoint)
         .status()
         .unwrap()
@@ -704,6 +707,7 @@ fn test_restore_lock_blocks_writer_until_cutover_then_releases() {
         .args(["restore", archive.to_str().unwrap()])
         .env("XDG_DATA_HOME", dst.home_dir.path())
         .env("HOME", dst.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .env("SNAG_FAILPOINT_HOLD", "restore_before_active_switch")
         .env("SNAG_FAILPOINT_HOLD_MS", "5000")
         .spawn()
@@ -732,12 +736,14 @@ fn test_restore_lock_blocks_writer_until_cutover_then_releases() {
         .args(["report", "barrier writer", "--unowned"])
         .env("XDG_DATA_HOME", dst.home_dir.path())
         .env("HOME", dst.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .spawn()
         .unwrap();
     let mut reader = Proc::new(dst.bin())
         .args(["verify", "--full"])
         .env("XDG_DATA_HOME", dst.home_dir.path())
         .env("HOME", dst.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .spawn()
         .unwrap();
     // Both must stay blocked (alive) across the ENTIRE observation window
@@ -786,6 +792,7 @@ fn test_killed_restore_releases_lock_for_writer() {
         .args(["restore", archive.to_str().unwrap()])
         .env("XDG_DATA_HOME", dst.home_dir.path())
         .env("HOME", dst.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .env("SNAG_FAILPOINT_HOLD", "restore_before_active_switch")
         .env("SNAG_FAILPOINT_HOLD_MS", "5000")
         .spawn()
@@ -806,6 +813,7 @@ fn test_killed_restore_releases_lock_for_writer() {
         .args(["report", "surviving writer", "--unowned"])
         .env("XDG_DATA_HOME", dst.home_dir.path())
         .env("HOME", dst.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -855,6 +863,7 @@ fn test_rebuild_crash_never_publishes_destination() {
             ])
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE")
             .env("SNAG_FAILPOINT", stage)
             .status()
             .unwrap();
@@ -1290,7 +1299,8 @@ fn test_concurrent_same_object_single_artifact() {
             .arg("--artifact")
             .arg(&f)
             .env("XDG_DATA_HOME", ctx.home_dir.path())
-            .env("HOME", ctx.home_dir.path());
+            .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         children.push(c.spawn().unwrap());
     }
     for mut c in children {

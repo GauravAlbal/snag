@@ -27,7 +27,8 @@ impl TestContext {
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("snag").unwrap();
         c.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         c
     }
     fn conn(&self) -> Connection {

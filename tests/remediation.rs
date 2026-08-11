@@ -22,7 +22,8 @@ impl TestContext {
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("snag").unwrap();
         c.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         c
     }
     fn cmd_as(&self, session: &str) -> Command {
@@ -792,6 +793,7 @@ fn t2_process_crash_leaves_no_visible_claim() {
         .args(["review", "claim", &obs])
         .env("XDG_DATA_HOME", ctx.home_dir.path())
         .env("HOME", ctx.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .env("SNAG_REVIEWER_ID", "rev_alice")
         .env("SNAG_REVIEW_SESSION_ID", "sess_alice")
         .env("SNAG_FAILPOINT", "remediation_before_commit")
@@ -822,6 +824,7 @@ fn t2_concurrent_acquisition_yields_exactly_one_winner() {
         c.args(["review", "claim", &obs])
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE")
             .env("SNAG_REVIEWER_ID", format!("rev_{i}"))
             .env("SNAG_REVIEW_SESSION_ID", format!("sess_{i}"))
             .stdout(std::process::Stdio::piped())
@@ -860,6 +863,7 @@ fn t2_concurrent_owner_assignment_preserves_projection_and_stream() {
             .args(["review", "assign-owner", &observation, owner])
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE")
             .env("SNAG_REVIEWER_ID", format!("rev_owner_{i}"))
             .env("SNAG_REVIEW_SESSION_ID", format!("sess_owner_{i}"))
             .stdout(std::process::Stdio::piped())
@@ -2261,6 +2265,7 @@ fn run_with_failpoint(ctx: &TestContext, failpoint: &str, args: &[&str]) -> bool
         .args(args)
         .env("XDG_DATA_HOME", ctx.home_dir.path())
         .env("HOME", ctx.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .env("SNAG_REVIEWER_ID", "rev_alice")
         .env("SNAG_REVIEW_SESSION_ID", "sess_alice")
         .env("SNAG_FAILPOINT", failpoint)

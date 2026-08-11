@@ -483,7 +483,10 @@ pub fn resolve_repository(
 
 /// If the given aliases resolve to exactly one repository across all aliases,
 /// return it. If multiple distinct repositories match, ambiguity is surfaced
-/// (G30: multiple matches must not silently choose the first).
+/// (G30: multiple matches must not silently choose the first). Confirmed rows
+/// only: an unconfirmed candidate must never block a valid fresh-clone
+/// resolution (aligned with `repository_from_git_aliases` and
+/// `resolve_alias_assignment`).
 fn unique_alias_match(store: &mut Store, aliases: &[String]) -> anyhow::Result<Option<String>> {
     let mut candidates: Vec<String> = Vec::new();
     let tx = store
@@ -492,7 +495,9 @@ fn unique_alias_match(store: &mut Store, aliases: &[String]) -> anyhow::Result<O
     for alias in aliases {
         let norm = normalize_remote_alias(alias);
         let mut stmt = tx.prepare(
-            "SELECT repository_id FROM repository_aliases WHERE alias = ?1 ORDER BY repository_id",
+            "SELECT repository_id FROM repository_aliases
+             WHERE alias = ?1 AND confirmed = 1
+             ORDER BY repository_id",
         )?;
         let mut rows = stmt.query(params![norm])?;
         while let Some(row) = rows.next()? {
@@ -503,13 +508,22 @@ fn unique_alias_match(store: &mut Store, aliases: &[String]) -> anyhow::Result<O
         }
     }
     if candidates.len() > 1 {
-        return Err(SnagError::RepositoryAmbiguous(format!(
-            "aliases {:?} match multiple repositories: {:?}",
-            aliases, candidates
-        ))
-        .into());
+        return Err(
+            SnagError::RepositoryAmbiguous(ambiguous_alias_hint(aliases, &candidates)).into(),
+        );
     }
     Ok(candidates.pop())
+}
+
+/// The actionable ambiguity message: name the matches and the only flag that
+/// disambiguates the primary filing identity. `--affected-repo` only annotates
+/// ownership/impact and never resolves the reporter repository.
+fn ambiguous_alias_hint(aliases: &[String], candidates: &[String]) -> String {
+    format!(
+        "aliases {:?} match multiple repositories: {:?}; snag will not guess — \
+         select one with --repo-id <id>",
+        aliases, candidates
+    )
 }
 
 /// Resolve a single `--affected-repo` value. Accepted forms: a repository ID,
