@@ -33,7 +33,10 @@ impl TestContext {
     pub fn cmd(&self) -> Command {
         let mut cmd = Command::cargo_bin("snag").unwrap();
         cmd.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            // The agent harness injects SNAG_CONTEXT_FILE; it may point at a
+            // purged /tmp file and must never leak into isolated CLI runs.
+            .env_remove("SNAG_CONTEXT_FILE");
         cmd
     }
 }
@@ -1351,6 +1354,7 @@ fn test_closed_pipe_exits_cleanly() {
         .arg(format!("'{}' list | head -1", bin.display()))
         .env("XDG_DATA_HOME", ctx.home_dir.path())
         .env("HOME", ctx.home_dir.path())
+        .env_remove("SNAG_CONTEXT_FILE")
         .output()
         .unwrap();
     assert!(
@@ -1575,7 +1579,9 @@ fn repro_key_is_labeled_deterministic_and_distinct() {
     let home = tempfile::tempdir().unwrap();
     let run = |title: &str, ik: Option<&str>| {
         let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
-        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.env("XDG_DATA_HOME", home.path())
+            .env("HOME", home.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         c.arg("report")
             .arg(title)
             .arg("--unowned")
@@ -1637,7 +1643,9 @@ fn thin_high_severity_report_nudges() {
     let home = tempfile::tempdir().unwrap();
     let run = |args: &[&str]| {
         let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
-        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.env("XDG_DATA_HOME", home.path())
+            .env("HOME", home.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         c.arg("report");
         for a in args {
             c.arg(a);
@@ -1686,7 +1694,9 @@ fn prefix_observation_ids_resolve() {
     let home = tempfile::tempdir().unwrap();
     let run = |args: &[&str]| {
         let mut c = assert_cmd::Command::cargo_bin("snag").unwrap();
-        c.env("XDG_DATA_HOME", home.path()).env("HOME", home.path());
+        c.env("XDG_DATA_HOME", home.path())
+            .env("HOME", home.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         for a in args {
             c.arg(a);
         }

@@ -19,7 +19,11 @@ impl TestContext {
     fn cmd(&self) -> Command {
         let mut cmd = Command::cargo_bin("snag").unwrap();
         cmd.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            // The agent harness injects SNAG_CONTEXT_FILE into the ambient
+            // environment; it may point at a purged /tmp file and must never
+            // leak into isolated CLI invocations.
+            .env_remove("SNAG_CONTEXT_FILE");
         cmd
     }
 }
@@ -169,13 +173,86 @@ fn test_ambiguous_remote_aliases() {
         .arg("in c")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("ambiguous"));
+        .stderr(predicate::str::contains("ambiguous"))
+        .stderr(predicate::str::contains("--repo-id"));
     // No third repository may have been created for the ambiguous checkout.
     let repos = store_rows(&ctx, "SELECT repository_id, created_at FROM repositories");
     assert_eq!(
         repos.len(),
         2,
         "ambiguous alias must not invent a third repository"
+    );
+}
+
+/// A confirmed + an unconfirmed row for the SAME alias: the fresh checkout
+/// resolves to the confirmed repository — the never-confirmed candidate must
+/// not join the resolution at all (G30 confirmed-only alignment).
+#[test]
+fn test_unconfirmed_alias_does_not_join_resolution() {
+    let ctx = TestContext::new();
+    let a = ctx.home_dir.path().join("a");
+    let c = ctx.home_dir.path().join("c");
+    init_repo(&a);
+    init_repo(&c);
+    git(
+        &a,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+    ctx.cmd()
+        .current_dir(&a)
+        .arg("report")
+        .arg("--unowned")
+        .arg("in a")
+        .arg("--repo-id")
+        .arg("repoA")
+        .assert()
+        .success();
+
+    // A never-confirmed alias row for a second repository. Before the
+    // confirmed-only fix this made the fresh clone AMBIGUOUS.
+    let conn = rusqlite::Connection::open(ctx.data_dir.join("snag.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO repositories (repository_id, created_at) VALUES (?1, ?2)",
+        rusqlite::params!["repoStale", "2026-01-01T00:00:00Z"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repository_aliases
+             (alias, repository_id, confirmed, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, 0, ?3, ?3)",
+        rusqlite::params!["acme/widgets", "repoStale", "2026-01-01T00:00:00Z"],
+    )
+    .unwrap();
+
+    // The fresh checkout resolves successfully to the confirmed repository.
+    git(
+        &c,
+        &["remote", "add", "origin", "git@github.com:acme/widgets.git"],
+    );
+    ctx.cmd()
+        .current_dir(&c)
+        .arg("report")
+        .arg("--unowned")
+        .arg("in c")
+        .assert()
+        .success();
+    let linked = store_rows(
+        &ctx,
+        "SELECT DISTINCT repository_id, repository_id FROM observation_repositories",
+    );
+    assert_eq!(
+        linked,
+        vec![("repoA".to_string(), "repoA".to_string())],
+        "report must land under the confirmed repository"
+    );
+    // The unconfirmed candidate is present in the store but was never used.
+    let stale = store_rows(
+        &ctx,
+        "SELECT alias, repository_id FROM repository_aliases WHERE confirmed = 0",
+    );
+    assert_eq!(
+        stale,
+        vec![("acme/widgets".to_string(), "repoStale".to_string())]
     );
 }
 

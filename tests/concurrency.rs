@@ -18,7 +18,10 @@ impl TestContext {
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("snag").unwrap();
         c.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            // The agent harness injects SNAG_CONTEXT_FILE; it may point at a
+            // purged /tmp file and must never leak into isolated CLI runs.
+            .env_remove("SNAG_CONTEXT_FILE");
         c
     }
     fn bin(&self) -> PathBuf {
@@ -56,6 +59,7 @@ fn test_32_concurrent_writers() {
             .arg(format!("concurrent-{}", i))
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         children.push(c.spawn().unwrap());
@@ -97,7 +101,8 @@ fn test_concurrent_same_key_single_observation() {
             .arg("--idempotency-key")
             .arg("concurrent_shared")
             .env("XDG_DATA_HOME", ctx.home_dir.path())
-            .env("HOME", ctx.home_dir.path());
+            .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE");
         children.push(c.spawn().unwrap());
     }
     for mut c in children {
@@ -186,6 +191,7 @@ fn test_crash_injection_report_failpoints() {
             .arg(format!("crash-{}", stage))
             .env("XDG_DATA_HOME", ctx.home_dir.path())
             .env("HOME", ctx.home_dir.path())
+            .env_remove("SNAG_CONTEXT_FILE")
             .env("SNAG_FAILPOINT", stage);
         let status = c.status().unwrap();
         assert!(

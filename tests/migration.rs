@@ -17,7 +17,10 @@ impl TestContext {
     fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("snag").unwrap();
         c.env("XDG_DATA_HOME", self.home_dir.path())
-            .env("HOME", self.home_dir.path());
+            .env("HOME", self.home_dir.path())
+            // The agent harness injects SNAG_CONTEXT_FILE; it may point at a
+            // purged /tmp file and must never leak into isolated CLI runs.
+            .env_remove("SNAG_CONTEXT_FILE");
         c
     }
 }
