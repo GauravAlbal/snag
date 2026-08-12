@@ -5,14 +5,18 @@ All notable changes to snag are documented here. Format follows
 [SemVer](https://semver.org/). See [docs/RELEASING.md](docs/RELEASING.md) for
 the release process.
 
-> **Version state on `main`:** development for v0.3.0; `snag --version` reports
-> `0.3.0-dev` on unreleased builds. The current release is `v0.2.0`
+> **Version state on `main`:** development for v0.4.0; `snag --version` reports
+> `0.4.0-dev` on unreleased builds. The current release is `v0.3.0`
 > (Apache-2.0); the prior MIT release `v0.1.0` is retired (release and tag
 > removed). All versions from v0.1.1 onward are Apache-2.0.
 
-## [Unreleased]
+## [Unreleased] — 0.4.0-dev
+
+## [0.3.0] — 2026-08-12 (release publication hardening)
 
 ### Changed
+- Replace tag-triggered GitHub Actions release publication with the explicit, checked, in-house release command.
+
 - **Capture ownership is mandatory on every report.** Every `snag report` must
   declare exactly one fix owner: `--owner <id|alias|path|current>` when the
   lane is known, or `--unowned` when the observation is genuinely ambiguous
@@ -41,15 +45,6 @@ the release process.
   to JSON owner lanes without narrowing threshold evaluation, and equal-score
   lanes sort deterministically by canonical repository ID.
 
-### Added
-- Add append-only `review assign-owner` for moving ownerless observations into
-  fix-owner lanes without rewriting report provenance. Repository resolution,
-  event append, and projection update commit atomically; exact canonical IDs
-  beat aliases; list/show expose the singular owner; the export schema and
-  rebuild projection recognize the event; and `verify --full` detects missing,
-  stale, or conflicting owner projections.
-
-### Fixed
 - Prevent a conflicting explicit repository ID from acquiring the current
   checkout's worktree and remote-alias identity while preserving explicit
   reporter attribution.
@@ -62,6 +57,43 @@ the release process.
 - Keep `review list` and `review summary` read-pure under `--repo current`:
   repository filters now resolve from existing checkout and confirmed-alias
   state without creating repository, alias, checkout, or worktree rows.
+- **Report flag documentation**: every `report`/fast-path flag now carries
+  help text, including the `--json` dual role (a TITLE that names an existing
+  file, or `-`, is JSON intake; otherwise `--json` selects JSON output) and
+  `--stdin` intake ownership.
+- **Intake vocabulary enforcement**: `--kind` and `--severity` are validated
+  at report intake against the canonical sets
+  (`bug|tooling|papercut|friction|usability|probe|feature` and
+  `blocker|major|medium|minor|low`); unknown values are rejected with the
+  allowed set named. The `list`/`review` filters stay permissive so legacy
+  drift values remain queryable.
+- **JSON intake error remedy**: a failed JSON-file read now names the escape
+  hatch (`--stdin` for stdin intake; a non-file title for JSON output) instead
+  of a bare read error.
+### Added
+- Add append-only `review assign-owner` for moving ownerless observations into
+  fix-owner lanes without rewriting report provenance. Repository resolution,
+  event append, and projection update commit atomically; exact canonical IDs
+  beat aliases; list/show expose the singular owner; the export schema and
+  rebuild projection recognize the event; and `verify --full` detects missing,
+  stale, or conflicting owner projections.
+- **`review list` lane filters + pagination**: `snag review list` now accepts
+  the full `next` filter surface — `--repo` (id, alias, or `current`),
+  `--kind`, `--severity`, `--unreviewed` — plus `--include-deferred` (deferred
+  marks handled=true in the reducer, so `--unhandled` alone hides punted
+  work an owner lane still owns) and explicit `--limit N` / `--offset N`
+  paging with an unbounded default, so `--repo my-lane --unhandled` is a
+  one-flag "my lane's open observations" query and text-parse consumers keep
+  the full dump. `--repo current` resolves from the cwd git context
+  (recording checkout bindings, same as `next`).
+- **Build provenance**: `snag --version` and the `snag doctor` header now
+  report the source revision (`rev <sha>`), build date, and a `-dirty` marker
+  for builds from an uncommitted tree; internal-lane builds add a flavor
+  suffix. `snag doctor` compares the embedded revision against the repo HEAD
+  when run from a matching checkout and warns when the installed binary is
+  stale — so a fix sitting in the tree while the installed binary still runs
+  older code is one command away from diagnosable.
+
 
 ## [0.1.1] - 2026-08-05
 
@@ -97,40 +129,6 @@ the release process.
 - **Release hygiene**: distinct install contracts in the README (released
   `--tag v0.1.1` vs current main).
 
-## [Unreleased]
-
-### Added
-- **`review list` lane filters + pagination**: `snag review list` now accepts
-  the full `next` filter surface — `--repo` (id, alias, or `current`),
-  `--kind`, `--severity`, `--unreviewed` — plus `--include-deferred` (deferred
-  marks handled=true in the reducer, so `--unhandled` alone hides punted
-  work an owner lane still owns) and explicit `--limit N` / `--offset N`
-  paging with an unbounded default, so `--repo my-lane --unhandled` is a
-  one-flag "my lane's open observations" query and text-parse consumers keep
-  the full dump. `--repo current` resolves from the cwd git context
-  (recording checkout bindings, same as `next`).
-- **Build provenance**: `snag --version` and the `snag doctor` header now
-  report the source revision (`rev <sha>`), build date, and a `-dirty` marker
-  for builds from an uncommitted tree; internal-lane builds add a flavor
-  suffix. `snag doctor` compares the embedded revision against the repo HEAD
-  when run from a matching checkout and warns when the installed binary is
-  stale — so a fix sitting in the tree while the installed binary still runs
-  older code is one command away from diagnosable.
-
-### Changed
-- **Report flag documentation**: every `report`/fast-path flag now carries
-  help text, including the `--json` dual role (a TITLE that names an existing
-  file, or `-`, is JSON intake; otherwise `--json` selects JSON output) and
-  `--stdin` intake ownership.
-- **Intake vocabulary enforcement**: `--kind` and `--severity` are validated
-  at report intake against the canonical sets
-  (`bug|tooling|papercut|friction|usability|probe|feature` and
-  `blocker|major|medium|minor|low`); unknown values are rejected with the
-  allowed set named. The `list`/`review` filters stay permissive so legacy
-  drift values remain queryable.
-- **JSON intake error remedy**: a failed JSON-file read now names the escape
-  hatch (`--stdin` for stdin intake; a non-file title for JSON output) instead
-  of a bare read error.
 ## [0.2.0] - 2026-08-05
 
 ### Added
@@ -210,6 +208,5 @@ Certified v0.1.0 — 59-test surface, three hard gates, tag `v0.1.0`.
 - **Testing**: 59 tests across cli, git_identity, migration, concurrency,
   robustness suites; GitHub Actions CI.
 
-[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/GauravAlbal/snag/compare/v0.1.1...v0.2.0
-[0.1.1]: https://github.com/GauravAlbal/snag/releases/tag/v0.1.1
+[Unreleased]: https://github.com/GauravAlbal/snag/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/GauravAlbal/snag/compare/v0.2.0...v0.3.0

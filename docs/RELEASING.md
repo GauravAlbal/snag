@@ -41,25 +41,35 @@ git tag -a vX.Y.Z -m "snag vX.Y.Z"
 git push origin main --tags
 ```
 
-Pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which:
+### 4. Build and publish from the tagged commit
 
-1. Builds release binaries for macOS (arm64) and Linux (x86_64,
-   aarch64).
-2. Captures `snag --version` output for each build.
-3. Generates `SHA256SUMS.txt` over all artifacts, a `source-sha.txt` with the
-   triggering commit SHA, and (best-effort) a CycloneDX SBOM.
-4. Creates the GitHub Release for the tag with every artifact attached.
+Run this explicitly from the repository checkout after pushing the tag:
 
-### 4. Verify
+```sh
+scripts/release.sh --lane public vX.Y.Z
+```
 
-Check the Actions run on the tag and confirm the Release page has:
+The command is the release authority; GitHub Actions is not involved. It
+requires a clean checkout whose `HEAD` exactly matches the annotated tag's
+resolved commit, a running Docker daemon, `cross`, and the Rust macOS arm64
+target. Both Linux targets are built with `cross`; macOS arm64 is built with
+Cargo. The command verifies all three binaries, records the package version in
+`version.txt`, writes `source-sha.txt`, generates `SHA256SUMS.txt` (including
+the SBOM when generated), and uploads the artifacts to a draft GitHub Release.
+It verifies the complete asset set before publishing and removes an incomplete
+draft on failure without overwriting an existing release. Use `--dry-run` to
+build and verify artifacts without GitHub writes.
 
-- `snag-<target-triple>` binaries for all four platforms;
+### 5. Verify
+
+Confirm the GitHub Release page has:
+
+- `snag-<target-triple>` binaries for all three targets;
 - `SHA256SUMS.txt` (verify with `shasum -a 256 -c SHA256SUMS.txt`);
 - `source-sha.txt` (the exact commit the binaries were built from);
 - `version.txt` and the SBOM, if generated.
 
-### 5. Announce
+### 6. Announce
 
 Note the release in the project's discussion channel; the CHANGELOG entry is
 the source of truth for what changed.
