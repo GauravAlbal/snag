@@ -1038,7 +1038,7 @@ fn test_list_since_json_retracted() {
         .arg("xml")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("invalid --format"));
+        .stderr(predicate::str::contains("invalid value 'xml'"));
 
     // Retracted state is surfaced.
     let id: String = {
@@ -1554,6 +1554,84 @@ fn test_doctor_reports_paths_and_version() {
         .stdout(predicate::str::contains("Backups:"))
         .stdout(predicate::str::contains("Context file:"))
         .stdout(predicate::str::contains("(not set)"));
+}
+
+/// A failed store check must remain visible in the complete diagnostics while
+/// also making the doctor command fail for automation. A missing store is
+/// still a successful first-run diagnosis (installer `--verify`).
+#[test]
+fn test_doctor_fails_for_corrupt_store() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .arg("report")
+        .arg("corrupt doctor store")
+        .arg("--unowned")
+        .assert()
+        .success();
+    std::fs::write(ctx.data_dir.join("snag.sqlite"), b"not a sqlite database").unwrap();
+
+    let output = ctx.cmd().arg("doctor").output().unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Store access: FAILED"), "{stdout}");
+    assert!(stdout.contains("Diagnostics complete."), "{stdout}");
+}
+
+#[test]
+fn test_format_options_reject_unsupported_values() {
+    let ctx = TestContext::new();
+    for args in [
+        vec!["list", "--format", "yaml"],
+        vec!["context", "--format", "yaml"],
+        vec!["review", "next", "--format", "json"],
+        vec!["review", "list", "--format", "table"],
+        vec!["review", "summary", "--format", "table"],
+        vec!["review", "show", "obs_missing", "--format", "table"],
+        vec!["review", "history", "obs_missing", "--format", "agent"],
+    ] {
+        ctx.cmd()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("possible values"));
+    }
+    ctx.cmd()
+        .args(["export", "--format", "json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
+}
+
+#[test]
+fn test_export_rejects_inverted_bounds_without_output_artifact() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .args(["report", "Inverted export bounds", "--unowned"])
+        .assert()
+        .success();
+
+    let output = ctx.home_dir.path().join("inverted.jsonl");
+    ctx.cmd()
+        .args(["export", "--after-sequence", "1", "--through-sequence", "1"])
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be greater"));
+    assert!(
+        !output.exists(),
+        "inverted export bounds must not publish an output artifact"
+    );
+}
+
+#[test]
+fn test_verify_rejects_quick_and_full_together() {
+    let ctx = TestContext::new();
+    ctx.cmd()
+        .args(["verify", "--quick", "--full"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 /// Build provenance: --version reports the source revision and build date so

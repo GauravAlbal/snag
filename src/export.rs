@@ -24,6 +24,13 @@ struct ExportBounds {
 }
 
 fn compute_bounds(args: &ExportArgs, store: &Store) -> Result<ExportBounds> {
+    if let (Some(after), Some(through)) = (args.after_sequence, args.through_sequence)
+        && through <= after
+    {
+        anyhow::bail!(
+            "`--through-sequence` ({through}) must be greater than `--after-sequence` ({after})"
+        );
+    }
     let min_seq = args.after_sequence.map(|s| s + 1).unwrap_or(1) as i64;
 
     let (actual_through_seq, record_count): (i64, i64) = if let Some(ts) = args.through_sequence {

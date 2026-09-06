@@ -552,6 +552,112 @@ fn t1b_list_paginates() {
     assert_eq!(all.len(), 5);
 }
 
+fn show_agent(ctx: &TestContext, obs: &str) -> serde_json::Value {
+    let out = ctx
+        .cmd()
+        .args(["review", "show", obs, "--format", "agent"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "review show --format agent failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap()
+}
+
+#[test]
+fn t1c_agent_packet_allowed_actions_follow_reduced_state() {
+    let ctx = TestContext::new();
+    let actionable = report(&ctx, "actionable actions", "bug", "major");
+    let claimed = report(&ctx, "claimed actions", "bug", "major");
+    ctx.cmd_as("claimed")
+        .arg("review")
+        .arg("claim")
+        .arg(&claimed)
+        .assert()
+        .success();
+
+    assert_eq!(
+        show_agent(&ctx, &actionable)["allowed_actions"],
+        serde_json::json!(["claim", "disposition"])
+    );
+    assert_eq!(
+        show_agent(&ctx, &claimed)["allowed_actions"],
+        serde_json::json!(["heartbeat", "release", "disposition"])
+    );
+
+    let deferred_ctx = TestContext::new();
+    let deferred = report(&deferred_ctx, "deferred actions", "bug", "major");
+    deferred_ctx
+        .cmd_as("owner")
+        .arg("review")
+        .arg("disposition")
+        .arg(&deferred)
+        .arg("deferred")
+        .assert()
+        .success();
+    let shown = show_agent(&deferred_ctx, &deferred);
+    assert_eq!(
+        shown["allowed_actions"],
+        serde_json::json!(["reopen_remediation"])
+    );
+    let next = deferred_ctx
+        .cmd()
+        .args(["review", "next", "--include-deferred", "--format", "agent"])
+        .output()
+        .unwrap();
+    assert!(next.status.success());
+    let next: serde_json::Value =
+        serde_json::from_slice(&next.stdout).expect("agent next must be JSON");
+    assert_eq!(next["allowed_actions"], shown["allowed_actions"]);
+}
+
+#[test]
+fn t1c_next_claim_rejects_handled_deferred_without_mutation() {
+    let ctx = TestContext::new();
+    let deferred = report(&ctx, "deferred claim guard", "bug", "major");
+    ctx.cmd_as("owner")
+        .arg("review")
+        .arg("disposition")
+        .arg(&deferred)
+        .arg("deferred")
+        .assert()
+        .success();
+    let before_records = record_count(&ctx);
+    let before_claims = claim_count(&ctx);
+
+    let out = ctx
+        .cmd_as("owner")
+        .args([
+            "review",
+            "next",
+            "--include-deferred",
+            "--claim",
+            "--format",
+            "agent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("reopen remediation"), "stderr: {stderr}");
+    assert_eq!(record_count(&ctx), before_records);
+    assert_eq!(claim_count(&ctx), before_claims);
+    let (state, handled, active_claim): (String, i64, Option<String>) = ctx
+        .conn()
+        .query_row(
+            "SELECT state, handled, active_claim_id
+             FROM observation_review_state WHERE observation_id = ?1",
+            [&deferred],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "deferred");
+    assert_eq!(handled, 1);
+    assert!(active_claim.is_none());
+}
+
 // ---------------------------------------------------------------------------
 // T2: claim leases.
 // ---------------------------------------------------------------------------

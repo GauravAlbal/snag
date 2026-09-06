@@ -258,7 +258,7 @@ pub fn agent_packet(store: &Store, observation_id: &str) -> Result<serde_json::V
             "verification_receipts": reduced.verification_receipts,
         },
         "body_gap": body_gap(&observation),
-        "allowed_actions": [],
+        "allowed_actions": crate::remediation::reducer::allowed_actions(&reduced),
     }))
 }
 

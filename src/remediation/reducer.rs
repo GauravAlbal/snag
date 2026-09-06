@@ -63,6 +63,58 @@ impl WorkStatus {
     }
 }
 
+/// Return the remediation commands that are valid for the current reduced state.
+///
+/// Derived from the reducer projection rather than event history or a second
+/// queue lifecycle. The strings are the existing `snag review` action
+/// vocabulary consumed by agent packets.
+pub fn allowed_actions(r: &ReducedObservation) -> Vec<&'static str> {
+    if r.handled {
+        return vec!["reopen_remediation"];
+    }
+    if r.active_claim.is_some() && r.disposition.is_none() {
+        return vec!["heartbeat", "release", "disposition"];
+    }
+    match r.state.as_str() {
+        STATE_UNREVIEWED | STATE_REOPENED => vec!["claim", "disposition"],
+        STATE_CONFIRMED => {
+            let mut actions = vec![
+                "promote",
+                "attach_task",
+                "attach_fix",
+                "attach_verification",
+            ];
+            if !r.task_ids.is_empty() || !r.verification_receipts.is_empty() {
+                actions.push("mark_handled");
+            }
+            actions
+        }
+        STATE_PROMOTED => {
+            let mut actions = vec!["attach_task", "attach_fix", "attach_verification"];
+            if !r.task_ids.is_empty() || !r.verification_receipts.is_empty() {
+                actions.push("mark_handled");
+            }
+            actions
+        }
+        STATE_REMEDIATION_IN_PROGRESS => {
+            let mut actions = vec!["attach_verification"];
+            if !r.task_ids.is_empty() || !r.verification_receipts.is_empty() {
+                actions.push("mark_handled");
+            }
+            actions
+        }
+        STATE_CANDIDATE_FIX => vec!["attach_verification"],
+        STATE_VERIFIED_FIXED | STATE_DEFERRED | STATE_NEGATIVE_DISPOSITION => {
+            vec!["reopen_remediation"]
+        }
+        _ => match r.work_status {
+            WorkStatus::Terminal | WorkStatus::Resolved => vec!["reopen_remediation"],
+            WorkStatus::Actionable => vec!["claim", "disposition"],
+            WorkStatus::Active => vec!["heartbeat", "release"],
+        },
+    }
+}
+
 /// Dispositions that make an observation `Terminal`: remediation should not
 /// proceed for a non-work reason. Distinct from `TERMINAL_NEGATIVE_DISPOSITIONS`
 /// (queue semantics): `insufficient_evidence` is a queue-handled negative but

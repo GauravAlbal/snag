@@ -103,11 +103,14 @@ impl Cli {
             Some(Command::Report(args)) => args.json,
             Some(Command::List(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Context(args)) => args.format.as_deref() == Some("json"),
-            Some(Command::Export(args)) => args.format.as_deref() == Some("json"),
             Some(Command::Review(cmd)) => match cmd {
                 ReviewCommand::Next(args) => args.format.as_deref() == Some("agent"),
                 ReviewCommand::List(args) => args.format.as_deref() == Some("json"),
                 ReviewCommand::Summary(args) => args.format.as_deref() == Some("json"),
+                ReviewCommand::Show(args) => {
+                    matches!(args.format.as_deref(), Some("json" | "agent"))
+                }
+                ReviewCommand::History(args) => args.format.as_deref() == Some("json"),
                 #[cfg(snag_internal)]
                 ReviewCommand::Retro(args) => args.format.as_deref() == Some("json"),
                 _ => false,
@@ -245,7 +248,8 @@ pub struct ListArgs {
     #[arg(long)]
     pub limit: Option<usize>,
 
-    #[arg(long)]
+    /// Output format: `json` or `table` (default)
+    #[arg(long, value_parser = ["json", "table"])]
     pub format: Option<String>,
 }
 
@@ -256,15 +260,13 @@ pub struct ShowArgs {
 
 #[derive(Args)]
 pub struct ContextArgs {
-    #[arg(long)]
+    /// Output format: `json` or `text` (default)
+    #[arg(long, value_parser = ["json", "text"])]
     pub format: Option<String>,
 }
 
 #[derive(Args)]
 pub struct ExportArgs {
-    #[arg(long)]
-    pub format: Option<String>,
-
     #[arg(long)]
     pub after_sequence: Option<u64>,
 
@@ -280,10 +282,10 @@ pub struct BackupArgs {}
 
 #[derive(Args)]
 pub struct VerifyArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with = "full")]
     pub quick: bool,
 
-    #[arg(long)]
+    #[arg(long, conflicts_with = "quick")]
     pub full: bool,
 
     #[arg(long)]
@@ -465,7 +467,7 @@ pub struct ReviewNextArgs {
     pub include_deferred: bool,
 
     /// Output format: `agent` (versioned JSON packet) or `text` (default)
-    #[arg(long)]
+    #[arg(long, value_parser = ["agent", "text"])]
     pub format: Option<String>,
 
     /// Claim the returned observation atomically (fold-in: with --task,
@@ -582,7 +584,8 @@ pub struct ReviewListArgs {
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
 
-    #[arg(long)]
+    /// Output format: `json` or `text` (default)
+    #[arg(long, value_parser = ["json", "text"])]
     pub format: Option<String>,
 }
 
@@ -605,8 +608,8 @@ pub struct ReviewSummaryArgs {
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
-    /// Output format: text (default) or json (review_summary_v1 envelope)
-    #[arg(long)]
+    /// Output format: `json` or `text` (default)
+    #[arg(long, value_parser = ["json", "text"])]
     pub format: Option<String>,
 }
 
@@ -834,7 +837,8 @@ pub struct ReviewReopenRemediationArgs {
 pub struct ReviewShowArgs {
     pub observation_id: String,
 
-    #[arg(long)]
+    /// Output format: `agent`, `json`, or `text` (default)
+    #[arg(long, value_parser = ["agent", "json", "text"])]
     pub format: Option<String>,
 }
 
@@ -842,7 +846,8 @@ pub struct ReviewShowArgs {
 pub struct ReviewHistoryArgs {
     pub observation_id: String,
 
-    #[arg(long)]
+    /// Output format: `json` or `text` (default)
+    #[arg(long, value_parser = ["json", "text"])]
     pub format: Option<String>,
 }
 

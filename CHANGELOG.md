@@ -12,6 +12,16 @@ the release process.
 
 ## [Unreleased] — 0.4.0-dev
 
+### Fixed
+- **`doctor` fail-closed**: failed store-path, store-access, backup-directory, or SQLite integrity checks now exit nonzero after printing the full diagnostic report. A missing store remains a first-run warning so installer `--verify` still succeeds.
+- **Agent packet `allowed_actions`**: `review next --format agent` and `review show --format agent` now list the reducer-derived commands that are valid for the current observation instead of an empty array.
+- **Claim after closure**: claiming a handled or deferred observation is rejected until `review reopen-remediation`; the refusal does not append a claim record.
+- **Export inverted bounds**: `--after-sequence` ≥ `--through-sequence` fails before creating an output artifact.
+
+### Changed
+- **CLI format values** are finite and enforced (`list`, `context`, `review next/list/summary/show/history`). The unused `export --format` flag is removed. `verify --quick` and `verify --full` are mutually exclusive.
+
+
 ## [0.3.0] — 2026-08-12 (release publication hardening)
 
 ### Changed

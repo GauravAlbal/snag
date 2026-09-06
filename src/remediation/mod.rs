@@ -212,6 +212,15 @@ fn claim_observation(
         anyhow::bail!(SnagError::NotFound(format!("observation {observation_id}")));
     }
 
+    let reduced = crate::remediation::reducer::reduce_observation(tx, observation_id)?;
+    if reduced.handled {
+        anyhow::bail!(SnagError::Validation(format!(
+            "observation {} is handled ({}); reopen remediation before claiming",
+            observation_id,
+            reduced.disposition.as_deref().unwrap_or("resolved")
+        )));
+    }
+
     let active: Option<(String, String, String)> = tx
         .query_row(
             "SELECT claim_id, claim_session_id, lease_expires_at FROM remediation_claims
